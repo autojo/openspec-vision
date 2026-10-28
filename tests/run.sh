@@ -465,6 +465,17 @@ run_lib() {
     bash -c '. "$1/runtime/bin/boss-lib.sh"; shift; "$@"' _ "$ROOT" "$@"
 }
 
+# run_lib_state <state-dir> <function...> -- the same library call against a
+# dedicated state root, so tests can control open_apply_count and lock_holders.
+run_lib_state() {
+  local st="$1"; shift
+  env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="${BOSS_CONFIG:-$CONFIG}" BOSS_STATE_DIR="$st" \
+    HERDR_AGENTS_JSON="${HERDR_AGENTS_JSON:-}" \
+    HERDR_INTEGRATION_STATUS="${HERDR_INTEGRATION_STATUS:-}" \
+    HERDR_WORKTREE_MAP="${HERDR_WORKTREE_MAP:-$TMP/herdr-worktrees.jsonl}" \
+    bash -c '. "$1/runtime/bin/boss-lib.sh"; shift; "$@"' _ "$ROOT" "$@"
+}
+
 make_project() {
   local dir="$1"; shift
   mkdir -p "$dir/openspec/changes/archive" "$dir/openspec/missions"
@@ -2718,6 +2729,341 @@ for needle in "boss plan commit" "worktrees" "worktree" "merge_conflict" "merge_
 done
 for needle in "boss plan commit" "worktree" "merge" "resume"; do
   check_contains "worktree skill: $needle" "$needle" "$skill"
+done
+
+# 70. Parallel mission bullets parse touches; none is declared-empty and a
+# missing annotation stays undeclared.
+P_PAR="$TMP/project-parallel-parse"
+make_project "$P_PAR"
+make_change "$P_PAR" feat-a '- [ ] 1.1 Code.'
+make_change "$P_PAR" feat-b '- [ ] 1.1 Code.'
+make_change "$P_PAR" feat-c '- [ ] 1.1 Code.'
+make_mission "$P_PAR" v1 $'- feat-a (touches: src/auth, deps)\n- feat-b (touches: none)\n- feat-c'
+status="$(run_boss mission status v1 --project "$P_PAR")"
+check_eq "touches: list" '["src/auth","deps"]' \
+  "$(printf '%s' "$status" | jq -c '.changes[] | select(.change=="feat-a") | .touches')"
+check_eq "touches: list declared" "true" \
+  "$(printf '%s' "$status" | jq -r '.changes[] | select(.change=="feat-a") | .declared')"
+check_eq "touches: none is empty" '[]' \
+  "$(printf '%s' "$status" | jq -c '.changes[] | select(.change=="feat-b") | .touches')"
+check_eq "touches: none declared" "true" \
+  "$(printf '%s' "$status" | jq -r '.changes[] | select(.change=="feat-b") | .declared')"
+check_eq "touches: missing undeclared" "false" \
+  "$(printf '%s' "$status" | jq -r '.changes[] | select(.change=="feat-c") | .declared')"
+check_eq "touches: dependency mirror" '["src/auth","deps"]' \
+  "$(printf '%s' "$status" | jq -c '.dependencies[] | select(.name=="feat-a") | .touches')"
+check_eq "touches: status still serial" "1" "$(printf '%s' "$status" | jq -r '.max_parallel')"
+
+# 71. max_parallel resolution: config, env override, invalid input and the
+# doctor checks for the limit and for missing lock declarations.
+PCONF="$TMP/parallel.toml"
+printf 'default = "opencode"\n[projects]\npar = "%s"\n[runners.opencode]\nkind = "opencode"\nargs = []\napply = "/opsx-apply {change}"\n[missions]\nmax_parallel = 2\n' "$P_PAR" >"$PCONF"
+DST_PAR="$TMP/parallel-doctor-state"
+doctor="$(BOSS_CONFIG="$PCONF" run_boss_state "$DST_PAR" doctor --project "$P_PAR" --json 2>/dev/null)"
+check_eq "max_parallel: doctor ok" "ok" \
+  "$(printf '%s' "$doctor" | jq -r '.checks[] | select(.id=="mission_parallel") | .status')"
+check_contains "max_parallel: config value" "max_parallel = 2" \
+  "$(printf '%s' "$doctor" | jq -r '.checks[] | select(.id=="mission_parallel") | .hint')"
+doctor="$(BOSS_CONFIG="$PCONF" BOSS_MAX_PARALLEL=4 run_boss_state "$DST_PAR" doctor --project "$P_PAR" --json 2>/dev/null)"
+check_contains "max_parallel: env override" "max_parallel = 4" \
+  "$(printf '%s' "$doctor" | jq -r '.checks[] | select(.id=="mission_parallel") | .hint')"
+check_contains "max_parallel: env named" "BOSS_MAX_PARALLEL" \
+  "$(printf '%s' "$doctor" | jq -r '.checks[] | select(.id=="mission_parallel") | .hint')"
+doctor="$(BOSS_CONFIG="$PCONF" run_boss_state "$DST_PAR" doctor --project "$P_PAR" --json 2>/dev/null)"
+check_eq "parallel locks: missing warn" "warn" \
+  "$(printf '%s' "$doctor" | jq -r '.checks[] | select(.id=="mission_parallel_locks") | .status')"
+check_contains "parallel locks: names change" "feat-c" \
+  "$(printf '%s' "$doctor" | jq -r '.checks[] | select(.id=="mission_parallel_locks") | .hint')"
+make_mission "$P_PAR" v1 $'- feat-a (touches: src/auth, deps)\n- feat-b (touches: none)\n- feat-c (touches: none)'
+doctor="$(BOSS_CONFIG="$PCONF" run_boss_state "$DST_PAR" doctor --project "$P_PAR" --json 2>/dev/null)"
+check_eq "parallel locks: complete ok" "ok" \
+  "$(printf '%s' "$doctor" | jq -r '.checks[] | select(.id=="mission_parallel_locks") | .status')"
+ICONF_PAR="$TMP/parallel-invalid.toml"
+printf 'default = "opencode"\n[projects]\npar = "%s"\n[runners.opencode]\nkind = "opencode"\nargs = []\napply = "/opsx-apply {change}"\n[missions]\nmax_parallel = 0\n' "$P_PAR" >"$ICONF_PAR"
+doctor="$(BOSS_CONFIG="$ICONF_PAR" run_boss_state "$DST_PAR" doctor --project "$P_PAR" --json 2>/dev/null)"
+check_eq "max_parallel: invalid fails" "fail" \
+  "$(printf '%s' "$doctor" | jq -r '.checks[] | select(.id=="mission_parallel") | .status')"
+err="$(BOSS_CONFIG="$ICONF_PAR" run_boss_fail_state "$DST_PAR" dispatch feat-a --project "$P_PAR")"
+check_contains "max_parallel: invalid dispatch" "invalid_max_parallel" "$err"
+
+# 72. open_apply_count excludes parked, merged/kept and stale states but keeps
+# test-failed and conflict states.
+CST="$TMP/parallel-count-state"
+mkdir -p "$CST/applies"
+jq -n --arg p "$P_PAR" '{change:"run",project:$p,pane_id:"p-run",parked:false,merge_state:"none"}' \
+  >"$CST/applies/run.json"
+jq -n --arg p "$P_PAR" '{change:"parked",project:$p,pane_id:"p-park",parked:true,merge_state:"none"}' \
+  >"$CST/applies/parked.json"
+jq -n --arg p "$P_PAR" '{change:"kept",project:$p,pane_id:"p-kept",parked:false,merge_state:"done",kept:true,merged:true}' \
+  >"$CST/applies/kept.json"
+jq -n --arg p "$P_PAR" '{change:"failed",project:$p,pane_id:null,merge_state:"test_failed",merged:true}' \
+  >"$CST/applies/failed.json"
+jq -n --arg p "$P_PAR" '{change:"conflict",project:$p,pane_id:null,merge_state:"conflict"}' \
+  >"$CST/applies/conflict.json"
+jq -n --arg p "$P_PAR" '{change:"stale",project:$p,pane_id:"p-stale",parked:false,merge_state:"none"}' \
+  >"$CST/applies/stale.json"
+AGENTS_COUNT='[{"name":"apply-run","pane_id":"p-run","workspace_id":"ws-1"},{"name":"apply-parked","pane_id":"p-park","workspace_id":"ws-1"},{"name":"apply-kept","pane_id":"p-kept","workspace_id":"ws-1"}]'
+count="$(HERDR_AGENTS_JSON="$AGENTS_COUNT" run_lib_state "$CST" open_apply_count)"
+check_eq "count: running + failed + conflict" "3" "$count"
+count="$(HERDR_AGENTS_JSON="$AGENTS_COUNT" run_lib_state "$CST" open_apply_count "$CST/applies/run.json")"
+check_eq "count: own state excluded" "2" "$count"
+count="$(HERDR_AGENTS_JSON='[]' run_lib_state "$CST" open_apply_count)"
+check_eq "count: dead panes do not hold slots" "2" "$count"
+
+# 73. The hard limit starts two disjoint worktree applies, refuses the third,
+# and a base-checkout dispatch is refused in parallel mode.
+P_LIM="$TMP/project-parallel-limit"
+make_git_project "$P_LIM"
+make_change "$P_LIM" lim-a '- [ ] 1.1 Code.'
+make_change "$P_LIM" lim-b '- [ ] 1.1 Code.'
+make_change "$P_LIM" lim-c '- [ ] 1.1 Code.'
+plan_commit "$P_LIM" lim-a >/dev/null
+LST="$TMP/parallel-limit-state"
+mkdir -p "$LST"
+out="$(BOSS_MAX_PARALLEL=2 run_boss_state "$LST" dispatch lim-a --project "$P_LIM" --touches none)"
+check_eq "limit: first started" "started" "$(printf '%s' "$out" | jq -r '.status')"
+LIM_A_WT="$(printf '%s' "$out" | jq -r '.worktree')"
+check_contains "limit: first worktree" "worktrees/" "$LIM_A_WT"
+AG_A="$(jq -nc --arg p "pane-lim-a" --arg w "ws-wt-lim-a" '[{name:"apply-lim-a",pane_id:$p,workspace_id:$w}]')"
+out="$(BOSS_MAX_PARALLEL=2 HERDR_AGENTS_JSON="$AG_A" run_boss_state "$LST" dispatch lim-b --project "$P_LIM" --touches none)"
+check_eq "limit: second started" "started" "$(printf '%s' "$out" | jq -r '.status')"
+AG_AB="$(jq -nc --arg a "pane-lim-a" --arg b "pane-lim-b" '[{name:"apply-lim-a",pane_id:$a,workspace_id:"ws-wt-lim-a"},{name:"apply-lim-b",pane_id:$b,workspace_id:"ws-wt-lim-b"}]')"
+err="$(BOSS_MAX_PARALLEL=2 HERDR_AGENTS_JSON="$AG_AB" run_boss_fail_state "$LST" dispatch lim-c --project "$P_LIM" --touches none)"
+check_contains "limit: third refused" "parallel_limit" "$err"
+check_eq "limit: current" "2" "$(printf '%s' "$err" | tail -n 1 | jq -r '.current')"
+check_eq "limit: max" "2" "$(printf '%s' "$err" | tail -n 1 | jq -r '.max')"
+check_eq "limit: third no state" "0" \
+  "$( [ -f "$LST/applies/$(run_lib sha1_hex "$P_LIM")-lim-c.json" ] && printf 1 || printf 0)"
+check_eq "limit: base clean" "" "$(git -C "$P_LIM" status --porcelain)"
+status="$(BOSS_MAX_PARALLEL=2 HERDR_AGENTS_JSON="$AG_A" run_boss_state "$LST" status lim-a --project "$P_LIM" --json)"
+check_eq "limit: status declared" "true" "$(printf '%s' "$status" | jq -r '.declared')"
+check_eq "limit: status touches" "[]" "$(printf '%s' "$status" | jq -c '.touches')"
+LST_REQ="$TMP/parallel-limit-required-state"
+mkdir -p "$LST_REQ"
+err="$(BOSS_MAX_PARALLEL=2 run_boss_fail_state "$LST_REQ" dispatch lim-a --project "$P_LIM" --no-worktree --touches none)"
+check_contains "limit: no-worktree refused" "worktree_required" "$err"
+check_eq "limit: refused base clean" "" "$(git -C "$P_LIM" status --porcelain)"
+P_SER="$TMP/project-parallel-serial"
+make_project "$P_SER"
+make_change "$P_SER" ser '- [ ] 1.1 Code.'
+out="$(BOSS_MAX_PARALLEL=1 run_boss_state "$LST_REQ" dispatch ser --project "$P_SER")"
+check_eq "limit: serial still base" "started" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "limit: serial no worktree" "null" "$(printf '%s' "$out" | jq -r '.worktree')"
+
+# 74. Lock comparison: exact key, path prefix, disjoint, none and a parked
+# holder. The helper cases run without dispatch first.
+if run_lib touches_overlap '["deps"]' '["deps"]'; then ok; else bad "locks: exact key did not overlap"; fi
+if run_lib touches_overlap '["src/auth"]' '["src/auth/login"]'; then ok; else bad "locks: path prefix did not overlap"; fi
+if run_lib touches_overlap '["src/auth/"]' '["src/auth"]'; then ok; else bad "locks: trailing slash not ignored"; fi
+if run_lib touches_overlap '["deps"]' '["src/auth"]'; then bad "locks: unrelated keys overlapped"; else ok; fi
+if run_lib touches_overlap '["deps"]' '["src/deps"]'; then bad "locks: key without slash prefix-matched"; else ok; fi
+if run_lib touches_overlap '[]' '["deps"]'; then bad "locks: empty overlap"; else ok; fi
+
+P_LCK="$TMP/project-parallel-locks"
+make_git_project "$P_LCK"
+make_change "$P_LCK" lock-a '- [ ] 1.1 Code.'
+make_change "$P_LCK" lock-b '- [ ] 1.1 Code.'
+make_change "$P_LCK" lock-c '- [ ] 1.1 Code.'
+plan_commit "$P_LCK" lock-a >/dev/null
+LCKST="$TMP/parallel-lock-state"
+mkdir -p "$LCKST"
+out="$(BOSS_MAX_PARALLEL=2 run_boss_state "$LCKST" dispatch lock-a --project "$P_LCK" --touches deps)"
+check_eq "locks: holder started" "started" "$(printf '%s' "$out" | jq -r '.status')"
+LCK_A="$(jq -nc '[{name:"apply-lock-a",pane_id:"pane-lock-a",workspace_id:"ws-wt-lock-a"}]')"
+err="$(BOSS_MAX_PARALLEL=2 HERDR_AGENTS_JSON="$LCK_A" run_boss_fail_state "$LCKST" dispatch lock-b --project "$P_LCK" --touches deps)"
+check_contains "locks: exact conflict" "lock_conflict" "$err"
+check_contains "locks: names holder" "lock-a" "$err"
+check_eq "locks: conflict no state" "0" \
+  "$( [ -f "$LCKST/applies/$(run_lib sha1_hex "$P_LCK")-lock-b.json" ] && printf 1 || printf 0)"
+err="$(BOSS_MAX_PARALLEL=2 HERDR_AGENTS_JSON="$LCK_A" run_boss_fail_state "$LCKST" dispatch lock-b --project "$P_LCK")"
+check_contains "locks: undeclared candidate waits" "lock_conflict" "$err"
+out="$(BOSS_MAX_PARALLEL=2 HERDR_AGENTS_JSON="$LCK_A" run_boss_state "$LCKST" dispatch lock-c --project "$P_LCK" --touches "src/ui, cache")"
+check_eq "locks: disjoint starts" "started" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "locks: comma list parsed" '["src/ui","cache"]' \
+  "$(jq -c '.touches' "$LCKST/applies/$(run_lib sha1_hex "$P_LCK")-lock-c.json")"
+
+P_LCP="$TMP/project-parallel-lock-prefix"
+make_git_project "$P_LCP"
+make_change "$P_LCP" pfx-a '- [ ] 1.1 Code.'
+make_change "$P_LCP" pfx-b '- [ ] 1.1 Code.'
+plan_commit "$P_LCP" pfx-a >/dev/null
+LCPST="$TMP/parallel-lock-prefix-state"
+mkdir -p "$LCPST"
+run_boss_state "$LCPST" dispatch pfx-a --project "$P_LCP" --touches src/auth --worktree >/dev/null
+LCP_A="$(jq -nc '[{name:"apply-pfx-a",pane_id:"pane-pfx-a",workspace_id:"ws-wt-pfx-a"}]')"
+err="$(BOSS_MAX_PARALLEL=2 HERDR_AGENTS_JSON="$LCP_A" run_boss_fail_state "$LCPST" dispatch pfx-b --project "$P_LCP" --touches src/auth/login)"
+check_contains "locks: path prefix conflict" "lock_conflict" "$err"
+
+P_LPN="$TMP/project-parallel-lock-none"
+make_git_project "$P_LPN"
+make_change "$P_LPN" none-a '- [ ] 1.1 Code.'
+make_change "$P_LPN" none-b '- [ ] 1.1 Code.'
+plan_commit "$P_LPN" none-a >/dev/null
+LPNST="$TMP/parallel-lock-none-state"
+mkdir -p "$LPNST"
+run_boss_state "$LPNST" dispatch none-a --project "$P_LPN" --touches none --worktree >/dev/null
+LPN_A="$(jq -nc '[{name:"apply-none-a",pane_id:"pane-none-a",workspace_id:"ws-wt-none-a"}]')"
+out="$(BOSS_MAX_PARALLEL=2 HERDR_AGENTS_JSON="$LPN_A" run_boss_state "$LPNST" dispatch none-b --project "$P_LPN" --touches none)"
+check_eq "locks: none is disjoint" "started" "$(printf '%s' "$out" | jq -r '.status')"
+
+P_LPK="$TMP/project-parallel-lock-parked"
+make_git_project "$P_LPK"
+make_change "$P_LPK" park-a '- [ ] 1.1 [Nutzer] Konto verknüpfen.'
+make_change "$P_LPK" park-b '- [ ] 1.1 Code.'
+plan_commit "$P_LPK" park-a >/dev/null
+LPKST="$TMP/parallel-lock-parked-state"
+mkdir -p "$LPKST"
+out="$(BOSS_MAX_PARALLEL=2 run_boss_state "$LPKST" dispatch park-a --project "$P_LPK" --touches auth)"
+check_eq "locks: parked holder started" "started" "$(printf '%s' "$out" | jq -r '.status')"
+run_boss_state "$LPKST" park park-a --project "$P_LPK" >/dev/null
+err="$(BOSS_MAX_PARALLEL=2 run_boss_fail_state "$LPKST" dispatch park-b --project "$P_LPK" --touches auth)"
+check_contains "locks: parked holder blocks" "lock_conflict" "$err"
+check_contains "locks: parked holder named" "park-a" "$err"
+
+# 75. Mission fill: two disjoint slots start, the third hits the limit, and
+# status exposes the slots.
+P_FILL="$TMP/project-parallel-fill"
+make_git_project "$P_FILL"
+make_change "$P_FILL" fill-a '- [ ] 1.1 Code.'
+make_change "$P_FILL" fill-b '- [ ] 1.1 Code.'
+make_change "$P_FILL" fill-c '- [ ] 1.1 Code.'
+make_mission "$P_FILL" v1 $'- fill-a (touches: none)\n- fill-b (touches: none)\n- fill-c (touches: none)'
+plan_commit "$P_FILL" fill-a >/dev/null
+FST="$TMP/parallel-fill-state"
+mkdir -p "$FST"
+out="$(BOSS_MAX_PARALLEL=2 run_boss_state "$FST" mission next v1 --project "$P_FILL")"
+check_eq "fill: first" "started" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "fill: first change" "fill-a" "$(printf '%s' "$out" | jq -r '.change')"
+AG_FA="$(jq -nc '[{name:"apply-fill-a",pane_id:"pane-fill-a",workspace_id:"ws-wt-fill-a"}]')"
+out="$(BOSS_MAX_PARALLEL=2 HERDR_AGENTS_JSON="$AG_FA" run_boss_state "$FST" mission next v1 --project "$P_FILL")"
+check_eq "fill: second" "started" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "fill: second change" "fill-b" "$(printf '%s' "$out" | jq -r '.change')"
+AG_FAB="$(jq -nc '[{name:"apply-fill-a",pane_id:"pane-fill-a",workspace_id:"ws-wt-fill-a"},{name:"apply-fill-b",pane_id:"pane-fill-b",workspace_id:"ws-wt-fill-b"}]')"
+out="$(BOSS_MAX_PARALLEL=2 HERDR_AGENTS_JSON="$AG_FAB" run_boss_state "$FST" mission next v1 --project "$P_FILL")"
+check_eq "fill: third limited" "parallel_limit" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "fill: third no state" "0" \
+  "$( [ -f "$FST/applies/$(run_lib sha1_hex "$P_FILL")-fill-c.json" ] && printf 1 || printf 0)"
+status="$(BOSS_MAX_PARALLEL=2 HERDR_AGENTS_JSON="$AG_FAB" run_boss_state "$FST" mission status v1 --project "$P_FILL")"
+check_eq "fill: status max" "2" "$(printf '%s' "$status" | jq -r '.max_parallel')"
+check_eq "fill: status running" "2" "$(printf '%s' "$status" | jq -r '.running')"
+check_eq "fill: status slots used" "2" "$(printf '%s' "$status" | jq -r '.slots_used')"
+check_eq "fill: status slots free" "0" "$(printf '%s' "$status" | jq -r '.slots_free')"
+check_eq "fill: status per-change running" "true" \
+  "$(printf '%s' "$status" | jq -r '.changes[] | select(.change=="fill-a") | .running')"
+check_eq "fill: status per-change none" "true" \
+  "$(printf '%s' "$status" | jq -r '.changes[] | select(.change=="fill-b") | .declared')"
+
+# A single slot still dispatches once on the base checkout.
+P_SINGLE="$TMP/project-parallel-single"
+make_project "$P_SINGLE"
+make_change "$P_SINGLE" single '- [ ] 1.1 Code.'
+make_mission "$P_SINGLE" v1 "- single"
+SST="$TMP/parallel-single-state"
+mkdir -p "$SST"
+out="$(BOSS_MAX_PARALLEL=1 run_boss_state "$SST" mission next v1 --project "$P_SINGLE")"
+check_eq "fill: single started" "started" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "fill: single no worktree" "null" "$(printf '%s' "$out" | jq -r '.worktree')"
+
+# 76. A lock conflict during selection is no_startable and names the holder.
+P_NS="$TMP/project-parallel-no-startable"
+make_git_project "$P_NS"
+make_change "$P_NS" ns-a '- [ ] 1.1 Code.'
+make_change "$P_NS" ns-b '- [ ] 1.1 Code.'
+make_mission "$P_NS" v1 "- ns-b (touches: deps)"
+plan_commit "$P_NS" ns-a >/dev/null
+NSST="$TMP/parallel-no-startable-state"
+mkdir -p "$NSST"
+run_boss_state "$NSST" dispatch ns-a --project "$P_NS" --touches deps >/dev/null
+NS_A="$(jq -nc '[{name:"apply-ns-a",pane_id:"pane-ns-a",workspace_id:"ws-wt-ns-a"}]')"
+out="$(BOSS_MAX_PARALLEL=2 HERDR_AGENTS_JSON="$NS_A" run_boss_state "$NSST" mission next v1 --project "$P_NS")"
+check_eq "no_startable: status" "no_startable" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "no_startable: holder" "ns-a" "$(printf '%s' "$out" | jq -r '.holders[0].change')"
+check_eq "no_startable: reason" "lock_conflict" "$(printf '%s' "$out" | jq -r '.skipped[0].reason')"
+
+# 77. Review reports overlapping changed files and stays silent for a disjoint
+# pair.
+P_OV="$TMP/project-parallel-overlap"
+make_git_project "$P_OV"
+make_change "$P_OV" ov-a '- [ ] 1.1 Code.'
+make_change "$P_OV" ov-b '- [ ] 1.1 Code.'
+plan_commit "$P_OV" ov-a >/dev/null
+OVST="$TMP/parallel-overlap-state"
+mkdir -p "$OVST"
+out="$(BOSS_MAX_PARALLEL=2 run_boss_state "$OVST" dispatch ov-a --project "$P_OV" --touches none)"
+OV_A="$(printf '%s' "$out" | jq -r '.worktree')"
+OV_AG="$(jq -nc '[{name:"apply-ov-a",pane_id:"pane-ov-a",workspace_id:"ws-wt-ov-a"}]')"
+out="$(BOSS_MAX_PARALLEL=2 HERDR_AGENTS_JSON="$OV_AG" run_boss_state "$OVST" dispatch ov-b --project "$P_OV" --touches none)"
+OV_B="$(printf '%s' "$out" | jq -r '.worktree')"
+if [ -z "$OV_A" ] || [ ! -d "$OV_A" ] || [ -z "$OV_B" ] || [ ! -d "$OV_B" ]; then
+  bad "overlap: dispatch produced no worktrees"
+else
+  printf 'shared\n' >"$OV_A/shared.txt"
+  git -C "$OV_A" add shared.txt; git -C "$OV_A" commit -qm "a shared"
+  printf 'shared b\n' >"$OV_B/shared.txt"
+  git -C "$OV_B" add shared.txt; git -C "$OV_B" commit -qm "b shared"
+  out="$(run_boss_state "$OVST" review ov-a --project "$P_OV" --json)"
+  check_eq "overlap: file" "shared.txt" "$(printf '%s' "$out" | jq -r '.overlaps[0].file')"
+  check_contains "overlap: both changes" "ov-b" \
+    "$(printf '%s' "$out" | jq -r '.overlaps[0].changes | join(",")')"
+fi
+P_OD="$TMP/project-parallel-overlap-disjoint"
+make_git_project "$P_OD"
+make_change "$P_OD" od-a '- [ ] 1.1 Code.'
+make_change "$P_OD" od-b '- [ ] 1.1 Code.'
+plan_commit "$P_OD" od-a >/dev/null
+ODST="$TMP/parallel-overlap-disjoint-state"
+mkdir -p "$ODST"
+out="$(BOSS_MAX_PARALLEL=2 run_boss_state "$ODST" dispatch od-a --project "$P_OD" --touches none)"
+OD_A="$(printf '%s' "$out" | jq -r '.worktree')"
+OD_AG="$(jq -nc '[{name:"apply-od-a",pane_id:"pane-od-a",workspace_id:"ws-wt-od-a"}]')"
+out="$(BOSS_MAX_PARALLEL=2 HERDR_AGENTS_JSON="$OD_AG" run_boss_state "$ODST" dispatch od-b --project "$P_OD" --touches none)"
+OD_B="$(printf '%s' "$out" | jq -r '.worktree')"
+if [ -z "$OD_A" ] || [ ! -d "$OD_A" ] || [ -z "$OD_B" ] || [ ! -d "$OD_B" ]; then
+  bad "overlap disjoint: dispatch produced no worktrees"
+else
+  printf 'a\n' >"$OD_A/a.txt"; git -C "$OD_A" add a.txt; git -C "$OD_A" commit -qm a
+  printf 'b\n' >"$OD_B/b.txt"; git -C "$OD_B" add b.txt; git -C "$OD_B" commit -qm b
+  out="$(run_boss_state "$ODST" review od-a --project "$P_OD" --json)"
+  check_eq "overlap disjoint: none" "0" "$(printf '%s' "$out" | jq '.overlaps | length')"
+fi
+
+# 78. Resource warnings are returned by dispatch and do not stop or interrupt
+# an apply; the fill loop's soft stop is part of the skill contract.
+MEM_LOW="$TMP/parallel-meminfo"
+LOAD_HIGH="$TMP/parallel-loadavg"
+printf 'MemAvailable: 100000 kB\n' >"$MEM_LOW"
+printf '100.0 1.0 1.0 1/1 1\n' >"$LOAD_HIGH"
+P_RES="$TMP/project-parallel-resource"
+make_project "$P_RES"
+make_change "$P_RES" res-a '- [ ] 1.1 Code.'
+make_change "$P_RES" res-b '- [ ] 1.1 Code.'
+RST_RES="$TMP/parallel-resource-state"
+mkdir -p "$RST_RES"
+out="$(BOSS_MEMINFO_FILE="$MEM_LOW" BOSS_LOADAVG_FILE="$LOAD_HIGH" BOSS_DISPATCH_MIN_FREE_MB=1024 BOSS_DISPATCH_MAX_LOAD=1 \
+  run_boss_state "$RST_RES" dispatch res-a --project "$P_RES" --touches none)"
+check_eq "resource: first starts" "started" "$(printf '%s' "$out" | jq -r '.status')"
+check_contains "resource: warning names memory" "free memory" "$(printf '%s' "$out" | jq -r '.resource_warning')"
+check_contains "resource: warning names load" "1-min load" "$(printf '%s' "$out" | jq -r '.resource_warning')"
+out="$(BOSS_MEMINFO_FILE="$MEM_LOW" BOSS_LOADAVG_FILE="$LOAD_HIGH" BOSS_DISPATCH_MIN_FREE_MB=1024 BOSS_DISPATCH_MAX_LOAD=1 \
+  run_boss_state "$RST_RES" dispatch res-b --project "$P_RES" --touches none)"
+check_eq "resource: second starts" "started" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "resource: first still recorded" "1" \
+  "$( [ -f "$RST_RES/applies/$(run_lib sha1_hex "$P_RES")-res-a.json" ] && printf 1 || printf 0)"
+out="$(run_boss_state "$RST_RES" status res-a --project "$P_RES" --json)"
+check_eq "resource: first still running" "res-a" "$(printf '%s' "$out" | jq -r '.change')"
+check_eq "resource: first merge state" "none" "$(printf '%s' "$out" | jq -r '.merge_state')"
+
+# 79. Documentation and both skills describe the parallel rules.
+readme="$(cat "$ROOT/README.md")"
+skill="$(cat "$ROOT/vision/SKILL.md")"
+boss_skill="$(cat "$ROOT/boss/SKILL.md")"
+for needle in "max_parallel" "BOSS_MAX_PARALLEL" "touches:" "touches: none" "worktree_required" "parallel_limit" "no_startable" "overlaps"; do
+  check_contains "parallel readme: $needle" "$needle" "$readme"
+done
+for doc in "$skill" "$boss_skill"; do
+  for needle in "BOSS_MAX_PARALLEL" "touches:" "touches: none" "parallel_limit" "no_startable"; do
+    check_contains "parallel skill: $needle" "$needle" "$doc"
+  done
 done
 
 # 57. The installer bundles the boss skill, keeps foreign directories and

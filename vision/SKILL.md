@@ -272,6 +272,14 @@ After all features have changes assigned, do exactly one sort pass:
   runner (no annotation). A mixed change uses the runner of its dominant part
   or is split into two changes. The runner names must exist under `[runners]`
   in `boss.toml`; `boss mission next` starts the change with that runner.
+- Assign locks to every change on the same bullet:
+  `- spike-api (runner: claude-opus; touches: src/api, deps)`. List the source
+  paths or directories the change will edit and the shared resources it uses
+  (`deps`, `test-env`, `port:<n>`, `db:<name>`). Use `touches: none` for an
+  isolated change; omit `touches:` only while uncertain, which makes the change
+  exclusive and serial. Locks match exactly or by path prefix when both sides
+  contain `/`, and a missing declaration keeps the change serial. The final
+  sort may add or adjust annotations but never rewrites artifacts.
 - Move changes between mission change lists only:
   `boss mission add <new-version> <change> --project <p>` and
   `boss mission rm <old-version> <change> --project <p>`.
@@ -507,14 +515,39 @@ opencode integration v13 or newer. Re-run `./install.sh` after updating Herdr.
    end the mission; resume it later with `boss resume` or checked-off tasks.
    After the last version, report completion or handoff and offer archiving.
 
+### Parallel slots
+
+`[missions] max_parallel` (default `1`) caps how many applies run at once;
+`BOSS_MAX_PARALLEL` overrides it for one process. Above `1`, every apply uses
+the worktree lifecycle and a base-checkout dispatch is refused with
+`worktree_required`.
+
+Fill free slots instead of dispatching one change and waiting:
+
+1. Call `boss mission next <slug> --project <p>`. While it returns `started`,
+   call it again; each call selects and starts one change.
+2. Stop filling on `parallel_limit`, `no_startable`, `waiting_human`,
+   `mission_complete`, or a non-null `resource_warning` in the dispatch result.
+   A resource warning stops new starts only; running applies continue.
+3. End the turn and wait for a wake. Drain `boss inbox`, review each finished
+   change, finish or retrigger it, then refill the slots.
+4. At `max_parallel = 1` this is the existing serial path: dispatch once and
+   wait for that change's wake.
+
+`boss mission next` names blocking holders in `no_startable` and reports
+`parallel_limit` with `current`, `max` and `slots_free`. Declare `touches:` on
+mission bullets (`touches: none` for an isolated change); a missing declaration
+stays exclusive. `boss mission status` shows the slots.
+
 ### Worktree applies
 
 An isolated apply runs in a git worktree outside the project tree, on branch
 `boss/<change>`, in its own Herdr workspace. Choose the mode with
 `[missions] worktrees = "auto"|"always"|"never"` (default `auto`) in
 `boss.toml`, or per command with `--worktree` / `--no-worktree` on
-`boss dispatch` and `boss mission next`. In this change `auto` keeps the
-base-checkout behaviour; `always` and `--worktree` isolate.
+`boss dispatch` and `boss mission next`. `auto` keeps the base checkout at a
+serial limit and isolates every apply when `max_parallel > 1`; `always` and
+`--worktree` isolate at any limit.
 
 Before the first isolated dispatch, commit the plan on the base branch:
 

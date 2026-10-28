@@ -116,7 +116,7 @@ log() {
 # the tab is closed again and the pane's last visible lines are attached as
 # pane_tail, unless BOSS_KEEP_FAILED_TAB=1.
 die_json() {
-  local code="$1" msg="$2" tail_json="null"
+  local code="$1" msg="$2" extra="${3:-}" tail_json="null"
   # A worktree dispatch that fails after creating its worktree must not leave a
   # half-created apply behind. Cleanup never masks the original error.
   if [ -n "${BOSS_FAILED_WORKTREE:-}" ]; then
@@ -133,8 +133,13 @@ die_json() {
     fi
     BOSS_FAILED_TAB=""
   fi
-  jq -nc --arg code "$code" --arg msg "$msg" --argjson tail "$tail_json" \
-    '{error: $code, message: $msg} + (if $tail == null then {} else {pane_tail: $tail} end)' >&2
+  if [ -n "$extra" ]; then
+    jq -nc --arg code "$code" --arg msg "$msg" --argjson tail "$tail_json" --argjson extra "$extra" \
+      '{error: $code, message: $msg} + (if $tail == null then {} else {pane_tail: $tail} end) + $extra' >&2
+  else
+    jq -nc --arg code "$code" --arg msg "$msg" --argjson tail "$tail_json" \
+      '{error: $code, message: $msg} + (if $tail == null then {} else {pane_tail: $tail} end)' >&2
+  fi
   exit 1
 }
 
@@ -1867,18 +1872,125 @@ PY
 
 # ------------------------------------------------------------- resources ---
 
-# open_apply_count -- number of state files in $BOSS_APPLIES_DIR for applies
-# that are still running. A parked change keeps its state file for 'boss
-# status' but holds no executer, so it is not counted.
+# open_apply_count [<exclude-state-file>] -- number of applies that are still
+# running. A parked change keeps its state file for 'boss status' but holds no
+# executer, so it is not counted; a merged/kept state (merge_state=done) is
+# finished and not counted either. A merge_test_failed or merge_conflict state
+# still counts because the change is unfinished even when its agent is gone.
+# A state whose recorded pane no longer hosts a live agent is stale and does
+# not consume a slot; when the agent list cannot be read, every unfinished
+# state counts (fail-safe).
 open_apply_count() {
-  local f n=0
+  local skip="${1:-}" f n=0 agents="" have_agents=0 ms parked pane
   [ -d "$BOSS_APPLIES_DIR" ] || { printf '0\n'; return 0; }
+  if agents="$(herdr_json agent list 2>/dev/null)"; then
+    printf '%s' "$agents" | jq -e '.agents' >/dev/null 2>&1 && have_agents=1
+  fi
   for f in "$BOSS_APPLIES_DIR"/*.json; do
     [ -f "$f" ] || continue
-    [ "$(jq -r '.parked // false' "$f" 2>/dev/null || printf false)" = "true" ] && continue
+    [ -n "$skip" ] && [ "$f" = "$skip" ] && continue
+    parked="$(jq -r '.parked // false' "$f" 2>/dev/null || printf false)"
+    [ "$parked" = "true" ] && continue
+    ms="$(jq -r '.merge_state // "none"' "$f" 2>/dev/null || printf none)"
+    [ "$ms" = "done" ] && continue
+    case "$ms" in
+      test_failed|conflict) ;;
+      *)
+        if [ "$have_agents" -eq 1 ]; then
+          pane="$(jq -r '.pane_id // empty' "$f" 2>/dev/null || true)"
+          if [ -z "$pane" ] || [ "$pane" = "null" ] \
+             || ! printf '%s' "$agents" | jq -e --arg p "$pane" \
+                  '[.agents[] | select(.pane_id == $p)] | length > 0' >/dev/null 2>&1; then
+            continue
+          fi
+        fi
+        ;;
+    esac
     n=$((n + 1))
   done
   printf '%s\n' "$n"
+}
+
+# touches_overlap <a-json> <b-json> -- 0 when the two lock arrays intersect.
+# Locks match exactly, or by path prefix when both sides contain '/'. A
+# trailing slash is ignored; a key without '/' never prefix-matches a path.
+touches_overlap() {
+  local a="$1" b="$2" x y
+  while IFS= read -r x; do
+    [ -n "$x" ] || continue
+    x="$(printf '%s' "$x" | sed 's:/*$::')"
+    [ -n "$x" ] || continue
+    while IFS= read -r y; do
+      [ -n "$y" ] || continue
+      y="$(printf '%s' "$y" | sed 's:/*$::')"
+      [ -n "$y" ] || continue
+      [ "$x" = "$y" ] && return 0
+      case "$x" in
+        */*)
+          case "$y" in
+            */*)
+              case "$y" in "$x"/*) return 0 ;; esac
+              case "$x" in "$y"/*) return 0 ;; esac
+              ;;
+          esac
+          ;;
+      esac
+    done < <(printf '%s' "$b" | jq -r '.[]?')
+  done < <(printf '%s' "$a" | jq -r '.[]?')
+  return 1
+}
+
+# lock_holders <project> [<exclude-state-file>] -- compact JSON array of the
+# applies of <project> that still hold locks: running applies, parked applies
+# with a worktree (unmerged work) and conflict/test-failed states. A merged
+# green kept worktree holds nothing because its code is already in the base.
+lock_holders() {
+  local project="$1" exclude="${2:-}" f json='[]' ms parked wt
+  [ -d "$BOSS_APPLIES_DIR" ] || { printf '[]\n'; return 0; }
+  for f in "$BOSS_APPLIES_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    [ -n "$exclude" ] && [ "$f" = "$exclude" ] && continue
+    [ "$(jq -r '.project // empty' "$f" 2>/dev/null || true)" = "$project" ] || continue
+    ms="$(jq -r '.merge_state // "none"' "$f" 2>/dev/null || printf none)"
+    [ "$ms" = "done" ] && continue
+    parked="$(jq -r '.parked // false' "$f" 2>/dev/null || printf false)"
+    wt="$(jq -r '.worktree // empty' "$f" 2>/dev/null || true)"
+    if [ "$parked" = "true" ] && [ -z "$wt" ]; then continue; fi
+    json="$(printf '%s' "$json" | jq -c --arg f "$f" \
+      --arg change "$(jq -r '.change // empty' "$f" 2>/dev/null || true)" \
+      --arg project "$project" --arg merge_state "$ms" --arg worktree "$wt" \
+      --argjson touches "$(jq -c '.touches // []' "$f" 2>/dev/null || printf '[]')" \
+      --argjson declared "$(jq -r '.declared // false' "$f" 2>/dev/null || printf false)" \
+      '. + [{change: $change, project: $project, touches: $touches,
+             declared: $declared, merge_state: $merge_state,
+             worktree: (if $worktree == "" then null else $worktree end),
+             state_file: $f}]')"
+  done
+  printf '%s\n' "$json"
+}
+
+# lock_check <project> <change> <touches-json> <declared> [<exclude-state>] --
+# compact JSON {change, conflict, holders, holder}. A candidate without a
+# declaration is exclusive: it conflicts with any holder. If any holder is
+# undeclared, a declared candidate waits too. Otherwise only intersecting lock
+# sets conflict.
+lock_check() {
+  local project="$1" change="$2" touches="$3" declared="$4" exclude="${5:-}"
+  local holders h ht hd conflict=false conflicts="[]"
+  holders="$(lock_holders "$project" "$exclude")"
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    ht="$(printf '%s' "$h" | jq -c '.touches')"
+    hd="$(printf '%s' "$h" | jq -r '.declared')"
+    if [ "$declared" != "true" ] || [ "$hd" != "true" ] || touches_overlap "$touches" "$ht"; then
+      conflict=true
+      conflicts="$(printf '%s' "$conflicts" | jq -c --argjson h "$h" '. + [$h]')"
+    fi
+  done < <(printf '%s' "$holders" | jq -c '.[]')
+  jq -nc --arg change "$change" --argjson conflict "$conflict" \
+    --argjson holders "$conflicts" \
+    '{change: $change, conflict: $conflict, holders: $holders,
+      holder: ($holders[0] // null)}'
 }
 
 # free_mem_mb -- MemAvailable from BOSS_MEMINFO_FILE (/proc/meminfo) in MB, or

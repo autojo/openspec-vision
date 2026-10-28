@@ -28,7 +28,7 @@ usage() {
 boss -- control session for OpenSpec apply cycles (see README.md)
 
 Usage:
-  boss dispatch <change> [--project <name|path>] [--runner <name>] [--note <text>] [--worktree|--no-worktree] [--as <pane|agent>]
+  boss dispatch <change> [--project <name|path>] [--runner <name>] [--note <text>] [--worktree|--no-worktree] [--touches <list|none>] [--as <pane|agent>]
   boss plan commit <change> [--project <name|path>]
   boss status [<change>] [--project <name|path>] [--json]
   boss review <change> [--project <name|path>] [--json]
@@ -157,6 +157,8 @@ ensure_config() {
     printf '# shop = "~/work/shop"\n'
     printf '\n[missions]\n'
     printf '# worktrees = "auto"  # auto | always | never; --worktree/--no-worktree override\n'
+    printf '# max_parallel = 1     # hard cap on running applies; > 1 forces worktrees\n'
+    printf '#                      # BOSS_MAX_PARALLEL overrides it for one process\n'
   } >"$BOSS_CONFIG"
   log "generated config at $BOSS_CONFIG (default runner: $default_runner)"
 }
@@ -374,13 +376,24 @@ mission_worktree_mode() {
   printf '%s\n' "$mode"
 }
 
-# resolve_worktree_flag <mode> <worktree-flag> <no-worktree-flag> -- 1 when the
-# apply runs in a worktree. An explicit flag wins over the configured mode;
-# 'auto' stays on the base checkout in this change.
+# resolve_worktree_flag <mode> <worktree-flag> <no-worktree-flag> [<max-parallel>]
+# -- 1 when the apply runs in a worktree. An explicit flag wins over the
+# configured mode at a serial limit; above one the run is worktree-only, so a
+# base-checkout dispatch is refused with worktree_required.
 resolve_worktree_flag() {
-  local mode="$1" want="${2:-}" never="${3:-}"
+  local mode="$1" want="${2:-}" never="${3:-}" max="${4:-1}"
   if [ "$want" = "1" ] && [ "$never" = "1" ]; then
     usage_error "--worktree and --no-worktree are mutually exclusive"
+  fi
+  if [ "$max" -gt 1 ] 2>/dev/null; then
+    if [ "$never" = "1" ]; then
+      die_json "worktree_required" "max_parallel=$max runs applies in worktrees only; --no-worktree is refused so the base checkout stays clean"
+    fi
+    case "$mode" in
+      never) die_json "worktree_required" "max_parallel=$max runs applies in worktrees only; [missions] worktrees = \"never\" is refused so the base checkout stays clean" ;;
+    esac
+    printf '1\n'
+    return 0
   fi
   if [ "$want" = "1" ]; then printf '1\n'; return 0; fi
   if [ "$never" = "1" ]; then printf '0\n'; return 0; fi
@@ -388,6 +401,29 @@ resolve_worktree_flag() {
     always) printf '1\n' ;;
     *) printf '0\n' ;;
   esac
+}
+
+# mission_max_parallel -- effective hard concurrency limit: BOSS_MAX_PARALLEL
+# when set for this process, otherwise [missions] max_parallel (default 1). A
+# missing, non-integer or below-one value is a config error, never a silent
+# fallback.
+mission_max_parallel() {
+  local cfg value source="[missions] max_parallel"
+  cfg="$(config_json)" || exit 1
+  value="$(printf '%s' "$cfg" | jq -r '.missions.max_parallel // 1')"
+  if [ -n "${BOSS_MAX_PARALLEL:-}" ]; then
+    value="$BOSS_MAX_PARALLEL"
+    source="BOSS_MAX_PARALLEL"
+  fi
+  case "$value" in
+    ''|*[!0-9]*)
+      die_json "invalid_max_parallel" "invalid max_parallel value '$value' from $source; use an integer >= 1"
+      ;;
+  esac
+  if [ "$value" -lt 1 ] 2>/dev/null; then
+    die_json "invalid_max_parallel" "invalid max_parallel value '$value' from $source; use an integer >= 1"
+  fi
+  printf '%s\n' "$value"
 }
 
 # git_dirty_paths <dir> <all|plan|code> -- changed paths from git status, one
@@ -924,9 +960,23 @@ external_verify_prompt_block() {
 
 # ---------------------------------------------------------------- dispatch ---
 
+# parse_touches_value <raw> -- lock array JSON for a manual --touches value.
+# 'none' declares that the change shares nothing; otherwise the value is a
+# comma list of resource keys or path prefixes.
+parse_touches_value() {
+  local raw="$1"
+  if [ "$raw" = "none" ]; then
+    printf '[]\n'
+    return 0
+  fi
+  printf '%s' "$raw" | tr ',' '\n' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+    | jq -Rsc 'split("\n") | map(select(length > 0))'
+}
+
 cmd_dispatch() {
   local change="" project_name="" runner_name="" note="" as_target="" arg
-  local wt_flag="" no_wt_flag=""
+  local wt_flag="" no_wt_flag="" touches_raw="" touches_given=0
   while [ $# -gt 0 ]; do
     arg="$1"; shift
     case "$arg" in
@@ -935,32 +985,40 @@ cmd_dispatch() {
       --note) note="$(one_line "${1:-}")"; shift ;;
       --worktree) wt_flag=1 ;;
       --no-worktree) no_wt_flag=1 ;;
+      --touches) touches_raw="${1:-}"; touches_given=1; shift ;;
       --as) as_target="${1:-}"; shift ;;
       -h|--help) usage ;;
       --*) usage_error "unknown option: $arg" ;;
       *) if [ -z "$change" ]; then change="$arg"; else usage_error "unexpected argument: $arg"; fi ;;
     esac
   done
-  [ -n "$change" ] || usage_error "usage: boss dispatch <change> [--project <name|path>] [--runner <name>] [--worktree|--no-worktree] [--as <pane|agent>]"
+  [ -n "$change" ] || usage_error "usage: boss dispatch <change> [--project <name|path>] [--runner <name>] [--worktree|--no-worktree] [--touches <list|none>] [--as <pane|agent>]"
 
   # The identity is resolved before any claim or state write.
   boss_use_caller "$as_target"
   ensure_boss_claim dispatch
   ensure_config
 
-  local runner project wt_mode want_worktree
+  local runner project wt_mode want_worktree max_parallel touches_json='[]' declared=false
   runner="$(resolve_runner "$runner_name")" || exit 1
   project="$(resolve_project "$project_name")" || exit 1
+  max_parallel="$(mission_max_parallel)" || exit 1
   wt_mode="$(mission_worktree_mode)" || exit 1
-  want_worktree="$(resolve_worktree_flag "$wt_mode" "$wt_flag" "$no_wt_flag")" || exit 1
-  dispatch_change "$change" "$project" "$runner" "$note" "$want_worktree"
+  want_worktree="$(resolve_worktree_flag "$wt_mode" "$wt_flag" "$no_wt_flag" "$max_parallel")" || exit 1
+  if [ "$touches_given" -eq 1 ]; then
+    touches_json="$(parse_touches_value "$touches_raw")"
+    declared=true
+  fi
+  dispatch_change "$change" "$project" "$runner" "$note" "$want_worktree" "$touches_json" "$declared"
 }
 
-# dispatch_change <change> <project> <runner-json> <note> [<want-worktree>] --
-# shared dispatch path of 'boss dispatch', 'boss mission next' and a resumed
-# worktree apply. The caller has established the boss claim and config and
-# resolved project and runner. <want-worktree> is 1 for the isolated lifecycle;
-# a recorded worktree always wins so resume/retrigger reuse it.
+# dispatch_change <change> <project> <runner-json> <note> [<want-worktree>]
+# [<touches-json> <declared>] -- shared dispatch path of 'boss dispatch',
+# 'boss mission next' and a resumed worktree apply. The caller has established
+# the boss claim and config and resolved project and runner. <want-worktree> is
+# 1 for the isolated lifecycle; a recorded worktree always wins so
+# resume/retrigger reuse it. <touches-json>/<declared> come from a mission
+# bullet or a manual --touches; an existing state keeps its own values.
 dispatch_change() {
   local change="$1" project="$2" runner="$3" note="$4" want_worktree="${5:-0}"
   # The dispatcher is the verified caller. Its workspace and cwd are recorded
@@ -997,12 +1055,72 @@ dispatch_change() {
   local state_file
   state_file="$(state_file_for "$project" "$change")"
   local existing_worktree="" existing_branch="" existing_base=""
+  local existing_touches="[]" existing_declared="false"
+  local touches_json="${6:-[]}" declared="${7:-false}"
   if [ -f "$state_file" ]; then
     existing_worktree="$(jq -r '.worktree // empty' "$state_file" 2>/dev/null || true)"
     existing_branch="$(jq -r '.branch // empty' "$state_file" 2>/dev/null || true)"
     existing_base="$(jq -r '.base_head // empty' "$state_file" 2>/dev/null || true)"
+    existing_touches="$(jq -c '.touches // []' "$state_file" 2>/dev/null || printf '[]')"
+    existing_declared="$(jq -r '.declared // false' "$state_file" 2>/dev/null || printf false)"
+    # A resumed or retriggered apply keeps the declarations it started with;
+    # an old state without them stays exclusive.
+    touches_json="$existing_touches"
+    declared="$existing_declared"
   fi
   [ -n "$existing_worktree" ] && want_worktree=1
+
+  local max_parallel
+  max_parallel="$(mission_max_parallel)" || exit 1
+  if [ "$max_parallel" -gt 1 ] && [ "$want_worktree" != "1" ]; then
+    die_json "worktree_required" "max_parallel=$max_parallel runs applies in worktrees only; dispatch '$change' with --worktree or set [missions] worktrees = \"always\""
+  fi
+
+  # An already-running apply wins over the slot/lock checks: dispatching the
+  # same change again is idempotent and does not create anything.
+  existing="$(find_running_apply "$change" "$project" "$existing_worktree")"
+  if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+    pane_id="$(printf '%s' "$existing" | jq -r '.pane_id')"
+    tab_id="$(printf '%s' "$existing" | jq -r '.tab_id')"
+    workspace_id="$(printf '%s' "$existing" | jq -r '.workspace_id')"
+    # The already-running apply keeps its recorded dispatcher as the next wake.
+    if [ -f "$state_file" ]; then
+      wake_target="$(boss_wake_plan "$state_file" | jq -c '.next // null')"
+    else
+      wake_target="null"
+    fi
+    printf '%s\n' "$(jq -n \
+      --arg change "$change" --arg project "$project" \
+      --arg runner "$(printf '%s' "$runner" | jq -r '.name')" \
+      --arg agent "$agent_name" --arg pane_id "$pane_id" --arg tab_id "$tab_id" \
+      --arg workspace_id "$workspace_id" --arg status "already_running" \
+      --arg worktree "$existing_worktree" --arg branch "$existing_branch" \
+      --argjson touches "$touches_json" --argjson declared "$declared" \
+      --argjson wake_target "$wake_target" --argjson warnings "$warnings_json" \
+      --argjson project_registered "$project_registered" --arg hint "$hint" --arg resource_warning "$resource_warn" \
+      --argjson mode "$mode_json" \
+      '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), touches: $touches, declared: $declared, status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode}')"
+    return 0
+  fi
+
+  # Hard concurrency limit: one slot per running apply, globally. Excluding
+  # this change's own state lets a retrigger or resume reuse its slot.
+  local running
+  running="$(open_apply_count "$state_file")"
+  if [ "$running" -ge "$max_parallel" ] 2>/dev/null; then
+    die_json "parallel_limit" "parallel limit reached: $running running apply(s), max_parallel=$max_parallel; finish or park one before dispatching '$change'" \
+      "$(jq -nc --argjson c "$running" --argjson m "$max_parallel" '{current: $c, max: $m, slots_free: 0}')"
+  fi
+
+  # Locks are checked before the worktree or tab exists, so a conflict starts
+  # nothing. A candidate without a touches declaration is exclusive.
+  local lock_json lock_holder
+  lock_json="$(lock_check "$project" "$change" "$touches_json" "$declared" "$state_file")"
+  if [ "$(printf '%s' "$lock_json" | jq -r '.conflict')" = "true" ]; then
+    lock_holder="$(printf '%s' "$lock_json" | jq -r '.holder.change // "unknown"')"
+    die_json "lock_conflict" "change '$change' conflicts with running or unmerged change '$lock_holder'; declared locks: $(printf '%s' "$touches_json" | jq -c '.')" \
+      "$(printf '%s' "$lock_json" | jq -c '{holder: .holder, holders: .holders}')"
+  fi
 
   local worktree="" branch="" worktree_workspace="" apply_root="$project"
   local base_head=""
@@ -1059,30 +1177,6 @@ dispatch_change() {
     [ -n "$worktree_workspace" ] || worktree_workspace="$(ensure_workspace "$worktree" "$change")"
     BOSS_FAILED_WORKTREE_WS="$worktree_workspace"
     apply_root="$worktree"
-  fi
-
-  existing="$(find_running_apply "$change" "$project" "$worktree")"
-  if [ -n "$existing" ] && [ "$existing" != "null" ]; then
-    pane_id="$(printf '%s' "$existing" | jq -r '.pane_id')"
-    tab_id="$(printf '%s' "$existing" | jq -r '.tab_id')"
-    workspace_id="$(printf '%s' "$existing" | jq -r '.workspace_id')"
-    # The already-running apply keeps its recorded dispatcher as the next wake.
-    if [ -f "$state_file" ]; then
-      wake_target="$(boss_wake_plan "$state_file" | jq -c '.next // null')"
-    else
-      wake_target="null"
-    fi
-    printf '%s\n' "$(jq -n \
-      --arg change "$change" --arg project "$project" \
-      --arg runner "$(printf '%s' "$runner" | jq -r '.name')" \
-      --arg agent "$agent_name" --arg pane_id "$pane_id" --arg tab_id "$tab_id" \
-      --arg workspace_id "$workspace_id" --arg status "already_running" \
-      --arg worktree "$worktree" --arg branch "$branch" \
-      --argjson wake_target "$wake_target" --argjson warnings "$warnings_json" \
-      --argjson project_registered "$project_registered" --arg hint "$hint" --arg resource_warning "$resource_warn" \
-      --argjson mode "$mode_json" \
-      '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode}')"
-    return 0
   fi
 
   local kind apply_template apply_cmd
@@ -1200,9 +1294,10 @@ dispatch_change() {
     --arg base_head "$base_head" \
     --arg worktree "$worktree" --arg branch "$branch" \
     --arg worktree_workspace "$worktree_workspace" \
+    --argjson touches "$touches_json" --argjson declared "$declared" \
     --arg started_at "$now" --arg last_state "working" --arg last_state_at "$now" \
     --argjson mode "$mode_json" \
-    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, lessons: $lessons, external_block: $external_block, commit_block: $commit_block, commit_policy: $commit_policy, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), merge_state: "none", merged: false, merge_test: "not_run", kept: false, boss: $boss, boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_workspace: (if $boss_workspace == "" then null else $boss_workspace end), boss_cwd: (if $boss_cwd == "" then null else $boss_cwd end), boss_cross_workspace: $boss_cross, boss_cross_project: $boss_cross_project, base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at, opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode}' \
+    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, lessons: $lessons, external_block: $external_block, commit_block: $commit_block, commit_policy: $commit_policy, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), touches: $touches, declared: $declared, merge_state: "none", merged: false, merge_test: "not_run", kept: false, boss: $boss, boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_workspace: (if $boss_workspace == "" then null else $boss_workspace end), boss_cwd: (if $boss_cwd == "" then null else $boss_cwd end), boss_cross_workspace: $boss_cross, boss_cross_project: $boss_cross_project, base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at, opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode}' \
     >"$state_file" || die_json "state_write" "cannot write state file $state_file"
 
   detach_waiter "$state_file"
@@ -1221,10 +1316,11 @@ dispatch_change() {
     --arg agent "$agent_name" --arg pane_id "$pane_id" --arg tab_id "$tab_id" \
     --arg workspace_id "$workspace_id" --arg status "started" \
     --arg worktree "$worktree" --arg branch "$branch" \
+    --argjson touches "$touches_json" --argjson declared "$declared" \
     --argjson wake_target "$wake_target" --argjson warnings "$warnings_json" \
     --argjson project_registered "$project_registered" --arg hint "$hint" --arg resource_warning "$resource_warn" \
     --argjson mode "$mode_json" \
-    '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode}')"
+    '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), touches: $touches, declared: $declared, status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode}')"
 }
 
 # --------------------------------------------------------------- retarget ---
@@ -1364,7 +1460,7 @@ status_one() {
   local change="$1" project_name="$2" json_only="$3"
   local state_file project agent pane_id tab_id workspace_id last_state last_state_at waiter_pid waiter_alive_flag
   local opencode_version permission_mode
-  local worktree branch worktree_workspace merge_state merged merge_test kept review_root
+  local worktree branch worktree_workspace merge_state merged merge_test kept review_root touches declared
   state_file="$(find_state_file "$change" "$project_name")" || exit 1
   project="$(jq -r '.project' "$state_file")"
   worktree="$(jq -r '.worktree // empty' "$state_file" 2>/dev/null || true)"
@@ -1374,6 +1470,8 @@ status_one() {
   merged="$(jq -r '.merged // false' "$state_file" 2>/dev/null || printf false)"
   merge_test="$(jq -r '.merge_test // "not_run"' "$state_file" 2>/dev/null || true)"
   kept="$(jq -r '.kept // false' "$state_file" 2>/dev/null || printf false)"
+  touches="$(jq -c '.touches // []' "$state_file" 2>/dev/null || printf '[]')"
+  declared="$(jq -r '.declared // false' "$state_file" 2>/dev/null || printf false)"
   review_root="${worktree:-$project}"
   agent="$(jq -r '.agent' "$state_file")"
   pane_id="$(jq -r '.pane_id' "$state_file")"
@@ -1494,8 +1592,8 @@ status_one() {
     --arg opencode_version "$opencode_version" --arg permission_mode "$permission_mode" \
     --arg worktree "$worktree" --arg branch "$branch" --arg worktree_workspace "$worktree_workspace" \
     --arg merge_state "$merge_state" --argjson merged "$merged" --arg merge_test "$merge_test" \
-    --argjson kept "$kept" \
-    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), merge_state: $merge_state, merged: $merged, merge_test: $merge_test, kept: $kept, pane: $pane, herdr_agent: $herdr_agent, waiter_pid: (if $waiter_pid == "" then null else ($waiter_pid | tonumber? // $waiter_pid) end), waiter_alive: $waiter_alive, waiter: $waiter, inbox_pending: $inbox_pending, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, state: $state, human_tasks: $human_tasks, external_tasks: $external_tasks, opencode_version: (if $opencode_version == "" then null else ($opencode_version | tonumber? // null) end), permission_mode: (if $permission_mode == "" then null else $permission_mode end), lessons: {global: $lessons_global, project: $lessons_project}, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end), boss: (if $boss == "" then null else $boss end), boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok, wake_plan: $wake_plan, wake_target: $wake_target, last_wake: $last_wake}')"
+    --argjson kept "$kept" --argjson touches "$touches" --argjson declared "$declared" \
+    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), merge_state: $merge_state, merged: $merged, merge_test: $merge_test, kept: $kept, touches: $touches, declared: $declared, pane: $pane, herdr_agent: $herdr_agent, waiter_pid: (if $waiter_pid == "" then null else ($waiter_pid | tonumber? // $waiter_pid) end), waiter_alive: $waiter_alive, waiter: $waiter, inbox_pending: $inbox_pending, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, state: $state, human_tasks: $human_tasks, external_tasks: $external_tasks, opencode_version: (if $opencode_version == "" then null else ($opencode_version | tonumber? // null) end), permission_mode: (if $permission_mode == "" then null else $permission_mode end), lessons: {global: $lessons_global, project: $lessons_project}, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end), boss: (if $boss == "" then null else $boss end), boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok, wake_plan: $wake_plan, wake_target: $wake_target, last_wake: $last_wake}')"
 
   if [ "$json_only" -eq 1 ]; then
     printf '%s\n' "$json"
@@ -1509,6 +1607,11 @@ status_one() {
     printf 'branch: %s\n' "${branch:-unknown}"
   fi
   printf 'merge: %s (merged: %s, test: %s)\n' "$merge_state" "$merged" "$merge_test"
+  if [ "$declared" = "true" ]; then
+    printf 'locks: %s\n' "$(printf '%s' "$touches" | jq -r 'if length == 0 then "none" else join(", ") end')"
+  else
+    printf 'locks: undeclared (exclusive)\n'
+  fi
   if [ -n "$opencode_version" ]; then
     printf 'opencode: v%s (permission %s)\n' "$opencode_version" "${permission_mode:-unknown}"
   elif [ -n "$permission_mode" ]; then
@@ -1616,7 +1719,7 @@ status_all() {
     permission_mode="$(jq -r '.permission_mode // empty' "$state_file")"
     e="$(jq -c --arg s "$agent_state" --argjson wa "$waiter_alive_flag" --argjson ip "$inbox_pending" --arg ms "$mission_state" \
       --arg ov "$opencode_version" --arg pm "$permission_mode" \
-      '. + {agent_state: $s, waiter_alive: $wa, inbox_pending: $ip, waiter_pid: (.waiter_pid // null)} | {change, project, agent, agent_state, waiter_pid, waiter_alive, inbox_pending, pane_id, tab_id, workspace_id, worktree: (.worktree // null), branch: (.branch // null), merge_state: (.merge_state // "none"), merged: (.merged // false), merge_test: (.merge_test // "not_run"), kept: (.kept // false), last_state, last_state_at, state: $ms, opencode_version: (if $ov == "" then null else ($ov | tonumber? // null) end), permission_mode: (if $pm == "" then null else $pm end)}' "$state_file")"
+      '. + {agent_state: $s, waiter_alive: $wa, inbox_pending: $ip, waiter_pid: (.waiter_pid // null)} | {change, project, agent, agent_state, waiter_pid, waiter_alive, inbox_pending, pane_id, tab_id, workspace_id, worktree: (.worktree // null), branch: (.branch // null), merge_state: (.merge_state // "none"), merged: (.merged // false), merge_test: (.merge_test // "not_run"), kept: (.kept // false), touches: (.touches // []), declared: (.declared // false), last_state, last_state_at, state: $ms, opencode_version: (if $ov == "" then null else ($ov | tonumber? // null) end), permission_mode: (if $pm == "" then null else $pm end)}' "$state_file")"
     json="$(printf '%s' "$json" | jq -c --argjson e "$e" '. + [$e]')"
     if [ "$json_only" -eq 0 ]; then
       if [ "$mission_state" = "waiting_human" ]; then
@@ -1631,6 +1734,11 @@ status_all() {
           "$(jq -r '.worktree' "$state_file")" \
           "$(jq -r '.branch // "unknown"' "$state_file")" \
           "$(jq -r '.merge_state // "none"' "$state_file")"
+      fi
+      if [ "$(jq -r '.declared // false' "$state_file")" = "true" ]; then
+        printf '   locks: %s\n' "$(jq -r '(.touches // []) | if length == 0 then "none" else join(", ") end' "$state_file")"
+      else
+        printf '   locks: undeclared (exclusive)\n'
       fi
       if [ -n "$opencode_version" ]; then
         printf '   opencode: v%s, permission: %s\n' "$opencode_version" "${permission_mode:-unknown}"
@@ -1813,6 +1921,24 @@ state_commit_policy() {
   case "$policy" in agent|explorer) printf '%s' "$policy" ;; *) printf 'explorer' ;; esac
 }
 
+# changed_files_of <root> [<base>] -- every path changed in <root>, one per
+# line: uncommitted and untracked files from git status plus committed files
+# since <base>. Errors are ignored; the caller sorts and intersects the result.
+changed_files_of() {
+  local root="$1" base="${2:-}" line path
+  git -C "$root" status --porcelain --untracked-files=all 2>/dev/null \
+    | while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        path="${line:3}"
+        case "$path" in *" -> "*) path="${path#* -> }" ;; esac
+        printf '%s\n' "$path"
+      done
+  if [ -n "$base" ]; then
+    git -C "$root" diff --name-only "$base...HEAD" 2>/dev/null || true
+  fi
+  return 0
+}
+
 cmd_review() {
   # Read-only and herd-free: review must work in the boss session and outside
   # Herdr alike, so it does not claim the boss agent identity.
@@ -1938,6 +2064,31 @@ cmd_review() {
     violations="$(printf '%s' "$commits" | jq -Rsc 'split("\n") | map(select(length > 0))')"
   fi
 
+  # Merge overlap backstop: compare this worktree's changed files with those of
+  # the other running, parked and test-failed worktrees of the same project.
+  # The runtime never merges, rebases or resolves; the Explorer decides.
+  local overlaps="[]" current_files overlap_rows="[]"
+  local holder holder_change holder_wt holder_base holder_files ofile
+  current_files="$(changed_files_of "$review_root" "$base_head" | sort -u)"
+  if [ -n "$current_files" ] && [ -n "$state_file" ] && [ -f "$state_file" ]; then
+    while IFS= read -r holder; do
+      [ -n "$holder" ] || continue
+      holder_change="$(printf '%s' "$holder" | jq -r '.change')"
+      holder_wt="$(printf '%s' "$holder" | jq -r '.worktree // empty')"
+      [ -n "$holder_wt" ] && [ -d "$holder_wt" ] || continue
+      holder_base="$(jq -r '.base_head // empty' "$(printf '%s' "$holder" | jq -r '.state_file')" 2>/dev/null || true)"
+      holder_files="$(changed_files_of "$holder_wt" "$holder_base" | sort -u)"
+      while IFS= read -r ofile; do
+        [ -n "$ofile" ] || continue
+        printf '%s\n' "$current_files" | grep -Fxq -- "$ofile" || continue
+        overlap_rows="$(printf '%s' "$overlap_rows" | jq -c --arg f "$ofile" --arg c "$holder_change" \
+          '. + [{file: $f, change: $c}]')"
+      done <<<"$holder_files"
+    done < <(lock_holders "$project" "$state_file" | jq -c '.[]')
+    overlaps="$(printf '%s' "$overlap_rows" | jq -c --arg cur "$change" \
+      'group_by(.file) | map({file: .[0].file, changes: ([$cur] + map(.change) | unique)})')"
+  fi
+
   local summary
   summary=""
   if [ -n "$state_file" ] && [ -f "$state_file" ]; then
@@ -1996,12 +2147,13 @@ cmd_review() {
     --argjson wake_target "$wake_target" --argjson last_wake "$last_wake" \
     --arg worktree "$worktree" --arg branch "$branch" --arg worktree_workspace "$worktree_workspace" \
     --arg merge_state "$merge_state" --argjson merged "$merged" --arg merge_test "$merge_test" \
-    --argjson kept "$kept" \
+    --argjson kept "$kept" --argjson overlaps "$overlaps" \
     '{change: $change, project: $project, summary: (if $summary == "" then null else $summary end),
       worktree: (if $worktree == "" then null else $worktree end),
       branch: (if $branch == "" then null else $branch end),
       worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end),
       merge_state: $merge_state, merged: $merged, merge_test: $merge_test, kept: $kept,
+      overlaps: $overlaps,
       boss: (if $boss == "" then null else $boss end),
       boss_pane: (if $boss_pane == "" then null else $boss_pane end),
       boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok,
@@ -2033,6 +2185,7 @@ cmd_review() {
     printf 'branch: %s\n' "${branch:-unknown}"
   fi
   printf 'merge: %s (merged: %s, test: %s)\n' "$merge_state" "$merged" "$merge_test"
+  printf '%s' "$overlaps" | jq -r '.[] | "overlap: \(.file) (changes: \(.changes | join(", ")))"'
   if [ "$boss_state" = "name_stale" ]; then
     printf 'warning: workspace boss %s on pane %s lost its Herdr name; the waiter may not wake it (run boss claim there to heal it)\n' "${boss:-unknown}" "${boss_pane:-unknown}"
   elif [ "$boss_state" = "not_reachable" ]; then
@@ -2731,6 +2884,37 @@ cmd_doctor() {
     doctor_add mission_runners ok ""
   else
     doctor_add mission_runners warn "unknown runner(s) in missions:$runner_warn; add them under [runners] in $BOSS_CONFIG or correct the bullet"
+  fi
+
+  # The effective parallel limit and, above one, the lock declarations of every
+  # mission change. A missing declaration is safe (the change runs alone) but
+  # must be visible before a parallel run.
+  local parallel_value="1" parallel_hint lock_missing="" lock_mf lock_parsed lock_change
+  if parallel_value="$(mission_max_parallel 2>/dev/null)"; then
+    parallel_hint="max_parallel = $parallel_value"
+    [ -n "${BOSS_MAX_PARALLEL:-}" ] && parallel_hint="$parallel_hint (BOSS_MAX_PARALLEL)"
+    [ "$parallel_value" -gt 1 ] && parallel_hint="$parallel_hint; parallel mode uses worktrees only"
+    doctor_add mission_parallel ok "$parallel_hint"
+  else
+    parallel_value=1
+    doctor_add mission_parallel fail "invalid max_parallel; use an integer >= 1 in [missions] or BOSS_MAX_PARALLEL"
+  fi
+  if [ "$parallel_value" -gt 1 ] && [ -n "$mdir" ] && [ -d "$mdir" ]; then
+    for lock_mf in "$mdir"/*.md; do
+      [ -f "$lock_mf" ] || continue
+      lock_parsed="$(mission_parse "$lock_mf" 2>/dev/null || true)"
+      [ -n "$lock_parsed" ] || continue
+      while IFS= read -r lock_change; do
+        [ -n "$lock_change" ] || continue
+        lock_missing="$lock_missing $(basename "$lock_mf" .md):$lock_change"
+      done < <(printf '%s' "$lock_parsed" | jq -r \
+        '.changes[] as $c | select(([.change_specs[]? | select(.name == $c and (.declared // false) == true)] | length) == 0) | $c')
+    done
+  fi
+  if [ -z "$lock_missing" ]; then
+    doctor_add mission_parallel_locks ok ""
+  else
+    doctor_add mission_parallel_locks warn "changes without a touches declaration run exclusively:$lock_missing; add 'touches: none' or a lock list in P4"
   fi
 
   local jdir ldir
@@ -3745,19 +3929,21 @@ mission_trim() {
   printf '%s' "$text"
 }
 
-# mission_change_spec <bullet> -- compact JSON {name, after, human_ok, runner}
-# for one '## Changes' bullet. An annotation is recognized only when the
-# trailing parentheses contain 'after:', 'human-ok:' or 'runner:'; every other
-# bullet is a plain change name, so legacy missions parse unchanged.
+# mission_change_spec <bullet> -- compact JSON {name, after, human_ok, runner,
+# touches, declared} for one '## Changes' bullet. An annotation is recognized
+# only when the trailing parentheses contain 'after:', 'human-ok:', 'runner:'
+# or 'touches:'; every other bullet is a plain change name, so legacy missions
+# parse unchanged. 'touches: none' declares an empty lock list; a missing
+# touches annotation leaves declared=false (the change runs exclusively).
 mission_change_spec() {
   local item="$1"
-  local name="$item" inner part after="" human="" runner="" saved_ifs="$IFS"
+  local name="$item" inner part after="" human="" runner="" touches="" declared=false saved_ifs="$IFS"
   case "$item" in
     *"("*")"*)
       inner="${item#*(}"
       inner="${inner%)}"
       case "$inner" in
-        *"after:"*|*"human-ok:"*|*"runner:"*)
+        *"after:"*|*"human-ok:"*|*"runner:"*|*"touches:"*)
           name="$(mission_trim "${item%%(*}")"
           IFS=';'
           for part in $inner; do
@@ -3766,6 +3952,7 @@ mission_change_spec() {
               after:*) after="$(mission_trim "${part#after:}")" ;;
               human-ok:*) human="$(mission_trim "${part#human-ok:}")" ;;
               runner:*) runner="$(mission_trim "${part#runner:}")" ;;
+              touches:*) touches="$(mission_trim "${part#touches:}")"; declared=true ;;
             esac
           done
           IFS="$saved_ifs"
@@ -3773,15 +3960,23 @@ mission_change_spec() {
       esac
       ;;
   esac
-  local after_json human_json
+  local after_json human_json touches_json
   after_json="$(printf '%s' "$after" | tr ',' '\n' \
     | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
     | jq -Rsc 'split("\n") | map(select(length > 0))')"
   human_json="$(printf '%s' "$human" | tr ',' '\n' \
     | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
     | jq -Rsc 'split("\n") | map(select(length > 0))')"
-  jq -nc --arg n "$name" --argjson a "$after_json" --argjson h "$human_json" --arg r "$runner" \
-    '{name: $n, after: $a, human_ok: $h, runner: $r}'
+  if [ "$declared" = true ] && [ "$touches" != "none" ]; then
+    touches_json="$(printf '%s' "$touches" | tr ',' '\n' \
+      | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+      | jq -Rsc 'split("\n") | map(select(length > 0))')"
+  else
+    touches_json="[]"
+  fi
+  jq -nc --arg n "$name" --argjson a "$after_json" --argjson h "$human_json" \
+    --arg r "$runner" --argjson t "$touches_json" --argjson d "$declared" \
+    '{name: $n, after: $a, human_ok: $h, runner: $r, touches: $t, declared: $d}'
 }
 
 # mission_parse <file> -- compact JSON {goal, changes:[...], change_specs:[...],
@@ -4077,13 +4272,18 @@ EOF
 cmd_mission_status() {
   local slug="$1" project_name="$2"
   ensure_config
-  local project file default_runner
+  local project file default_runner max_parallel running slots_free
   project="$(resolve_project "$project_name")" || exit 1
   default_runner="$(config_json | jq -r '.default // empty')"
+  max_parallel="$(mission_max_parallel)" || exit 1
+  running="$(open_apply_count)"
+  slots_free=$(( max_parallel - running ))
+  [ "$slots_free" -lt 0 ] && slots_free=0
   file="$(mission_file_for "$project" "$slug")"
   if [ ! -f "$file" ]; then
     printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" --arg path "$file" \
-      '{slug: $slug, project: $project, path: $path, status: "mission_missing", goal: null, charter: {gate: "open", open_questions: 0, undecided_authorization: 0}, planning: "planned", reconcile: "explore", start_after: null, start_after_state: null, changes: [], dependencies: [], backlog: [], progress: {total: 0, done: 0}}')"
+      --argjson max_parallel "$max_parallel" --argjson running "$running" --argjson slots_free "$slots_free" \
+      '{slug: $slug, project: $project, path: $path, status: "mission_missing", goal: null, charter: {gate: "open", open_questions: 0, undecided_authorization: 0}, planning: "planned", reconcile: "explore", start_after: null, start_after_state: null, max_parallel: $max_parallel, running: $running, slots_used: $running, slots_free: $slots_free, changes: [], dependencies: [], backlog: [], progress: {total: 0, done: 0}}')"
     return 0
   fi
   local parsed goal backlog_json specs_json deps_json charter planning reconcile
@@ -4110,17 +4310,30 @@ cmd_mission_status() {
     printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" --arg path "$file" --arg goal "$goal" \
       --argjson charter "$charter" --arg planning "$planning" --arg reconcile "$reconcile" --argjson backlog "$backlog_json" \
       --argjson specs "$deps_json" --arg start_after "$start_after" --argjson start_after_state "$start_after_state" \
-      '{slug: $slug, project: $project, path: $path, status: "no_changes", goal: (if $goal == "" then null else $goal end), charter: $charter, planning: $planning, reconcile: $reconcile, start_after: (if $start_after == "" then null else $start_after end), start_after_state: $start_after_state, changes: [], dependencies: $specs, backlog: $backlog, progress: {total: 0, done: 0}}')"
+      --argjson max_parallel "$max_parallel" --argjson running "$running" --argjson slots_free "$slots_free" \
+      '{slug: $slug, project: $project, path: $path, status: "no_changes", goal: (if $goal == "" then null else $goal end), charter: $charter, planning: $planning, reconcile: $reconcile, start_after: (if $start_after == "" then null else $start_after end), start_after_state: $start_after_state, max_parallel: $max_parallel, running: $running, slots_used: $running, slots_free: $slots_free, changes: [], dependencies: $specs, backlog: $backlog, progress: {total: 0, done: 0}}')"
     return 0
   fi
-  local json="[]" c st done_count=0 spec runner
+  local json="[]" c st done_count=0 spec runner touches declared c_running state_file
   for c in "${changes[@]}"; do
     st="$(mission_done_state "$project" "$c")"
     spec="$(printf '%s' "$specs_json" | jq -c --arg n "$c" \
-      'map(select(.name == $n))[0] // {name: $n, runner: ""}')"
+      'map(select(.name == $n))[0] // {name: $n, runner: "", touches: [], declared: false}')"
     runner="$(printf '%s' "$spec" | jq -r '.runner // empty')"
     [ -n "$runner" ] || runner="$default_runner"
-    st="$(printf '%s' "$st" | jq -c --arg r "$runner" '. + {runner: (if $r == "" then null else $r end)}')"
+    touches="$(printf '%s' "$spec" | jq -c '.touches // []')"
+    declared="$(printf '%s' "$spec" | jq -r '.declared // false')"
+    c_running=false
+    state_file="$(state_file_for "$project" "$c")"
+    if [ -f "$state_file" ]; then
+      if [ "$(jq -r '.parked // false' "$state_file" 2>/dev/null || printf false)" != "true" ] \
+         && [ "$(jq -r '.merge_state // "none"' "$state_file" 2>/dev/null || printf none)" != "done" ]; then
+        c_running=true
+      fi
+    fi
+    st="$(printf '%s' "$st" | jq -c --arg r "$runner" --argjson t "$touches" \
+      --argjson d "$declared" --argjson run "$c_running" \
+      '. + {runner: (if $r == "" then null else $r end), touches: $t, declared: $d, running: $run}')"
     json="$(printf '%s' "$json" | jq -c --argjson s "$st" '. + [$s]')"
     [ "$(printf '%s' "$st" | jq -r '.state')" = "done" ] && done_count=$((done_count + 1))
   done
@@ -4128,7 +4341,8 @@ cmd_mission_status() {
     --argjson charter "$charter" --arg planning "$planning" --arg reconcile "$reconcile" \
     --argjson changes "$json" --argjson backlog "$backlog_json" --argjson done "$done_count" \
     --argjson specs "$deps_json" --arg start_after "$start_after" --argjson start_after_state "$start_after_state" \
-    '{slug: $slug, project: $project, path: $path, status: "ok", goal: (if $goal == "" then null else $goal end), charter: $charter, planning: $planning, reconcile: $reconcile, start_after: (if $start_after == "" then null else $start_after end), start_after_state: $start_after_state, changes: $changes, dependencies: $specs, backlog: $backlog, progress: {total: ($changes | length), done: $done}}')"
+    --argjson max_parallel "$max_parallel" --argjson running "$running" --argjson slots_free "$slots_free" \
+    '{slug: $slug, project: $project, path: $path, status: "ok", goal: (if $goal == "" then null else $goal end), charter: $charter, planning: $planning, reconcile: $reconcile, start_after: (if $start_after == "" then null else $start_after end), start_after_state: $start_after_state, max_parallel: $max_parallel, running: $running, slots_used: $running, slots_free: $slots_free, changes: $changes, dependencies: $specs, backlog: $backlog, progress: {total: ($changes | length), done: $done}}')"
 }
 
 # mission_dep_satisfied <project> <dep> <human-ok-json> -- 0 when a prerequisite
@@ -4200,8 +4414,17 @@ cmd_mission_next() {
   fi
   [ "${#candidates[@]}" -gt 0 ] || die_json "mission_empty" "mission '$slug' names no changes in $file"
 
+  local max_parallel running slots_free
+  max_parallel="$(mission_max_parallel)" || exit 1
+  running="$(open_apply_count)"
+  slots_free=$(( max_parallel - running ))
+  [ "$slots_free" -lt 0 ] && slots_free=0
+
   local c st state spec dep human_ok target="" target_state="" target_st=""
+  local target_touches="[]" target_declared=false
   local any_parked=false any_remaining=false handoff_json="[]"
+  local limit_hit=false skipped_json="[]" holders_json="[]"
+  local c_state_file c_parked c_open c_touches c_declared c_lock c_holder
   for c in "${candidates[@]}"; do
     st="$(mission_done_state "$project" "$c")"
     state="$(printf '%s' "$st" | jq -r '.state')"
@@ -4215,8 +4438,24 @@ cmd_mission_next() {
     fi
     [ "$state" = "done" ] && continue
 
+    # A change that already has an apply state is not started again: it is
+    # running, failed or waiting to be finished. The one exception is the
+    # documented check-off path: a parked change whose tasks are all checked
+    # may start again without an explicit resume.
+    c_state_file="$(state_file_for "$project" "$c")"
+    if [ -f "$c_state_file" ]; then
+      c_parked="$(jq -r '.parked // false' "$c_state_file" 2>/dev/null || printf false)"
+      c_open="$(printf '%s' "$st" | jq -r '.tasks.open // "null"')"
+      if [ "$c_parked" != "true" ] || [ "$c_open" != "0" ]; then
+        skipped_json="$(printf '%s' "$skipped_json" | jq -c --arg c "$c" \
+          --argjson parked "$( [ "$c_parked" = "true" ] && printf true || printf false )" \
+          '. + [{change: $c, reason: "has_state", parked: $parked}]')"
+        continue
+      fi
+    fi
+
     spec="$(printf '%s' "$specs_json" | jq -c --arg n "$c" \
-      'map(select(.name == $n))[0] // {name: $n, after: [], human_ok: []}')"
+      'map(select(.name == $n))[0] // {name: $n, after: [], human_ok: [], touches: [], declared: false}')"
     human_ok="$(printf '%s' "$spec" | jq -c '.human_ok // []')"
     local satisfied=true
     while IFS= read -r dep; do
@@ -4227,15 +4466,41 @@ cmd_mission_next() {
       fi
     done < <(printf '%s' "$spec" | jq -r '.after[]?')
 
-    if [ "$satisfied" = true ]; then
-      target="$c"
-      target_state="$state"
-      target_st="$st"
+    [ "$satisfied" = true ] || continue
+
+    c_touches="$(printf '%s' "$spec" | jq -c '.touches // []')"
+    c_declared="$(printf '%s' "$spec" | jq -r '.declared // false')"
+
+    if [ "$running" -ge "$max_parallel" ] 2>/dev/null; then
+      limit_hit=true
       break
     fi
+
+    c_lock="$(lock_check "$project" "$c" "$c_touches" "$c_declared" "$c_state_file")"
+    if [ "$(printf '%s' "$c_lock" | jq -r '.conflict')" = "true" ]; then
+      holders_json="$(printf '%s' "$holders_json" | jq -c --argjson hs "$(printf '%s' "$c_lock" | jq -c '.holders')" '. + $hs')"
+      skipped_json="$(printf '%s' "$skipped_json" | jq -c --arg c "$c" \
+        --argjson holders "$(printf '%s' "$c_lock" | jq -c '[.holders[].change]')" \
+        '. + [{change: $c, reason: "lock_conflict", holders: $holders}]')"
+      continue
+    fi
+
+    target="$c"
+    target_state="$state"
+    target_st="$st"
+    target_touches="$c_touches"
+    target_declared="$c_declared"
+    break
   done
 
   if [ -z "$target" ]; then
+    if [ "$limit_hit" = true ]; then
+      printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" \
+        --argjson current "$running" --argjson max "$max_parallel" \
+        '{slug: $slug, project: $project, status: "parallel_limit",
+          current: $current, max: $max, slots_used: $current, slots_free: 0}')"
+      return 0
+    fi
     if [ "$any_parked" = true ]; then
       printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" \
         --argjson handoff "$handoff_json" \
@@ -4245,6 +4510,18 @@ cmd_mission_next() {
     if [ "$any_remaining" = false ]; then
       printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" --arg status "mission_complete" \
         '{slug: $slug, project: $project, status: $status}')"
+      return 0
+    fi
+    if [ "$(printf '%s' "$skipped_json" | jq 'length')" -gt 0 ] \
+       || [ "$(printf '%s' "$holders_json" | jq 'length')" -gt 0 ]; then
+      local remaining_json
+      remaining_json="$(printf '%s' "$parsed" | jq -c '.changes')"
+      printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" \
+        --argjson holders "$holders_json" --argjson skipped "$skipped_json" \
+        --argjson remaining "$remaining_json" \
+        '{slug: $slug, project: $project, status: "no_startable",
+          reason: "no startable change; running or lock-conflicting applies hold it",
+          holders: $holders, skipped: $skipped, remaining: $remaining}')"
       return 0
     fi
     local remaining_json
@@ -4260,7 +4537,7 @@ cmd_mission_next() {
   # unknown name fails here and starts nothing.
   local target_spec target_runner runner
   target_spec="$(printf '%s' "$specs_json" | jq -c --arg n "$target" \
-    'map(select(.name == $n))[0] // {name: $n, runner: ""}')"
+    'map(select(.name == $n))[0] // {name: $n, runner: "", touches: [], declared: false}')"
   target_runner="$(printf '%s' "$target_spec" | jq -r '.runner // empty')"
   runner="$(resolve_runner "$target_runner")" || exit 1
 
@@ -4327,7 +4604,7 @@ cmd_mission_next() {
     [ -n "$workspace_id" ] && assert_workspace_free "$workspace_id"
   fi
 
-  dispatch_change "$target" "$project" "$runner" "" "$want_worktree"
+  dispatch_change "$target" "$project" "$runner" "" "$want_worktree" "$target_touches" "$target_declared"
 }
 
 # cmd_mission_add <slug> <change> <project-name> -- append a change to the mission
@@ -4388,10 +4665,11 @@ cmd_mission() {
        || [ -n "$wt_flag" ] || [ -n "$no_wt_flag" ]; }; then
     usage_error "--dry-run, --skip-reconcile, --worktree and --no-worktree apply only to 'boss mission next'"
   fi
-  local want_worktree=0 wt_mode
+  local want_worktree=0 wt_mode max_parallel
   if [ "$action" = "next" ]; then
+    max_parallel="$(mission_max_parallel)" || exit 1
     wt_mode="$(mission_worktree_mode)" || exit 1
-    want_worktree="$(resolve_worktree_flag "$wt_mode" "$wt_flag" "$no_wt_flag")" || exit 1
+    want_worktree="$(resolve_worktree_flag "$wt_mode" "$wt_flag" "$no_wt_flag" "$max_parallel")" || exit 1
   fi
   case "$action" in
     start) cmd_mission_start "$slug" "$project_name" ;;

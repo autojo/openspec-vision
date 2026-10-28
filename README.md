@@ -346,6 +346,100 @@ worktrees under the state root, a dirty base and an uncommitted plan.
 `boss doctor --fix` removes only merged worktrees that belong to a kept or
 finished state; unmerged worktrees are only reported.
 
+## Parallel missions
+
+`[missions] max_parallel` (default `1`) is the hard cap on concurrently running
+applies. Raise it in the project config or for one process:
+
+```toml
+[missions]
+worktrees = "auto"
+max_parallel = 2
+```
+
+```bash
+BOSS_MAX_PARALLEL=2 boss mission next v1 --project shop
+```
+
+The limit is global and counts running applies across projects. A parked,
+finished or merged/kept apply does not consume a slot; a `test_failed` or
+`conflict` state does, because the change is unfinished. A dispatch beyond the
+limit returns `parallel_limit` with `current`, `max` and `slots_free` and starts
+nothing. `BOSS_DISPATCH_MAX_APPLIES`, `BOSS_DISPATCH_MIN_FREE_MB` and
+`BOSS_DISPATCH_MAX_LOAD` remain advisory resource warnings; a user who raises
+`max_parallel` above `BOSS_DISPATCH_MAX_APPLIES` should raise that warning too.
+
+Above one, every apply uses the worktree lifecycle: `worktrees = "auto"`
+resolves to a worktree, and `--no-worktree` or `worktrees = "never"` is refused
+with `worktree_required`. Commit the plan and keep the base clean first. A
+limit of one keeps the existing serial base-checkout path.
+
+### Locks
+
+Declare what a change touches on its mission bullet:
+
+```markdown
+- feat-a (runner: opencode-flash; touches: src/auth, deps)
+- feat-b (runner: opencode-flash; touches: none)
+- feat-c (runner: opencode-flash)
+```
+
+`touches:` is a comma list of resource keys or path prefixes. Locks match
+exactly (`deps`, `test-env`, `port:3000`, `db:shop`) or by path prefix when both
+sides contain `/` (`src/auth` overlaps `src/auth/login`; a trailing slash is
+ignored). A lock without `/` never prefix-matches a path. `touches: none`
+declares that the change shares nothing; a missing annotation leaves the change
+undeclared and exclusive, so it waits for every running or unmerged apply.
+
+Locks are scoped to the base project in this version: `port:3000` serialises
+applies in one project, not machine-wide. A manual dispatch outside a mission
+uses `--touches`:
+
+```bash
+boss dispatch feat-a --project shop --touches "src/auth, deps"
+boss dispatch docs-fix --project shop --touches none
+```
+
+`boss dispatch` and `boss mission next` check locks before creating a worktree
+or tab and return `lock_conflict` with the holding change. Holders are running
+applies, parked applies with a worktree, and `conflict`/`test_failed` states. A
+merged green kept worktree holds no locks. Releasing a lock means merging or
+finishing the holder; there is no manual release command.
+
+### Filling slots
+
+`boss mission next` skips changes that already have an apply state (the
+documented check-off path for a parked change whose tasks are all checked stays
+available), skips changes whose locks conflict, and returns `no_startable` with
+the blocking holders when nothing else can start. The shared RUN procedure
+fills free slots: it repeats `boss mission next` while the result is `started`
+and stops on `parallel_limit`, `no_startable`, `waiting_human`,
+`mission_complete` or a non-null `resource_warning`. Running applies continue in
+every case. After a wake, review and finish or retrigger the finished change,
+then refill. At limit one the procedure dispatches once and waits as before.
+
+`boss mission status` shows `max_parallel`, `running`, `slots_used`,
+`slots_free` and per-change `running`, `touches` and `declared`. `boss status`
+adds `touches`, `declared` and `merge_state`.
+
+### Overlap backstop
+
+`boss review` compares the changed files of the current worktree with those of
+the other running, parked and test-failed worktrees of the same project and
+returns `overlaps: [{file, changes:[...]}]`. It does not merge, rebase or
+resolve; the Explorer uses the report to order merges or retrigger. A stale
+lock therefore cannot merge into the same file silently.
+
+### Assignment in PLAN
+
+The vision P4 pass writes `touches:` on every mission bullet: source paths or
+directories the change will edit and shared resources (`deps`, `test-env`,
+`port:<n>`, `db:<name>`). Use `touches: none` for an isolated change; omit the
+annotation only while uncertain, which makes the change exclusive. `boss
+doctor` warns for every mission change without a declaration when
+`max_parallel > 1`, and reports the effective limit including the
+`BOSS_MAX_PARALLEL` override.
+
 ## Reconcile gate
 
 `boss reconcile <slug> --json` is read-only context. Before starting a change
