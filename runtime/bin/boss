@@ -28,7 +28,8 @@ usage() {
 boss -- control session for OpenSpec apply cycles (see README.md)
 
 Usage:
-  boss dispatch <change> [--project <name|path>] [--runner <name>] [--note <text>] [--as <pane|agent>]
+  boss dispatch <change> [--project <name|path>] [--runner <name>] [--note <text>] [--worktree|--no-worktree] [--as <pane|agent>]
+  boss plan commit <change> [--project <name|path>]
   boss status [<change>] [--project <name|path>] [--json]
   boss review <change> [--project <name|path>] [--json]
   boss wait <change> [--project <name|path>]
@@ -38,7 +39,7 @@ Usage:
   boss doctor [--project <name|path>] [--json] [--fix]
   boss retrigger <change> [--project <name|path>] [--note <text>] [--as <pane|agent>]
   boss retarget <change> [--project <name|path>] [--to <pane|agent>]
-  boss finish <change> [--project <name|path>] [--force] [--lesson <text>] [--lesson-scope project|global] [--as <pane|agent>]
+  boss finish <change> [--project <name|path>] [--force] [--keep-worktree] [--no-merge] [--lesson <text>] [--lesson-scope project|global] [--as <pane|agent>]
   boss park <change> [--project <name|path>] [--note <text>] [--as <pane|agent>]
   boss resume <change> [--project <name|path>] [--note <text>] [--as <pane|agent>]
   boss interrupt <change> [--project <name|path>] [--as <pane|agent>]
@@ -48,7 +49,7 @@ Usage:
   boss session [--project <name|path>] [--runner <name>]
   boss mission start <slug> --project <name|path>
   boss mission status <slug> [--project <name|path>]
-  boss mission next <slug> [--project <name|path>] [--dry-run] [--skip-reconcile] [--as <pane|agent>]
+  boss mission next <slug> [--project <name|path>] [--dry-run] [--skip-reconcile] [--worktree|--no-worktree] [--as <pane|agent>]
   boss mission add|rm <slug> <change> [--project <name|path>]
   boss reconcile <slug> [--project <name|path>] [--json]
   boss config-json
@@ -154,6 +155,8 @@ ensure_config() {
     done
     printf '\n[projects]\n'
     printf '# shop = "~/work/shop"\n'
+    printf '\n[missions]\n'
+    printf '# worktrees = "auto"  # auto | always | never; --worktree/--no-worktree override\n'
   } >"$BOSS_CONFIG"
   log "generated config at $BOSS_CONFIG (default runner: $default_runner)"
 }
@@ -354,6 +357,128 @@ resolve_project() {
     die_json "project_invalid" "'$given' -> '$project' is not an OpenSpec project (missing openspec/changes)"
   fi
   printf '%s\n' "$project"
+}
+
+# ------------------------------------------------------- worktree settings ---
+
+# mission_worktree_mode -- the configured worktree mode: auto, always or never.
+# An invalid value is a config error, not a silent fallback.
+mission_worktree_mode() {
+  local cfg mode
+  cfg="$(config_json)" || exit 1
+  mode="$(printf '%s' "$cfg" | jq -r '.missions.worktrees // "auto"')"
+  case "$mode" in
+    auto|always|never) ;;
+    *) die_json "invalid_worktrees" "invalid [missions] worktrees value '$mode'; use 'auto', 'always' or 'never'" ;;
+  esac
+  printf '%s\n' "$mode"
+}
+
+# resolve_worktree_flag <mode> <worktree-flag> <no-worktree-flag> -- 1 when the
+# apply runs in a worktree. An explicit flag wins over the configured mode;
+# 'auto' stays on the base checkout in this change.
+resolve_worktree_flag() {
+  local mode="$1" want="${2:-}" never="${3:-}"
+  if [ "$want" = "1" ] && [ "$never" = "1" ]; then
+    usage_error "--worktree and --no-worktree are mutually exclusive"
+  fi
+  if [ "$want" = "1" ]; then printf '1\n'; return 0; fi
+  if [ "$never" = "1" ]; then printf '0\n'; return 0; fi
+  case "$mode" in
+    always) printf '1\n' ;;
+    *) printf '0\n' ;;
+  esac
+}
+
+# git_dirty_paths <dir> <all|plan|code> -- changed paths from git status, one
+# per line. 'plan' selects openspec/ paths, 'code' everything outside it.
+git_dirty_paths() {
+  local dir="$1" mode="${2:-all}" out line path
+  out="$(git -C "$dir" status --porcelain --untracked-files=all 2>/dev/null || true)"
+  [ -n "$out" ] || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    path="${line:3}"
+    case "$path" in
+      *" -> "*) path="${path#* -> }" ;;
+    esac
+    case "$mode" in
+      plan)
+        case "$path" in openspec/*) printf '%s\n' "$path" ;; esac
+        ;;
+      code)
+        case "$path" in openspec/*) ;; *) printf '%s\n' "$path" ;; esac
+        ;;
+      *)
+        printf '%s\n' "$path"
+        ;;
+    esac
+  done <<<"$out"
+}
+
+# plan_paths_for <project> -- existing plan pathspecs, one per line.
+plan_paths_for() {
+  local project="$1" path
+  for path in openspec/vision.md openspec/missions openspec/changes; do
+    [ -e "$project/$path" ] && printf '%s\n' "$path"
+  done
+}
+
+# cmd_plan commit <change> [--project <name|path>] -- commit only the planning
+# artifacts. Code and runtime paths are never added or committed.
+cmd_plan() {
+  local action="" change="" project_name="" arg
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --project) project_name="${1:-}"; shift ;;
+      -h|--help) usage ;;
+      --*) usage_error "unknown option: $arg" ;;
+      *)
+        if [ -z "$action" ]; then action="$arg"
+        elif [ -z "$change" ]; then change="$arg"
+        else usage_error "unexpected argument: $arg"; fi ;;
+    esac
+  done
+  [ -n "$action" ] || usage_error "usage: boss plan commit <change> [--project <name|path>]"
+  case "$action" in
+    commit) ;;
+    *) usage_error "unknown plan action: $action" ;;
+  esac
+  [ -n "$change" ] || usage_error "usage: boss plan commit <change> [--project <name|path>]"
+
+  ensure_config
+  local project
+  project="$(resolve_project "$project_name")" || exit 1
+  [ -d "$project/openspec/changes/$change" ] \
+    || die_json "change_not_found" "change '$change' not found in $project"
+  git -C "$project" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die_json "not_a_git_repo" "$project is not a git repository; a worktree apply needs one"
+
+  local -a paths=()
+  while IFS= read -r p; do [ -n "$p" ] && paths+=("$p"); done < <(plan_paths_for "$project")
+  [ "${#paths[@]}" -gt 0 ] || die_json "no_plan_paths" "$project has no openspec plan paths to commit"
+
+  git -C "$project" add -A -- "${paths[@]}" >/dev/null 2>&1 \
+    || die_json "git_add_failed" "cannot stage the plan paths in $project"
+  local staged commit="" status="clean"
+  staged="$(git -C "$project" diff --cached --name-only -- "${paths[@]}" 2>/dev/null || true)"
+  if [ -n "$staged" ]; then
+    # Commit the staged plan files explicitly. Passing the directories would
+    # fail for an existing but empty openspec/missions/ directory.
+    local -a staged_paths=()
+    while IFS= read -r p; do [ -n "$p" ] && staged_paths+=("$p"); done <<<"$staged"
+    git -C "$project" commit -m "plan: $change artifacts" -- "${staged_paths[@]}" >/dev/null 2>&1 \
+      || die_json "git_commit_failed" "cannot commit the plan paths in $project"
+    commit="$(git -C "$project" rev-parse HEAD 2>/dev/null || true)"
+    status="committed"
+  fi
+  local paths_json
+  paths_json="$(printf '%s\n' "$staged" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+  printf '%s\n' "$(jq -n --arg change "$change" --arg project "$project" \
+    --arg status "$status" --arg commit "$commit" --argjson paths "$paths_json" \
+    '{change: $change, project: $project, status: $status,
+      commit: (if $commit == "" then null else $commit end), paths: $paths}')"
 }
 
 # ------------------------------------------------------- boss identity (D5) ---
@@ -644,17 +769,20 @@ check_apply_ready() {
   fi
 }
 
-# find_running_apply <change> <project> -- {pane_id,tab_id,workspace_id} of a live
-# apply for this change in this project: a living agent named
-# apply_agent_name <change> whose cwd is in the project tree, or empty. Pane
-# tokens are deliberately ignored (any session can set them); the calling pane
-# and registered boss panes are never treated as a running apply.
+# find_running_apply <change> <project> [<worktree>] -- {pane_id,tab_id,
+# workspace_id} of a live apply for this change: a living agent named
+# apply_agent_name <change> whose cwd is in the worktree when one is recorded,
+# otherwise in the project tree. The base prefix is deliberately not used for a
+# worktree apply: an in-tree match would be a different checkout. Pane tokens
+# are ignored; the calling pane and registered boss panes are never a running
+# apply.
 find_running_apply() {
-  local change="$1" project="$2" agents hit excluded
+  local change="$1" project="$2" worktree="${3:-}" scope agents hit excluded
+  scope="${worktree:-$project}"
   agents="$(herdr_json agent list)" || exit 1
   excluded="$(boss_registered_pane_ids)"
   hit="$(printf '%s' "$agents" | jq -c \
-    --arg n "$(apply_agent_name "$change")" --arg p "$project" --arg ps "$project/" \
+    --arg n "$(apply_agent_name "$change")" --arg p "$scope" --arg ps "$scope/" \
     --arg self "${BOSS_CALLER_PANE:-${HERDR_PANE_ID:-}}" --arg ex "$excluded" \
     '[.agents[] | select(.name == $n)
         | select(((.cwd // "") == $p) or (((.cwd // "") | startswith($ps))))
@@ -798,36 +926,43 @@ external_verify_prompt_block() {
 
 cmd_dispatch() {
   local change="" project_name="" runner_name="" note="" as_target="" arg
+  local wt_flag="" no_wt_flag=""
   while [ $# -gt 0 ]; do
     arg="$1"; shift
     case "$arg" in
       --project) project_name="${1:-}"; shift ;;
       --runner) runner_name="${1:-}"; shift ;;
       --note) note="$(one_line "${1:-}")"; shift ;;
+      --worktree) wt_flag=1 ;;
+      --no-worktree) no_wt_flag=1 ;;
       --as) as_target="${1:-}"; shift ;;
       -h|--help) usage ;;
       --*) usage_error "unknown option: $arg" ;;
       *) if [ -z "$change" ]; then change="$arg"; else usage_error "unexpected argument: $arg"; fi ;;
     esac
   done
-  [ -n "$change" ] || usage_error "usage: boss dispatch <change> [--project <name|path>] [--runner <name>] [--as <pane|agent>]"
+  [ -n "$change" ] || usage_error "usage: boss dispatch <change> [--project <name|path>] [--runner <name>] [--worktree|--no-worktree] [--as <pane|agent>]"
 
   # The identity is resolved before any claim or state write.
   boss_use_caller "$as_target"
   ensure_boss_claim dispatch
   ensure_config
 
-  local runner project
+  local runner project wt_mode want_worktree
   runner="$(resolve_runner "$runner_name")" || exit 1
   project="$(resolve_project "$project_name")" || exit 1
-  dispatch_change "$change" "$project" "$runner" "$note"
+  wt_mode="$(mission_worktree_mode)" || exit 1
+  want_worktree="$(resolve_worktree_flag "$wt_mode" "$wt_flag" "$no_wt_flag")" || exit 1
+  dispatch_change "$change" "$project" "$runner" "$note" "$want_worktree"
 }
 
-# dispatch_change <change> <project> <runner-json> <note> -- shared dispatch
-# path of 'boss dispatch' and 'boss mission next'. The caller has established
-# the boss claim and config and resolved project and runner.
+# dispatch_change <change> <project> <runner-json> <note> [<want-worktree>] --
+# shared dispatch path of 'boss dispatch', 'boss mission next' and a resumed
+# worktree apply. The caller has established the boss claim and config and
+# resolved project and runner. <want-worktree> is 1 for the isolated lifecycle;
+# a recorded worktree always wins so resume/retrigger reuse it.
 dispatch_change() {
-  local change="$1" project="$2" runner="$3" note="$4"
+  local change="$1" project="$2" runner="$3" note="$4" want_worktree="${5:-0}"
   # The dispatcher is the verified caller. Its workspace and cwd are recorded
   # too, so the waiter can decide whether the dispatcher may wake this apply
   # even when the apply runs in a different workspace.
@@ -861,7 +996,72 @@ dispatch_change() {
   local existing pane_id tab_id workspace_id wake_target warnings_json="[]"
   local state_file
   state_file="$(state_file_for "$project" "$change")"
-  existing="$(find_running_apply "$change" "$project")"
+  local existing_worktree="" existing_branch="" existing_base=""
+  if [ -f "$state_file" ]; then
+    existing_worktree="$(jq -r '.worktree // empty' "$state_file" 2>/dev/null || true)"
+    existing_branch="$(jq -r '.branch // empty' "$state_file" 2>/dev/null || true)"
+    existing_base="$(jq -r '.base_head // empty' "$state_file" 2>/dev/null || true)"
+  fi
+  [ -n "$existing_worktree" ] && want_worktree=1
+
+  local worktree="" branch="" worktree_workspace="" apply_root="$project"
+  local base_head=""
+  if [ "$want_worktree" = "1" ]; then
+    if [ -n "$existing_worktree" ]; then
+      [ -d "$existing_worktree" ] \
+        || die_json "worktree_missing" "the recorded worktree $existing_worktree for '$change' is missing; run 'boss doctor --fix' or remove the state before dispatching again"
+      worktree="$existing_worktree"
+      branch="${existing_branch:-$(worktree_branch_for "$change")}"
+      # Open the worktree through Herdr when it still knows it, then prefer the
+      # workspace that currently hosts it. A stale recorded workspace is
+      # repaired below by find/ensure_workspace.
+      local opened=""
+      opened="$(herdr_worktree_open "$project" "$worktree" 2>/dev/null || true)"
+      if [ -n "$opened" ]; then
+        worktree_workspace="$(printf '%s' "$opened" | jq -r '.workspace_id // empty' 2>/dev/null || true)"
+        [ -n "$branch" ] || branch="$(printf '%s' "$opened" | jq -r '.branch // empty' 2>/dev/null || true)"
+      fi
+      [ -n "$worktree_workspace" ] || worktree_workspace="$(find_workspace_for_repo "$worktree")"
+      base_head="$existing_base"
+    else
+      git -C "$project" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+        || die_json "not_a_git_repo" "$project is not a git repository; a worktree apply needs one"
+      local plan_dirty code_dirty
+      plan_dirty="$(git_dirty_paths "$project" plan)"
+      if [ -n "$plan_dirty" ]; then
+        die_json "plan_uncommitted" "the planning artifacts are not committed: $(printf '%s' "$plan_dirty" | paste -sd ', ' -); run 'boss plan commit $change --project $project' first"
+      fi
+      code_dirty="$(git_dirty_paths "$project" code)"
+      if [ -n "$code_dirty" ]; then
+        die_json "base_dirty" "the base checkout has uncommitted changes outside openspec/: $(printf '%s' "$code_dirty" | paste -sd ', ' -); commit or stash them before a worktree dispatch"
+      fi
+      base_head="$(git -C "$project" rev-parse HEAD 2>/dev/null || true)"
+      [ -n "$base_head" ] || die_json "git_head" "cannot determine HEAD in $project"
+      worktree="$(worktree_path_for "$project" "$change")"
+      branch="$(worktree_branch_for "$change")"
+      if [ -e "$worktree" ]; then
+        die_json "worktree_exists" "a worktree already exists at $worktree without an apply state; inspect it or remove it before dispatching '$change'"
+      fi
+      mkdir -p "$(dirname "$worktree")" \
+        || die_json "worktree_create_failed" "cannot create the worktree parent directory for $worktree"
+      BOSS_FAILED_WORKTREE="$worktree"
+      BOSS_FAILED_WORKTREE_PROJECT="$project"
+      BOSS_FAILED_WORKTREE_BRANCH="$branch"
+      local wt_json
+      wt_json="$(herdr_worktree_create "$project" "$branch" "$base_head" "$worktree" "$change")" || exit 1
+      worktree="$(printf '%s' "$wt_json" | jq -r '.path // empty')"
+      branch="$(printf '%s' "$wt_json" | jq -r '.branch // empty')"
+      worktree_workspace="$(printf '%s' "$wt_json" | jq -r '.workspace_id // empty')"
+      [ -n "$worktree" ] || worktree="$(worktree_path_for "$project" "$change")"
+      [ -n "$branch" ] || branch="$(worktree_branch_for "$change")"
+    fi
+    [ -n "$worktree_workspace" ] || worktree_workspace="$(find_workspace_for_repo "$worktree")"
+    [ -n "$worktree_workspace" ] || worktree_workspace="$(ensure_workspace "$worktree" "$change")"
+    BOSS_FAILED_WORKTREE_WS="$worktree_workspace"
+    apply_root="$worktree"
+  fi
+
+  existing="$(find_running_apply "$change" "$project" "$worktree")"
   if [ -n "$existing" ] && [ "$existing" != "null" ]; then
     pane_id="$(printf '%s' "$existing" | jq -r '.pane_id')"
     tab_id="$(printf '%s' "$existing" | jq -r '.tab_id')"
@@ -877,10 +1077,11 @@ dispatch_change() {
       --arg runner "$(printf '%s' "$runner" | jq -r '.name')" \
       --arg agent "$agent_name" --arg pane_id "$pane_id" --arg tab_id "$tab_id" \
       --arg workspace_id "$workspace_id" --arg status "already_running" \
+      --arg worktree "$worktree" --arg branch "$branch" \
       --argjson wake_target "$wake_target" --argjson warnings "$warnings_json" \
       --argjson project_registered "$project_registered" --arg hint "$hint" --arg resource_warning "$resource_warn" \
       --argjson mode "$mode_json" \
-      '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode}')"
+      '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode}')"
     return 0
   fi
 
@@ -890,7 +1091,11 @@ dispatch_change() {
   local -a agent_args=()
   while IFS= read -r a; do agent_args+=("$a"); done < <(runner_args_of "$runner")
 
-  workspace_id="$(ensure_workspace "$project" "$(basename "$project")")"
+  if [ "$want_worktree" = "1" ]; then
+    workspace_id="$worktree_workspace"
+  else
+    workspace_id="$(ensure_workspace "$project" "$(basename "$project")")"
+  fi
 
   assert_workspace_free "$workspace_id" "$change"
 
@@ -899,13 +1104,13 @@ dispatch_change() {
 
   local created
   if [ "${#env_args[@]}" -gt 0 ]; then
-    created="$(herdr_json tab create --workspace "$workspace_id" --cwd "$project" --label "$change" --no-focus "${env_args[@]}")" || exit 1
+    created="$(herdr_json tab create --workspace "$workspace_id" --cwd "$apply_root" --label "$change" --no-focus "${env_args[@]}")" || exit 1
   else
-    created="$(herdr_json tab create --workspace "$workspace_id" --cwd "$project" --label "$change" --no-focus)" || exit 1
+    created="$(herdr_json tab create --workspace "$workspace_id" --cwd "$apply_root" --label "$change" --no-focus)" || exit 1
   fi
   pane_id="$(printf '%s' "$created" | jq -r '.root_pane.pane_id // empty')"
   tab_id="$(printf '%s' "$created" | jq -r '.tab.tab_id // .root_pane.tab_id // empty')"
-  [ -n "$pane_id" ] && [ -n "$tab_id" ] || die_json "tab_create_failed" "herdr tab create returned no pane/tab for $project"
+  [ -n "$pane_id" ] && [ -n "$tab_id" ] || die_json "tab_create_failed" "herdr tab create returned no pane/tab for $apply_root"
   # From here on a failure must not leave the tab behind (see die_json).
   BOSS_FAILED_TAB="$tab_id"
   BOSS_FAILED_PANE="$pane_id"
@@ -978,8 +1183,12 @@ dispatch_change() {
     '{boss: (if $b == "" then null else $b end),
       pane: (if $p == "" then null else $p end),
       workspace: (if $w == "" then null else $w end), source: "dispatcher"}')"
-  # Anchor for the apply's commit range: the HEAD the apply starts from.
-  base_head="$(git -C "$project" rev-parse HEAD 2>/dev/null || true)"
+  # Anchor for the apply's commit range: the HEAD the apply starts from. A
+  # resumed worktree keeps its original base so the review still sees the whole
+  # change, not just the work since the restart.
+  if [ -z "$base_head" ]; then
+    base_head="$(git -C "$project" rev-parse HEAD 2>/dev/null || true)"
+  fi
   mkdir -p "$BOSS_APPLIES_DIR" || die_json "state_write" "cannot create state dir $BOSS_APPLIES_DIR"
   jq -n \
     --arg change "$change" --arg project "$project" --arg runner "$runner_name_out" \
@@ -989,13 +1198,17 @@ dispatch_change() {
     --arg boss_cwd "$dispatcher_cwd" --argjson boss_cross "$dispatcher_cross" \
     --argjson boss_cross_project "$dispatcher_cross_project" \
     --arg base_head "$base_head" \
+    --arg worktree "$worktree" --arg branch "$branch" \
+    --arg worktree_workspace "$worktree_workspace" \
     --arg started_at "$now" --arg last_state "working" --arg last_state_at "$now" \
     --argjson mode "$mode_json" \
-    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, lessons: $lessons, external_block: $external_block, commit_block: $commit_block, commit_policy: $commit_policy, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, boss: $boss, boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_workspace: (if $boss_workspace == "" then null else $boss_workspace end), boss_cwd: (if $boss_cwd == "" then null else $boss_cwd end), boss_cross_workspace: $boss_cross, boss_cross_project: $boss_cross_project, base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at, opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode}' \
+    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, lessons: $lessons, external_block: $external_block, commit_block: $commit_block, commit_policy: $commit_policy, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), merge_state: "none", merged: false, merge_test: "not_run", kept: false, boss: $boss, boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_workspace: (if $boss_workspace == "" then null else $boss_workspace end), boss_cwd: (if $boss_cwd == "" then null else $boss_cwd end), boss_cross_workspace: $boss_cross, boss_cross_project: $boss_cross_project, base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at, opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode}' \
     >"$state_file" || die_json "state_write" "cannot write state file $state_file"
 
   detach_waiter "$state_file"
   BOSS_FAILED_TAB=""
+  BOSS_FAILED_WORKTREE=""
+  BOSS_FAILED_WORKTREE_WS=""
 
   log "dispatch: change=$change project=$project runner=$runner_name_out agent=$agent_name tab=$tab_id pane=$pane_id workspace=$workspace_id"
 
@@ -1007,10 +1220,11 @@ dispatch_change() {
     --arg change "$change" --arg project "$project" --arg runner "$runner_name_out" \
     --arg agent "$agent_name" --arg pane_id "$pane_id" --arg tab_id "$tab_id" \
     --arg workspace_id "$workspace_id" --arg status "started" \
+    --arg worktree "$worktree" --arg branch "$branch" \
     --argjson wake_target "$wake_target" --argjson warnings "$warnings_json" \
     --argjson project_registered "$project_registered" --arg hint "$hint" --arg resource_warning "$resource_warn" \
     --argjson mode "$mode_json" \
-    '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode}')"
+    '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode}')"
 }
 
 # --------------------------------------------------------------- retarget ---
@@ -1150,8 +1364,17 @@ status_one() {
   local change="$1" project_name="$2" json_only="$3"
   local state_file project agent pane_id tab_id workspace_id last_state last_state_at waiter_pid waiter_alive_flag
   local opencode_version permission_mode
+  local worktree branch worktree_workspace merge_state merged merge_test kept review_root
   state_file="$(find_state_file "$change" "$project_name")" || exit 1
   project="$(jq -r '.project' "$state_file")"
+  worktree="$(jq -r '.worktree // empty' "$state_file" 2>/dev/null || true)"
+  branch="$(jq -r '.branch // empty' "$state_file" 2>/dev/null || true)"
+  worktree_workspace="$(jq -r '.worktree_workspace // empty' "$state_file" 2>/dev/null || true)"
+  merge_state="$(jq -r '.merge_state // "none"' "$state_file" 2>/dev/null || true)"
+  merged="$(jq -r '.merged // false' "$state_file" 2>/dev/null || printf false)"
+  merge_test="$(jq -r '.merge_test // "not_run"' "$state_file" 2>/dev/null || true)"
+  kept="$(jq -r '.kept // false' "$state_file" 2>/dev/null || printf false)"
+  review_root="${worktree:-$project}"
   agent="$(jq -r '.agent' "$state_file")"
   pane_id="$(jq -r '.pane_id' "$state_file")"
   tab_id="$(jq -r '.tab_id' "$state_file")"
@@ -1183,10 +1406,11 @@ status_one() {
   pane_json="$(jq -nc --argjson a "$herdr_agent" --arg p "$pane_id" --arg t "$tab_id" --arg w "$workspace_id" \
     '{pane_id: ($a.pane_id // $p), tab_id: ($a.tab_id // $t), workspace_id: ($a.workspace_id // $w), cwd: ($a.cwd // null), focused: ($a.focused // null)}')"
 
-  local tasks_json tasks_open tasks_done tasks_total
-  if [ -f "$project/openspec/changes/$change/tasks.md" ]; then
-    tasks_open="$(grep -c '^[[:space:]]*- \[ \]' "$project/openspec/changes/$change/tasks.md" || true)"
-    tasks_done="$(grep -c '^[[:space:]]*- \[x\]' "$project/openspec/changes/$change/tasks.md" || true)"
+  local tasks_json tasks_open tasks_done tasks_total tasks_path
+  tasks_path="$(tasks_file_for "$review_root" "$change")"
+  if [ -n "$tasks_path" ]; then
+    tasks_open="$(grep -c '^[[:space:]]*- \[ \]' "$tasks_path" || true)"
+    tasks_done="$(grep -c '^[[:space:]]*- \[x\]' "$tasks_path" || true)"
     tasks_total=$((tasks_open + tasks_done))
     tasks_json="$(jq -nc --argjson o "$tasks_open" --argjson d "$tasks_done" --argjson t "$tasks_total" '{missing: false, open: $o, done: $d, total: $t}')"
   else
@@ -1194,16 +1418,16 @@ status_one() {
   fi
 
   local changed_files diff_stat
-  changed_files="$(git -C "$project" status --short 2>/dev/null || true)"
-  diff_stat="$(git -C "$project" diff --stat 2>/dev/null || true)"
+  changed_files="$(git -C "$review_root" status --short 2>/dev/null || true)"
+  diff_stat="$(git -C "$review_root" diff --stat 2>/dev/null || true)"
 
   local base_head commits diff_stat_range summary
-  base_head="$(git_range_base "$project" "$(jq -r '.base_head // empty' "$state_file")")"
+  base_head="$(git_range_base "$review_root" "$(jq -r '.base_head // empty' "$state_file")")"
   commits=""
   diff_stat_range=""
   if [ -n "$base_head" ]; then
-    commits="$(git -C "$project" log --oneline "$base_head..HEAD" 2>/dev/null || true)"
-    diff_stat_range="$(git -C "$project" diff --stat "$base_head..HEAD" 2>/dev/null || true)"
+    commits="$(git -C "$review_root" log --oneline "$base_head..HEAD" 2>/dev/null || true)"
+    diff_stat_range="$(git -C "$review_root" diff --stat "$base_head..HEAD" 2>/dev/null || true)"
   fi
   summary="$(jq -r '.summary // empty' "$state_file")"
   [ -n "$summary" ] || summary="$(last_event_field "$(events_file_for "$project" "$change")" summary summary)"
@@ -1268,7 +1492,10 @@ status_one() {
     --arg state "$mission_state" --argjson human_tasks "$mission_human" \
     --argjson external_tasks "$mission_external" \
     --arg opencode_version "$opencode_version" --arg permission_mode "$permission_mode" \
-    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, pane: $pane, herdr_agent: $herdr_agent, waiter_pid: (if $waiter_pid == "" then null else ($waiter_pid | tonumber? // $waiter_pid) end), waiter_alive: $waiter_alive, waiter: $waiter, inbox_pending: $inbox_pending, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, state: $state, human_tasks: $human_tasks, external_tasks: $external_tasks, opencode_version: (if $opencode_version == "" then null else ($opencode_version | tonumber? // null) end), permission_mode: (if $permission_mode == "" then null else $permission_mode end), lessons: {global: $lessons_global, project: $lessons_project}, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end), boss: (if $boss == "" then null else $boss end), boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok, wake_plan: $wake_plan, wake_target: $wake_target, last_wake: $last_wake}')"
+    --arg worktree "$worktree" --arg branch "$branch" --arg worktree_workspace "$worktree_workspace" \
+    --arg merge_state "$merge_state" --argjson merged "$merged" --arg merge_test "$merge_test" \
+    --argjson kept "$kept" \
+    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), merge_state: $merge_state, merged: $merged, merge_test: $merge_test, kept: $kept, pane: $pane, herdr_agent: $herdr_agent, waiter_pid: (if $waiter_pid == "" then null else ($waiter_pid | tonumber? // $waiter_pid) end), waiter_alive: $waiter_alive, waiter: $waiter, inbox_pending: $inbox_pending, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, state: $state, human_tasks: $human_tasks, external_tasks: $external_tasks, opencode_version: (if $opencode_version == "" then null else ($opencode_version | tonumber? // null) end), permission_mode: (if $permission_mode == "" then null else $permission_mode end), lessons: {global: $lessons_global, project: $lessons_project}, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end), boss: (if $boss == "" then null else $boss end), boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok, wake_plan: $wake_plan, wake_target: $wake_target, last_wake: $last_wake}')"
 
   if [ "$json_only" -eq 1 ]; then
     printf '%s\n' "$json"
@@ -1277,6 +1504,11 @@ status_one() {
 
   printf 'change: %s\n' "$change"
   printf 'project: %s\n' "$project"
+  if [ -n "$worktree" ]; then
+    printf 'worktree: %s\n' "$worktree"
+    printf 'branch: %s\n' "${branch:-unknown}"
+  fi
+  printf 'merge: %s (merged: %s, test: %s)\n' "$merge_state" "$merged" "$merge_test"
   if [ -n "$opencode_version" ]; then
     printf 'opencode: v%s (permission %s)\n' "$opencode_version" "${permission_mode:-unknown}"
   elif [ -n "$permission_mode" ]; then
@@ -1384,7 +1616,7 @@ status_all() {
     permission_mode="$(jq -r '.permission_mode // empty' "$state_file")"
     e="$(jq -c --arg s "$agent_state" --argjson wa "$waiter_alive_flag" --argjson ip "$inbox_pending" --arg ms "$mission_state" \
       --arg ov "$opencode_version" --arg pm "$permission_mode" \
-      '. + {agent_state: $s, waiter_alive: $wa, inbox_pending: $ip, waiter_pid: (.waiter_pid // null)} | {change, project, agent, agent_state, waiter_pid, waiter_alive, inbox_pending, pane_id, tab_id, workspace_id, last_state, last_state_at, state: $ms, opencode_version: (if $ov == "" then null else ($ov | tonumber? // null) end), permission_mode: (if $pm == "" then null else $pm end)}' "$state_file")"
+      '. + {agent_state: $s, waiter_alive: $wa, inbox_pending: $ip, waiter_pid: (.waiter_pid // null)} | {change, project, agent, agent_state, waiter_pid, waiter_alive, inbox_pending, pane_id, tab_id, workspace_id, worktree: (.worktree // null), branch: (.branch // null), merge_state: (.merge_state // "none"), merged: (.merged // false), merge_test: (.merge_test // "not_run"), kept: (.kept // false), last_state, last_state_at, state: $ms, opencode_version: (if $ov == "" then null else ($ov | tonumber? // null) end), permission_mode: (if $pm == "" then null else $pm end)}' "$state_file")"
     json="$(printf '%s' "$json" | jq -c --argjson e "$e" '. + [$e]')"
     if [ "$json_only" -eq 0 ]; then
       if [ "$mission_state" = "waiting_human" ]; then
@@ -1393,6 +1625,12 @@ status_all() {
         printf '%s) %s in %s: %s (%s), waiter: alive (pid %s)\n' "$idx" "$(jq -r '.change' "$state_file")" "$(jq -r '.project' "$state_file")" "$agent" "$agent_state" "$waiter_pid"
       else
         printf '%s) %s in %s: %s (%s), waiter: DEAD\n' "$idx" "$(jq -r '.change' "$state_file")" "$(jq -r '.project' "$state_file")" "$agent" "$agent_state"
+      fi
+      if [ "$(jq -r '.worktree // empty' "$state_file")" != "" ]; then
+        printf '   worktree: %s (branch %s, merge %s)\n' \
+          "$(jq -r '.worktree' "$state_file")" \
+          "$(jq -r '.branch // "unknown"' "$state_file")" \
+          "$(jq -r '.merge_state // "none"' "$state_file")"
       fi
       if [ -n "$opencode_version" ]; then
         printf '   opencode: v%s, permission: %s\n' "$opencode_version" "${permission_mode:-unknown}"
@@ -1431,13 +1669,14 @@ cmd_status() {
 # ------------------------------------------------------------------ review ---
 
 # review_locate <change> [<project-name>] -- locate the apply's sources without
-# dying when only an event log is left. Prints "<project>\t<events-file>\t<state-file>"
-# (state-file empty when the apply was already finished, so it stays last and
-# a leading empty field is never read). Dies with no_apply when there is
-# nothing to review.
+# dying when only an event log is left. Prints
+# "<project>\t<events-file>\t<state-file>\t<worktree>". The state file comes
+# before the worktree so a finished apply can leave both trailing fields empty;
+# a legacy state without a worktree prints an empty fourth field. Dies with
+# no_apply when there is nothing to review.
 review_locate() {
   local change="$1" project_name="${2:-}" norm files f count want names
-  local evs ev project state_file
+  local evs ev project state_file worktree=""
   norm="$(normalize_name "$change")"
 
   files="$(ls "$BOSS_APPLIES_DIR"/*-"$norm".json 2>/dev/null || true)"
@@ -1460,7 +1699,9 @@ review_locate() {
       state_file="$files"
     fi
     project="$(jq -r '.project' "$state_file")"
-    printf '%s\t%s\t%s\n' "$project" "$(events_file_for "$project" "$change")" "$state_file"
+    worktree="$(jq -r '.worktree // empty' "$state_file" 2>/dev/null || true)"
+    printf '%s\t%s\t%s\t%s\n' "$project" "$(events_file_for "$project" "$change")" \
+      "$state_file" "$worktree"
     return 0
   fi
 
@@ -1476,7 +1717,7 @@ review_locate() {
       want="$(resolve_project "$project_name")" || exit 1
       for ev in $evs; do
         [ "$(sed -n '1p' "$ev" | jq -r '.project // empty' 2>/dev/null)" = "$want" ] \
-          && { printf '%s\t%s\t%s\n' "$want" "$ev" ""; return 0; }
+          && { printf '%s\t%s\t\t\n' "$want" "$ev"; return 0; }
       done
     fi
     names=""
@@ -1485,7 +1726,7 @@ review_locate() {
   fi
   project="$(sed -n '1p' "$evs" | jq -r '.project // empty' 2>/dev/null)"
   [ -n "$project" ] || die_json "no_apply" "event log for change '$change' carries no project"
-  printf '%s\t%s\t%s\n' "$project" "$evs" ""
+  printf '%s\t%s\t\t\n' "$project" "$evs"
 }
 
 # is_project_registered <project> -- 0 when the canonical path is in the
@@ -1589,9 +1830,22 @@ cmd_review() {
   done
   [ -n "$change" ] || usage_error "usage: boss review <change> [--project <name|path>] [--json]"
 
-  local line state_file project ev
+  local line state_file project ev located_worktree
   line="$(review_locate "$change" "$project_name")" || exit 1
-  IFS=$'\t' read -r project ev state_file <<<"$line"
+  IFS=$'\t' read -r project ev state_file located_worktree <<<"$line"
+
+  local worktree="$located_worktree" branch="" worktree_workspace="" merge_state="none" merged=false
+  local merge_test="not_run" kept=false review_root="$project"
+  if [ -n "$state_file" ] && [ -f "$state_file" ]; then
+    [ -n "$worktree" ] || worktree="$(jq -r '.worktree // empty' "$state_file" 2>/dev/null || true)"
+    branch="$(jq -r '.branch // empty' "$state_file" 2>/dev/null || true)"
+    worktree_workspace="$(jq -r '.worktree_workspace // empty' "$state_file" 2>/dev/null || true)"
+    merge_state="$(jq -r '.merge_state // "none"' "$state_file" 2>/dev/null || true)"
+    merged="$(jq -r '.merged // false' "$state_file" 2>/dev/null || printf false)"
+    merge_test="$(jq -r '.merge_test // "not_run"' "$state_file" 2>/dev/null || true)"
+    kept="$(jq -r '.kept // false' "$state_file" 2>/dev/null || printf false)"
+    [ -n "$worktree" ] && review_root="$worktree"
+  fi
 
   local boss_workspace="" boss_dispatcher=""
   if [ -n "$state_file" ] && [ -f "$state_file" ]; then
@@ -1619,7 +1873,7 @@ cmd_review() {
   last_wake="$(last_wake_event "$events_file")"
 
   local tasks_file tasks_open tasks_done tasks_total tasks_json
-  tasks_file="$(tasks_file_for "$project" "$change")"
+  tasks_file="$(tasks_file_for "$review_root" "$change")"
   if [ -n "$tasks_file" ]; then
     tasks_open="$(grep -c '^[[:space:]]*- \[ \]' "$tasks_file" || true)"
     tasks_done="$(grep -c '^[[:space:]]*- \[x\]' "$tasks_file" || true)"
@@ -1632,7 +1886,7 @@ cmd_review() {
 
   local validate_result="not_run"
   if command -v openspec >/dev/null 2>&1; then
-    if (cd "$project" && openspec validate "$change" --strict >/dev/null 2>&1); then
+    if (cd "$review_root" && openspec validate "$change" --strict >/dev/null 2>&1); then
       validate_result="pass"
     else
       validate_result="fail"
@@ -1641,7 +1895,7 @@ cmd_review() {
 
   local test_cmd test_result="not_run"
   test_cmd="$(config_test_command "$project")"
-  [ -n "$test_cmd" ] || test_cmd="$(detect_test_command "$project")"
+  [ -n "$test_cmd" ] || test_cmd="$(detect_test_command "$review_root")"
   # A command whose program is not installed did not run and must not read as
   # a red test: drop it and report not_run instead.
   if [ -n "$test_cmd" ] && ! command -v "${test_cmd%% *}" >/dev/null 2>&1; then
@@ -1649,7 +1903,7 @@ cmd_review() {
     test_cmd=""
   fi
   if [ -n "$test_cmd" ] && command -v timeout >/dev/null 2>&1; then
-    if (cd "$project" && timeout "$BOSS_REVIEW_TEST_TIMEOUT_S" bash -c "$test_cmd" >/dev/null 2>&1); then
+    if (cd "$review_root" && timeout "$BOSS_REVIEW_TEST_TIMEOUT_S" bash -c "$test_cmd" >/dev/null 2>&1); then
       test_result="pass"
     else
       test_result="fail"
@@ -1657,8 +1911,8 @@ cmd_review() {
   fi
 
   local changed_files diff_stat
-  changed_files="$(git -C "$project" status --short 2>/dev/null || true)"
-  diff_stat="$(git -C "$project" diff --stat 2>/dev/null || true)"
+  changed_files="$(git -C "$review_root" status --short 2>/dev/null || true)"
+  diff_stat="$(git -C "$review_root" diff --stat 2>/dev/null || true)"
 
   local base_head="" commits="" diff_stat_range="" foreign_commits="" foreign_count=0
   local expected_name expected_email commit_details commit_policy="explorer" violations="[]"
@@ -1666,15 +1920,15 @@ cmd_review() {
     commit_policy="$(state_commit_policy "$state_file")"
   fi
   if [ -n "$state_file" ] && [ -f "$state_file" ]; then
-    base_head="$(git_range_base "$project" "$(jq -r '.base_head // empty' "$state_file")")"
+    base_head="$(git_range_base "$review_root" "$(jq -r '.base_head // empty' "$state_file")")"
   fi
   if [ -n "$base_head" ]; then
-    commits="$(git -C "$project" log --oneline "$base_head..HEAD" 2>/dev/null || true)"
-    diff_stat_range="$(git -C "$project" diff --stat "$base_head..HEAD" 2>/dev/null || true)"
-    expected_name="$(git -C "$project" config user.name 2>/dev/null || true)"
-    expected_email="$(git -C "$project" config user.email 2>/dev/null || true)"
+    commits="$(git -C "$review_root" log --oneline "$base_head..HEAD" 2>/dev/null || true)"
+    diff_stat_range="$(git -C "$review_root" diff --stat "$base_head..HEAD" 2>/dev/null || true)"
+    expected_name="$(git -C "$review_root" config user.name 2>/dev/null || true)"
+    expected_email="$(git -C "$review_root" config user.email 2>/dev/null || true)"
     if [ -n "$expected_name" ] || [ -n "$expected_email" ]; then
-      commit_details="$(git -C "$project" log --format='%H%x09%an%x09%ae%x09%s' "$base_head..HEAD" 2>/dev/null || true)"
+      commit_details="$(git -C "$review_root" log --format='%H%x09%an%x09%ae%x09%s' "$base_head..HEAD" 2>/dev/null || true)"
       foreign_commits="$(printf '%s\n' "$commit_details" | awk -F '\t' -v n="$expected_name" -v e="$expected_email" \
         'NF >= 4 && ((n != "" && $2 != n) || (e != "" && $3 != e)) { print $1 "\t" $2 " <" $3 ">\t" $4 }')"
       foreign_count="$(printf '%s' "$foreign_commits" | grep -c . 2>/dev/null || true)"
@@ -1740,7 +1994,14 @@ cmd_review() {
     --argjson boss_reachable "$boss_reachable" --argjson boss_name_ok "$boss_name_ok" \
     --arg events_file "$events_file" --argjson wake_plan "$wake_plan" \
     --argjson wake_target "$wake_target" --argjson last_wake "$last_wake" \
+    --arg worktree "$worktree" --arg branch "$branch" --arg worktree_workspace "$worktree_workspace" \
+    --arg merge_state "$merge_state" --argjson merged "$merged" --arg merge_test "$merge_test" \
+    --argjson kept "$kept" \
     '{change: $change, project: $project, summary: (if $summary == "" then null else $summary end),
+      worktree: (if $worktree == "" then null else $worktree end),
+      branch: (if $branch == "" then null else $branch end),
+      worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end),
+      merge_state: $merge_state, merged: $merged, merge_test: $merge_test, kept: $kept,
       boss: (if $boss == "" then null else $boss end),
       boss_pane: (if $boss_pane == "" then null else $boss_pane end),
       boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok,
@@ -1767,6 +2028,11 @@ cmd_review() {
 
   printf 'change: %s\n' "$change"
   printf 'project: %s\n' "$project"
+  if [ -n "$worktree" ]; then
+    printf 'worktree: %s\n' "$worktree"
+    printf 'branch: %s\n' "${branch:-unknown}"
+  fi
+  printf 'merge: %s (merged: %s, test: %s)\n' "$merge_state" "$merged" "$merge_test"
   if [ "$boss_state" = "name_stale" ]; then
     printf 'warning: workspace boss %s on pane %s lost its Herdr name; the waiter may not wake it (run boss claim there to heal it)\n' "${boss:-unknown}" "${boss_pane:-unknown}"
   elif [ "$boss_state" = "not_reachable" ]; then
@@ -2229,6 +2495,113 @@ cmd_doctor() {
     doctor_add test_command warn "no test command recognized; the review will report not_run"
   fi
 
+  # Worktree support and the state of every worktree apply of this project.
+  local wt_support=ok wt_support_hint=""
+  if ! git -C "$project" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    wt_support=warn
+    wt_support_hint="$project is not a git repository; worktree dispatch is unavailable"
+  elif ! git -C "$project" worktree list >/dev/null 2>&1; then
+    wt_support=warn
+    wt_support_hint="git worktree is unavailable in $project"
+  elif [ "$have_herdr" -ne 1 ]; then
+    wt_support=warn
+    wt_support_hint="cannot check 'herdr worktree list' without herdr"
+  elif ! herdr worktree list --cwd "$project" >/dev/null 2>&1; then
+    wt_support=warn
+    wt_support_hint="'herdr worktree list' failed in $project; update Herdr for native worktree support"
+  fi
+  doctor_add worktree_support "$wt_support" "$wt_support_hint"
+
+  local wt_project_hash wt_warn="" wt_orphans="" wt_removed="" wt_count=0
+  local wt_f wt_ch wt_path wt_ms wt_merged wt_kept wt_branch wt_tab wt_ws
+  wt_project_hash="$(sha1_hex "$project")"
+  if [ -d "$BOSS_APPLIES_DIR" ]; then
+    for wt_f in "$BOSS_APPLIES_DIR"/*.json; do
+      [ -f "$wt_f" ] || continue
+      [ "$(jq -r '.project // empty' "$wt_f" 2>/dev/null || true)" = "$project" ] || continue
+      wt_path="$(jq -r '.worktree // empty' "$wt_f" 2>/dev/null || true)"
+      [ -n "$wt_path" ] || continue
+      wt_count=$((wt_count + 1))
+      wt_ch="$(jq -r '.change // empty' "$wt_f" 2>/dev/null || true)"
+      wt_ms="$(jq -r '.merge_state // "none"' "$wt_f" 2>/dev/null || true)"
+      wt_merged="$(jq -r '.merged // false' "$wt_f" 2>/dev/null || true)"
+      wt_kept="$(jq -r '.kept // false' "$wt_f" 2>/dev/null || true)"
+      wt_branch="$(jq -r '.branch // empty' "$wt_f" 2>/dev/null || true)"
+      wt_ws="$(jq -r '.worktree_workspace // empty' "$wt_f" 2>/dev/null || true)"
+      if [ ! -d "$wt_path" ]; then
+        wt_warn="$wt_warn $wt_ch:path missing ($wt_path)"
+        continue
+      fi
+      case "$wt_ms" in
+        conflict|test_failed) wt_warn="$wt_warn $wt_ch:merge_state=$wt_ms" ;;
+      esac
+      if [ -d "$wt_path/openspec/changes/$wt_ch" ]; then
+        local wt_plan_dirty
+        wt_plan_dirty="$(git -C "$wt_path" status --porcelain -- "openspec/changes/$wt_ch" 2>/dev/null || true)"
+        [ -n "$wt_plan_dirty" ] && wt_warn="$wt_warn $wt_ch:change dir not committed in the worktree"
+      fi
+      if [ "$fix" -eq 1 ] && [ "$wt_merged" = "true" ]; then
+        if [ "$wt_kept" = "true" ] || [ "$wt_ms" = "done" ]; then
+          wt_tab="$(jq -r '.tab_id // empty' "$wt_f" 2>/dev/null || true)"
+          [ -n "$wt_tab" ] && [ "$wt_tab" != "null" ] && herdr tab close "$wt_tab" >/dev/null 2>&1 || true
+          herdr_worktree_remove "$project" "$wt_path" "$wt_ws"
+          git -C "$project" worktree remove --force "$wt_path" >/dev/null 2>&1 || true
+          git -C "$project" worktree prune >/dev/null 2>&1 || true
+          [ -n "$wt_branch" ] && git -C "$project" branch -D "$wt_branch" >/dev/null 2>&1 || true
+          rm -rf "$wt_path" 2>/dev/null || true
+          rmdir "$(dirname "$wt_path")" 2>/dev/null || true
+          rm -f "$wt_f"
+          inbox_remove "$project" "$wt_ch"
+          wt_removed="$wt_removed $wt_ch"
+          log "doctor --fix: removed merged worktree $wt_path for $wt_ch"
+        fi
+      fi
+    done
+  fi
+
+  if [ -d "$BOSS_WORKTREES_DIR/$wt_project_hash" ]; then
+    local wt_dir wt_name wt_state
+    for wt_dir in "$BOSS_WORKTREES_DIR/$wt_project_hash"/*; do
+      [ -d "$wt_dir" ] || continue
+      wt_name="$(basename "$wt_dir")"
+      wt_state="$BOSS_APPLIES_DIR/$wt_project_hash-$wt_name.json"
+      if [ ! -f "$wt_state" ]; then
+        wt_orphans="$wt_orphans $wt_dir"
+      fi
+    done
+  fi
+
+  if [ -z "$wt_warn" ]; then
+    local wt_hint=""
+    [ -n "$wt_removed" ] && wt_hint="removed merged worktrees:$wt_removed"
+    doctor_add worktree_state ok "$wt_hint"
+  else
+    local wt_hint="worktree states need attention:$wt_warn; run 'boss review' and 'boss finish', or 'boss doctor --fix' for merged kept worktrees"
+    [ -n "$wt_removed" ] && wt_hint="$wt_hint; removed merged worktrees:$wt_removed"
+    doctor_add worktree_state warn "$wt_hint"
+  fi
+  if [ -z "$wt_orphans" ]; then
+    doctor_add worktree_orphans ok ""
+  else
+    doctor_add worktree_orphans warn "worktrees under $BOSS_WORKTREES_DIR have no apply state:$wt_orphans; inspect them before removing anything"
+  fi
+
+  if [ "$wt_count" -gt 0 ] || [ -n "$wt_orphans" ]; then
+    local wt_base_paths wt_base_hint=""
+    wt_base_paths="$(git_dirty_paths "$project" code)"
+    [ -n "$wt_base_paths" ] && wt_base_hint="dirty base outside openspec/: $(printf '%s' "$wt_base_paths" | paste -sd ', ' -)"
+    local wt_plan_paths
+    wt_plan_paths="$(git_dirty_paths "$project" plan)"
+    if [ -n "$wt_plan_paths" ]; then
+      wt_base_hint="${wt_base_hint:+$wt_base_hint; }plan paths not committed: $(printf '%s' "$wt_plan_paths" | paste -sd ', ' -)"
+    fi
+    if [ -n "$wt_base_hint" ]; then
+      doctor_add worktree_base warn "$wt_base_hint"
+    else
+      doctor_add worktree_base ok ""
+    fi
+  fi
+
   if is_project_registered "$project"; then
     doctor_add project_registry ok ""
   elif [ "$fix" -eq 1 ] && doctor_register_project "$project" "$(basename "$project")"; then
@@ -2519,7 +2892,18 @@ cmd_retrigger() {
     [ -n "$base_head" ] && write_state_field "$state_file" base_head "$base_head"
   fi
 
-  if ! herdr agent get "$pane_id" >/dev/null 2>&1; then
+  if [ -z "$pane_id" ] || [ "$pane_id" = "null" ] || ! herdr agent get "$pane_id" >/dev/null 2>&1; then
+    local retrigger_worktree retrigger_runner
+    retrigger_worktree="$(jq -r '.worktree // empty' "$state_file" 2>/dev/null || true)"
+    if [ -n "$retrigger_worktree" ]; then
+      [ -d "$retrigger_worktree" ] \
+        || die_json "worktree_missing" "the recorded worktree $retrigger_worktree for '$change' is missing; do not fall back to the base checkout"
+      retrigger_runner="$(jq -r '.runner // empty' "$state_file")"
+      retrigger_runner="$(resolve_runner "$retrigger_runner")" || exit 1
+      log "retrigger: agent $agent is gone; starting a new agent in $retrigger_worktree"
+      dispatch_change "$change" "$project" "$retrigger_runner" "$note" 1
+      return 0
+    fi
     die_json "agent_gone" "agent '$agent' no longer exists; start a new apply with 'boss dispatch $change'"
   fi
 
@@ -2550,15 +2934,256 @@ tasks_file_for() {
   [ -n "$f" ] && printf '%s\n' "$f"
 }
 
+# record_finish_lesson <project> <text> <scope> -- append a verified lesson and
+# print its JSON description. A write error never blocks the finish.
+record_finish_lesson() {
+  local project="$1" text="$2" scope="$3" file
+  [ -n "$text" ] || { printf 'null\n'; return 0; }
+  if [ "$scope" = "global" ]; then
+    file="$(lessons_global_path 2>/dev/null || true)"
+  else
+    file="$(lessons_project_path "$project" 2>/dev/null || true)"
+  fi
+  if [ -z "$file" ]; then
+    log "warning: could not record lesson: cannot resolve $scope lessons path"
+    jq -nc --arg s "$scope" '{scope: $s, path: null, error: "cannot resolve lessons path"}'
+  elif lesson_append "$file" "$text"; then
+    log "finish: recorded $scope lesson in $file"
+    jq -nc --arg s "$scope" --arg p "$file" '{scope: $s, path: $p}'
+  else
+    log "warning: could not record $scope lesson in $file"
+    jq -nc --arg s "$scope" --arg p "$file" '{scope: $s, path: $p, error: "cannot write lessons file"}'
+  fi
+}
+
+# finish_worktree <change> <project> <state-file> <worktree> <branch> <commit-
+# policy> <keep> <no-merge> <lesson-text> <lesson-scope> -- the isolated finish:
+# verify, merge into the base, test the merged base and clean up. Calls die_json
+# for a dirty base/worktree, a conflict or a red integration test, always
+# leaving the worktree and state intact in those cases.
+finish_worktree() {
+  local change="$1" project="$2" state_file="$3" worktree="$4" branch="$5"
+  local commit_policy="$6" keep="$7" no_merge="$8" lesson_text="$9" lesson_scope="${10}"
+  local tab_id waiter_pid base_head merge_state merged merge_test worktree_workspace
+  tab_id="$(jq -r '.tab_id // empty' "$state_file")"
+  waiter_pid="$(jq -r '.waiter_pid // empty' "$state_file")"
+  worktree_workspace="$(jq -r '.worktree_workspace // empty' "$state_file")"
+  base_head="$(jq -r '.base_head // empty' "$state_file")"
+  merge_state="$(jq -r '.merge_state // "none"' "$state_file")"
+  merged="$(jq -r '.merged // false' "$state_file")"
+  merge_test="$(jq -r '.merge_test // "not_run"' "$state_file")"
+
+  # The worktree must be clean: under explorer the Explorer has not committed
+  # yet; under agent the apply was expected to commit its tested work.
+  local wt_changed wt_paths
+  wt_changed="$(git -C "$worktree" status --porcelain 2>/dev/null || true)"
+  wt_paths="$(git_dirty_paths "$worktree" all)"
+  if [ -n "$wt_changed" ]; then
+    die_json "worktree_dirty" "the worktree $worktree still has uncommitted changes: $(printf '%s' "$wt_paths" | paste -sd ', ' -); commit them before finishing (commit policy: $commit_policy)"
+  fi
+
+  # A merge into a dirty base is worse than refusing.
+  local base_paths
+  base_paths="$(git_dirty_paths "$project" all)"
+  if [ -n "$base_paths" ]; then
+    die_json "base_dirty" "the base checkout $project has uncommitted changes: $(printf '%s' "$base_paths" | paste -sd ', ' -); commit or stash them before finishing"
+  fi
+
+  local already_merged=false
+  git -C "$project" rev-parse --verify "$branch" >/dev/null 2>&1 || {
+    git -C "$project" merge-base --is-ancestor "$branch" HEAD >/dev/null 2>&1 \
+      && already_merged=true \
+      || die_json "branch_missing" "the recorded branch '$branch' for '$change' does not exist in $project"
+  }
+  if git -C "$project" merge-base --is-ancestor "$branch" HEAD >/dev/null 2>&1; then
+    already_merged=true
+  fi
+
+  # --no-merge is the manual path: close the agent, keep worktree and state.
+  if [ "$no_merge" = "1" ]; then
+    [ -n "$tab_id" ] && [ "$tab_id" != "null" ] && herdr tab close "$tab_id" >/dev/null 2>&1 || true
+    kill_waiter "$waiter_pid" >/dev/null 2>&1 || true
+    local nm_now tmp
+    nm_now="$(now_iso)"
+    tmp="$(mktemp)"
+    if jq --arg t "$nm_now" \
+        '.pane_id = null | .tab_id = null | .waiter_pid = null
+         | .kept = true | .last_state = "detached" | .last_state_at = $t' \
+        "$state_file" >"$tmp" 2>/dev/null; then
+      mv "$tmp" "$state_file"
+    else
+      rm -f "$tmp"
+      die_json "state_write" "cannot mark apply $change as detached"
+    fi
+    log "finish: --no-merge kept worktree $worktree and branch $branch for $change"
+    printf '%s\n' "$(jq -n --arg change "$change" --arg project "$project" \
+      --arg worktree "$worktree" --arg branch "$branch" --arg status "kept" \
+      --arg merge_state "$merge_state" --argjson merged "$merged" --arg merge_test "$merge_test" \
+      '{change: $change, project: $project, status: $status, no_merge: true,
+        worktree: $worktree, branch: $branch, merge_state: $merge_state,
+        merged: $merged, merge_test: $merge_test}')"
+    return 0
+  fi
+
+  if [ "$already_merged" != true ]; then
+    local base_now
+    base_now="$(git -C "$project" rev-parse HEAD 2>/dev/null || true)"
+    if [ -n "$base_head" ] && [ "$base_now" = "$base_head" ]; then
+      git -C "$project" merge --ff-only "$branch" >/dev/null 2>&1 || true
+    else
+      git -C "$project" merge --no-ff --no-edit "$branch" >/dev/null 2>&1 || true
+    fi
+    if ! git -C "$project" merge-base --is-ancestor "$branch" HEAD >/dev/null 2>&1; then
+      local conflicts
+      conflicts="$(git -C "$project" diff --name-only --diff-filter=U 2>/dev/null || true)"
+      git -C "$project" merge --abort >/dev/null 2>&1 || true
+      write_state_field "$state_file" merge_state "conflict" >/dev/null 2>&1 || true
+      die_json "merge_conflict" "merging '$branch' into $project conflicted: $(printf '%s' "$conflicts" | paste -sd ', ' -); the merge was aborted and the worktree and state were kept"
+    fi
+    merged=true
+  else
+    merged=true
+  fi
+
+  # Integration test on the merged base. 'not_run' passes, as in review.
+  local test_cmd="" test_result="not_run"
+  test_cmd="$(config_test_command "$project")"
+  [ -n "$test_cmd" ] || test_cmd="$(detect_test_command "$project")"
+  if [ -n "$test_cmd" ] && ! command -v "${test_cmd%% *}" >/dev/null 2>&1; then
+    log "test command '$test_cmd' not found in PATH; reporting not_run"
+    test_cmd=""
+  fi
+  if [ -n "$test_cmd" ] && command -v timeout >/dev/null 2>&1; then
+    if (cd "$project" && timeout "$BOSS_REVIEW_TEST_TIMEOUT_S" bash -c "$test_cmd" >/dev/null 2>&1); then
+      test_result="pass"
+    else
+      test_result="fail"
+    fi
+  fi
+
+  local done_now tmp
+  done_now="$(now_iso)"
+  if [ "$test_result" = "fail" ]; then
+    tmp="$(mktemp)"
+    if jq --arg t "$done_now" \
+        '.merged = true | .merge_state = "test_failed" | .merge_test = "fail"
+         | .last_state_at = $t' "$state_file" >"$tmp" 2>/dev/null; then
+      mv "$tmp" "$state_file"
+    else
+      rm -f "$tmp"
+    fi
+    die_json "merge_test_failed" "the change merged into $project but '$test_cmd' failed on the merged base; the state was kept so a second finish can retry after the fix"
+  fi
+  if [ -n "$test_cmd" ]; then
+    merge_test="$test_result"
+  else
+    merge_test="not_run"
+  fi
+
+  tmp="$(mktemp)"
+  if jq --arg t "$done_now" --arg ms "done" --arg mt "$merge_test" \
+      '.merged = true | .merge_state = $ms | .merge_test = $mt | .last_state_at = $t' \
+      "$state_file" >"$tmp" 2>/dev/null; then
+    mv "$tmp" "$state_file"
+  else
+    rm -f "$tmp"
+    die_json "state_write" "cannot update state file $state_file"
+  fi
+
+  # Snapshot the friction before the state file disappears.
+  local ev retriggers blocked_count waiter_lost duration_s tasks_open started_at tasks_file archived=false
+  ev="$(events_file_for "$project" "$change")"
+  retriggers="$(event_count_since_dispatch "$ev" retrigger)"
+  blocked_count="$(event_count_since_dispatch "$ev" blocked)"
+  waiter_lost=false
+  [ "$(event_count_since_dispatch "$ev" lost)" -gt 0 ] && waiter_lost=true
+  started_at="$(jq -r '.started_at // ""' "$state_file")"
+  duration_s=null
+  if [ -n "$started_at" ]; then
+    local started_epoch
+    started_epoch="$(epoch_of_iso "$started_at")"
+    [ -n "$started_epoch" ] && duration_s=$(( $(date +%s) - started_epoch ))
+  fi
+  tasks_open=null
+  tasks_file="$(tasks_file_for "$worktree" "$change")"
+  if [ -n "$tasks_file" ]; then
+    tasks_open="$(grep -c '^[[:space:]]*- \[ \]' "$tasks_file" || true)"
+  fi
+  ls -d "$project"/openspec/changes/archive/*-"$change" >/dev/null 2>&1 && archived=true
+
+  append_event "$ev" finish \
+    "$(jq -nc --arg c "$change" --arg p "$project" --argjson a "$archived" --argjson o "$tasks_open" \
+      '{change: $c, project: $p, archived: $a, tasks_open: $o}')" \
+    || log "warning: could not record finish event"
+  append_event "$ev" cycle \
+    "$(jq -nc --arg c "$change" --arg p "$project" --arg started_at "$started_at" \
+      --arg finished_at "$(now_iso)" --argjson duration_s "$duration_s" \
+      --argjson retriggers "$retriggers" --argjson blocked_count "$blocked_count" \
+      --argjson waiter_lost "$waiter_lost" --argjson tasks_open "$tasks_open" --argjson archived "$archived" \
+      '{change: $c, project: $p, started_at: $started_at, finished_at: $finished_at, duration_s: $duration_s, retriggers: $retriggers, blocked_count: $blocked_count, waiter_lost: $waiter_lost, tasks_open: $tasks_open, archived: $archived}')" \
+    || log "warning: could not record cycle event"
+
+  [ -n "$tab_id" ] && [ "$tab_id" != "null" ] && herdr tab close "$tab_id" >/dev/null 2>&1 || true
+  kill_waiter "$waiter_pid" >/dev/null 2>&1 || true
+
+  local lesson_json
+  lesson_json="$(record_finish_lesson "$project" "$lesson_text" "$lesson_scope")"
+
+  if [ "$keep" = "1" ]; then
+    tmp="$(mktemp)"
+    if jq --arg t "$done_now" \
+        '.kept = true | .pane_id = null | .tab_id = null | .waiter_pid = null
+         | .last_state = "finished" | .last_state_at = $t' \
+        "$state_file" >"$tmp" 2>/dev/null; then
+      mv "$tmp" "$state_file"
+    else
+      rm -f "$tmp"
+    fi
+    log "finish: --keep-worktree kept $worktree and branch $branch for $change"
+    printf '%s\n' "$(jq -n --arg change "$change" --arg project "$project" \
+      --arg worktree "$worktree" --arg branch "$branch" --arg status "kept" \
+      --argjson archived "$archived" --argjson lesson "$lesson_json" \
+      --arg merge_state "$merge_state" --arg merge_test "$merge_test" \
+      '{change: $change, project: $project, status: $status, kept: true,
+        worktree: $worktree, branch: $branch, merge_state: "done",
+        merged: true, merge_test: $merge_test, archived: $archived, lesson: $lesson}')"
+    return 0
+  fi
+
+  # Cleanup on green: remove the worktree, delete the branch and the state.
+  herdr_worktree_remove "$project" "$worktree" "$worktree_workspace"
+  git -C "$project" worktree remove --force "$worktree" >/dev/null 2>&1 || true
+  git -C "$project" worktree prune >/dev/null 2>&1 || true
+  git -C "$project" branch -D "$branch" >/dev/null 2>&1 || true
+  rm -rf "$worktree" 2>/dev/null || true
+  rmdir "$(dirname "$worktree")" 2>/dev/null || true
+  rm -f "$state_file"
+  inbox_remove "$project" "$change"
+
+  log "finish: change=$change project=$project worktree=$worktree branch=$branch removed"
+  printf '%s\n' "$(jq -n --arg change "$change" --arg project "$project" \
+    --arg worktree "$worktree" --arg branch "$branch" --arg status "finished" \
+    --arg json_merge_state "done" --arg merge_test "$merge_test" \
+    --argjson archived "$archived" --argjson lesson "$lesson_json" \
+    '{change: $change, project: $project, status: $status,
+      worktree: $worktree, branch: $branch, removed: true,
+      merge_state: $json_merge_state, merged: true, merge_test: $merge_test,
+      archived: $archived, lesson: $lesson,
+      working_tree_warning: false, changed_files: []}')"
+}
+
 # ------------------------------------------------------------------ finish ---
 
 cmd_finish() {
   local change="" project_name="" force=0 lesson_text="" lesson_scope="project" as_target="" arg
+  local keep_worktree=0 no_merge=0
   while [ $# -gt 0 ]; do
     arg="$1"; shift
     case "$arg" in
       --project) project_name="${1:-}"; shift ;;
       --force) force=1 ;;
+      --keep-worktree) keep_worktree=1 ;;
+      --no-merge) no_merge=1 ;;
       --lesson) lesson_text="$(one_line "${1:-}")"; shift ;;
       --lesson-scope) lesson_scope="${1:-}"; shift ;;
       --as) as_target="${1:-}"; shift ;;
@@ -2567,7 +3192,7 @@ cmd_finish() {
       *) if [ -z "$change" ]; then change="$arg"; else usage_error "unexpected argument: $arg"; fi ;;
     esac
   done
-  [ -n "$change" ] || usage_error "usage: boss finish <change> [--project <name|path>] [--force] [--lesson <text>] [--lesson-scope project|global] [--as <pane|agent>]"
+  [ -n "$change" ] || usage_error "usage: boss finish <change> [--project <name|path>] [--force] [--keep-worktree] [--no-merge] [--lesson <text>] [--lesson-scope project|global] [--as <pane|agent>]"
   boss_use_caller "$as_target"
   ensure_boss_claim finish
   ensure_config
@@ -2598,6 +3223,16 @@ cmd_finish() {
   agent_state="$(agent_state_of "$pane_id")"
   if [ "$force" -ne 1 ] && [ "$agent_state" = "working" ]; then
     die_json "agent_working" "apply agent for '$change' is still working; wait for it (boss wait $change) or use --force"
+  fi
+
+  local finish_worktree_path finish_branch
+  finish_worktree_path="$(jq -r '.worktree // empty' "$state_file" 2>/dev/null || true)"
+  finish_branch="$(jq -r '.branch // empty' "$state_file" 2>/dev/null || true)"
+  if [ -n "$finish_worktree_path" ]; then
+    finish_worktree "$change" "$project" "$state_file" "$finish_worktree_path" \
+      "${finish_branch:-$(worktree_branch_for "$change")}" "$commit_policy" \
+      "$keep_worktree" "$no_merge" "$lesson_text" "$lesson_scope"
+    return 0
   fi
 
   if [ -n "$tab_id" ] && [ "$tab_id" != "null" ]; then
@@ -2811,13 +3446,17 @@ cmd_resume() {
   ensure_boss_claim resume
   ensure_config
 
-  local project state_file pane_id jfile state_runner=""
+  local project state_file pane_id jfile state_runner="" resume_worktree=""
   project="$(resolve_project "$project_name")" || exit 1
   state_file="$(find_state_file "$change" "$project_name" 2>/dev/null || true)"
   pane_id=""
   if [ -n "$state_file" ]; then
     pane_id="$(jq -r '.pane_id // empty' "$state_file" 2>/dev/null || true)"
     state_runner="$(jq -r '.runner // empty' "$state_file" 2>/dev/null || true)"
+    resume_worktree="$(jq -r '.worktree // empty' "$state_file" 2>/dev/null || true)"
+    if [ -n "$resume_worktree" ] && [ ! -d "$resume_worktree" ]; then
+      die_json "worktree_missing" "the recorded worktree $resume_worktree for '$change' is missing; do not fall back to the base checkout"
+    fi
   fi
 
   append_event "$(events_file_for "$project" "$change")" resume \
@@ -2845,9 +3484,10 @@ cmd_resume() {
 
   # Preserve the runner of the original dispatch; a missing state field keeps
   # the configured default. A removed/renamed runner is an explicit error.
-  local runner
+  local runner want_worktree=0
+  [ -n "$resume_worktree" ] && want_worktree=1
   runner="$(resolve_runner "$state_runner")" || exit 1
-  dispatch_change "$change" "$project" "$runner" "$note"
+  dispatch_change "$change" "$project" "$runner" "$note" "$want_worktree"
 }
 
 # --------------------------------------------------------------- interrupt ---
@@ -3506,7 +4146,7 @@ mission_dep_satisfied() {
 # done nor human-ok are skipped; if only parked work remains, the result is the
 # non-error handoff waiting_human.
 cmd_mission_next() {
-  local slug="$1" project_name="$2" as_target="${3:-}" dry_run="${4:-0}" skip_reconcile="${5:-0}"
+  local slug="$1" project_name="$2" as_target="${3:-}" dry_run="${4:-0}" skip_reconcile="${5:-0}" want_worktree="${6:-0}"
   if [ "$dry_run" -ne 1 ]; then
     boss_use_caller "$as_target"
     ensure_boss_claim dispatch
@@ -3679,12 +4319,15 @@ cmd_mission_next() {
   fi
 
   # One executer per workspace: check only once a change is actually startable,
-  # so a handoff or a complete mission is not blocked by a busy workspace.
-  local workspace_id
-  workspace_id="$(find_workspace_for_repo "$project")"
-  [ -n "$workspace_id" ] && assert_workspace_free "$workspace_id"
+  # so a handoff or a complete mission is not blocked by a busy workspace. A
+  # worktree apply runs in its own workspace; dispatch_change checks that one.
+  if [ "$want_worktree" != "1" ]; then
+    local workspace_id
+    workspace_id="$(find_workspace_for_repo "$project")"
+    [ -n "$workspace_id" ] && assert_workspace_free "$workspace_id"
+  fi
 
-  dispatch_change "$target" "$project" "$runner" ""
+  dispatch_change "$target" "$project" "$runner" "" "$want_worktree"
 }
 
 # cmd_mission_add <slug> <change> <project-name> -- append a change to the mission
@@ -3717,6 +4360,7 @@ cmd_mission_rm() {
 # subcommands and reject a slug that would escape the missions directory.
 cmd_mission() {
   local action="" slug="" change="" project_name="" as_target="" dry_run=0 skip_reconcile=0 arg
+  local wt_flag="" no_wt_flag=""
   while [ $# -gt 0 ]; do
     arg="$1"; shift
     case "$arg" in
@@ -3724,6 +4368,8 @@ cmd_mission() {
       --as) as_target="${1:-}"; shift ;;
       --dry-run) dry_run=1 ;;
       --skip-reconcile) skip_reconcile=1 ;;
+      --worktree) wt_flag=1 ;;
+      --no-worktree) no_wt_flag=1 ;;
       -h|--help) usage ;;
       --*) usage_error "unknown option: $arg" ;;
       *)
@@ -3738,13 +4384,19 @@ cmd_mission() {
   case "$slug" in
     */*|*..*) usage_error "invalid mission slug: $slug" ;;
   esac
-  if [ "$action" != "next" ] && { [ "$dry_run" -eq 1 ] || [ "$skip_reconcile" -eq 1 ]; }; then
-    usage_error "--dry-run and --skip-reconcile apply only to 'boss mission next'"
+  if [ "$action" != "next" ] && { [ "$dry_run" -eq 1 ] || [ "$skip_reconcile" -eq 1 ] \
+       || [ -n "$wt_flag" ] || [ -n "$no_wt_flag" ]; }; then
+    usage_error "--dry-run, --skip-reconcile, --worktree and --no-worktree apply only to 'boss mission next'"
+  fi
+  local want_worktree=0 wt_mode
+  if [ "$action" = "next" ]; then
+    wt_mode="$(mission_worktree_mode)" || exit 1
+    want_worktree="$(resolve_worktree_flag "$wt_mode" "$wt_flag" "$no_wt_flag")" || exit 1
   fi
   case "$action" in
     start) cmd_mission_start "$slug" "$project_name" ;;
     status) cmd_mission_status "$slug" "$project_name" ;;
-    next) cmd_mission_next "$slug" "$project_name" "$as_target" "$dry_run" "$skip_reconcile" ;;
+    next) cmd_mission_next "$slug" "$project_name" "$as_target" "$dry_run" "$skip_reconcile" "$want_worktree" ;;
     add)
       [ -n "$change" ] || usage_error "usage: boss mission add <slug> <change> [--project <name|path>]"
       cmd_mission_add "$slug" "$change" "$project_name" ;;
@@ -3909,6 +4561,7 @@ main() {
   case "${1:-}" in
     config-json) shift; config_json "$@" ;;
     dispatch) shift; cmd_dispatch "$@" ;;
+    plan) shift; cmd_plan "$@" ;;
     status) shift; cmd_status "$@" ;;
     review) shift; cmd_review "$@" ;;
     wait) shift; cmd_wait "$@" ;;

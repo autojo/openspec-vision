@@ -186,6 +186,53 @@ opencode integration v13 or newer. Re-run `./install.sh` after updating Herdr.
    end the mission; resume it later with `boss resume` or checked-off tasks.
    After the last version, report completion or handoff and offer archiving.
 
+### Worktree applies
+
+An isolated apply runs in a git worktree outside the project tree, on branch
+`boss/<change>`, in its own Herdr workspace. Choose the mode with
+`[missions] worktrees = "auto"|"always"|"never"` (default `auto`) in
+`boss.toml`, or per command with `--worktree` / `--no-worktree` on
+`boss dispatch` and `boss mission next`. In this change `auto` keeps the
+base-checkout behaviour; `always` and `--worktree` isolate.
+
+Before the first isolated dispatch, commit the plan on the base branch:
+
+```bash
+boss plan commit <change> --project <name|path>
+```
+
+It commits only `openspec/vision.md`, `openspec/missions/` and
+`openspec/changes/` (`status: committed` with the commit id, or `clean` when
+already committed) and never touches code. An uncommitted plan returns
+`plan_uncommitted`; a dirty base outside `openspec/` returns `base_dirty`. Fix
+the named paths before dispatching.
+
+The run then dispatches as usual. The state stays keyed by the base project and
+change and records the worktree path, branch, worktree workspace, base commit
+and merge state. `boss review` reads git, tasks, `openspec validate` and the
+test command from the worktree; the mission and plan stay in the base. The base
+checkout must stay unchanged by the apply.
+
+On green, `boss finish` merges the worktree branch into the base
+(`--ff-only` at `base_head`, otherwise `--no-ff`), runs the configured or
+detected test command on the merged base, then closes the tab, removes the
+worktree, deletes the branch and the state. On a conflict it aborts the merge,
+keeps worktree and state and returns `merge_conflict` with the paths. A red
+integration test keeps the state with `merge_state=test_failed` and
+`merge_test_failed`; fix on the base and run `boss finish` again. Under
+`explorer` the worktree must be clean and the Explorer commits the reviewed
+change paths there first; under `agent` verify the commits. `--keep-worktree`
+merges and tests but keeps the worktree, branch and state (`kept=true`,
+`merge_state=done`); `--no-merge` closes the tab and keeps them without a finish
+event. A later `finish` cleans up either path.
+
+`boss park` keeps the worktree and branch. `boss resume` reuses them and starts
+a fresh agent in the same worktree; `boss retrigger` continues in place, or
+starts a new agent there when the old one is gone. A missing worktree fails with
+`worktree_missing`; never fall back to the base checkout. `boss doctor` reports
+missing worktree paths, conflicted or test-failed states, uncommitted change
+dirs, orphaned worktrees, a dirty base and an uncommitted plan.
+
 ### Caller identity and wake targets
 
 Boss verifies the caller before every write command (`claim`, `dispatch`,

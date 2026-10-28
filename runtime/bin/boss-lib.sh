@@ -12,6 +12,7 @@ BOSS_LOGS_DIR="$BOSS_STATE_DIR/logs"
 BOSS_CYCLES_DIR="$BOSS_STATE_DIR/cycles"
 BOSS_BOSSES_DIR="$BOSS_STATE_DIR/bosses"
 BOSS_INBOX_DIR="$BOSS_STATE_DIR/inbox"
+BOSS_WORKTREES_DIR="$BOSS_STATE_DIR/worktrees"
 
 # cpu_count -- number of online CPUs, or 1 when it cannot be determined.
 cpu_count() {
@@ -116,6 +117,11 @@ log() {
 # pane_tail, unless BOSS_KEEP_FAILED_TAB=1.
 die_json() {
   local code="$1" msg="$2" tail_json="null"
+  # A worktree dispatch that fails after creating its worktree must not leave a
+  # half-created apply behind. Cleanup never masks the original error.
+  if [ -n "${BOSS_FAILED_WORKTREE:-}" ]; then
+    worktree_cleanup_failed || true
+  fi
   if [ -n "${BOSS_FAILED_TAB:-}" ]; then
     local tail
     tail="$(herdr pane read "${BOSS_FAILED_PANE:-}" --source visible --lines 15 2>/dev/null \
@@ -199,6 +205,133 @@ apply_agent_name() {
   head="$(printf '%s' "$norm" | cut -c1-19 | sed -e 's/[-_]*$//')"
   hash="$(sha1_hex "$norm" | cut -c1-6)"
   printf 'apply-%s-%s\n' "$head" "$hash"
+}
+
+# worktree_path_for <base-project> <change> -- state-owned worktree path. Kept
+# outside the project tree on purpose: an in-tree path would match
+# find_workspace_for_repo and share the base workspace.
+worktree_path_for() {
+  local project="$1" change="$2"
+  printf '%s/%s/%s\n' "$BOSS_WORKTREES_DIR" "$(sha1_hex "$project")" "$(normalize_name "$change")"
+}
+
+# worktree_branch_for <change> -- branch a worktree apply runs on.
+worktree_branch_for() {
+  printf 'boss/%s\n' "$(normalize_name "$1")"
+}
+
+# herdr_worktree_list <base> -- worktrees Herdr knows for the repository as a
+# compact JSON array of {path, branch, workspace_id}. Tolerant about the exact
+# nested shape; an unavailable Herdr yields an empty array.
+herdr_worktree_list() {
+  local base="$1" out
+  out="$(herdr worktree list --cwd "$base" 2>/dev/null || true)"
+  [ -n "$out" ] || { printf '[]\n'; return 0; }
+  printf '%s' "$out" | jq -c '
+    (.result.worktrees // .result.worktree // .worktrees // .worktree // [])
+    | (if type == "array" then . else [.] end)
+    | map(select(type == "object"))
+    | map({path: (.path // .worktree.path // .worktree // empty),
+           branch: (.branch // .worktree.branch // empty),
+           workspace_id: (.open_workspace_id // .workspace_id // .workspace.workspace_id
+                          // .worktree.open_workspace_id // .worktree.workspace_id
+                          // .workspace.id // .worktree.workspace.id // empty)})' \
+    2>/dev/null || printf '[]\n'
+}
+
+# herdr_worktree_create <base> <branch> <base-head> <path> <label> -- create a
+# worktree through Herdr and print {path,branch,workspace_id}. Falls back to
+# 'herdr worktree list' when the create result omits path, branch or workspace.
+herdr_worktree_create() {
+  local base="$1" branch="$2" base_head="$3" path="$4" label="$5" out rc parsed
+  out="$(herdr worktree create --cwd "$base" --branch "$branch" --base "$base_head" \
+    --path "$path" --label "$label" --no-focus 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | jq -e '.result != null' >/dev/null 2>&1; then
+    local code msg
+    code="$(printf '%s' "$out" | jq -r '.error.code // "worktree_create_failed"' 2>/dev/null || printf 'worktree_create_failed')"
+    msg="$(printf '%s' "$out" | jq -r '.error.message // empty' 2>/dev/null || true)"
+    die_json "$code" "herdr worktree create for $path failed: ${msg:-exit $rc}"
+  fi
+  parsed="$(printf '%s' "$out" | jq -c '
+    (.result // {}) as $r
+    | {path: ($r.worktree.path // $r.path // $r.worktree // empty),
+       branch: ($r.worktree.branch // $r.branch // empty),
+       workspace_id: ($r.worktree.open_workspace_id // $r.open_workspace_id
+                      // $r.worktree.workspace_id // $r.workspace_id
+                      // $r.workspace.workspace_id // $r.worktree.workspace.id
+                      // $r.workspace.id // empty)}' 2>/dev/null || true)"
+  [ -n "$parsed" ] || parsed='{"path":"","branch":"","workspace_id":""}'
+  if [ -z "$(printf '%s' "$parsed" | jq -r '.path // empty')" ] \
+     || [ -z "$(printf '%s' "$parsed" | jq -r '.branch // empty')" ] \
+     || [ -z "$(printf '%s' "$parsed" | jq -r '.workspace_id // empty')" ]; then
+    local row
+    row="$(herdr_worktree_list "$base" | jq -c --arg p "$path" --arg b "$branch" '
+      map(select((.path // "") == $p or (.branch // "") == $b)) | .[0] // {}')"
+    parsed="$(jq -nc --argjson p "$parsed" --argjson r "$row" --arg path "$path" --arg branch "$branch" '
+      {path: (if ($p.path // "") == "" then ($r.path // $path) else $p.path end),
+       branch: (if ($p.branch // "") == "" then ($r.branch // $branch) else $p.branch end),
+       workspace_id: (if ($p.workspace_id // "") == "" then ($r.workspace_id // "") else $p.workspace_id end)}')"
+  fi
+  printf '%s\n' "$parsed"
+}
+
+# herdr_worktree_open <base> <path> -- open an existing worktree through Herdr,
+# printing the same shape as herdr_worktree_create. An unsupported command is
+# not fatal here; the caller falls back to a normal workspace.
+herdr_worktree_open() {
+  local base="$1" path="$2" out
+  out="$(herdr worktree open --cwd "$base" --path "$path" 2>/dev/null || true)"
+  if [ -n "$out" ] && printf '%s' "$out" | jq -e '.result != null' >/dev/null 2>&1; then
+    printf '%s' "$out" | jq -c '
+      (.result // {}) as $r
+      | {path: ($r.worktree.path // $r.path // empty),
+         branch: ($r.worktree.branch // $r.branch // empty),
+         workspace_id: ($r.worktree.open_workspace_id // $r.open_workspace_id
+                        // $r.worktree.workspace_id // $r.workspace_id
+                        // $r.workspace.workspace_id // empty)}'
+    return 0
+  fi
+  return 1
+}
+
+# herdr_worktree_remove <base> <path> [<workspace>] -- remove a worktree through
+# Herdr. Herdr addresses a worktree by its open workspace, not by --cwd/--path;
+# when the recorded workspace is unknown, look it up by path in
+# 'herdr worktree list'. Never fails; the caller has a git fallback.
+herdr_worktree_remove() {
+  local base="$1" path="$2" workspace="${3:-}"
+  if [ -z "$workspace" ] && [ -n "$path" ]; then
+    workspace="$(herdr_worktree_list "$base" | jq -r --arg p "$path" \
+      'map(select((.path // "") == $p)) | .[0].workspace_id // empty' 2>/dev/null || true)"
+  fi
+  [ -n "$workspace" ] || return 0
+  herdr worktree remove --workspace "$workspace" --force >/dev/null 2>&1 || true
+}
+
+# worktree_cleanup_failed -- undo a half-created worktree dispatch. Removes the
+# tab when one was created, the worktree and the branch. Intentionally quiet and
+# idempotent; die_json calls it before printing the original error.
+worktree_cleanup_failed() {
+  local project="${BOSS_FAILED_WORKTREE_PROJECT:-}" path="${BOSS_FAILED_WORKTREE:-}"
+  local branch="${BOSS_FAILED_WORKTREE_BRANCH:-}" tab="${BOSS_FAILED_TAB:-}"
+  local workspace="${BOSS_FAILED_WORKTREE_WS:-}"
+  BOSS_FAILED_WORKTREE=""
+  BOSS_FAILED_WORKTREE_WS=""
+  if [ -n "$tab" ]; then
+    herdr tab close "$tab" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$path" ]; then
+    herdr_worktree_remove "$project" "$path" "$workspace"
+    if [ -n "$project" ]; then
+      git -C "$project" worktree remove --force "$path" >/dev/null 2>&1 || true
+      git -C "$project" worktree prune >/dev/null 2>&1 || true
+      [ -n "$branch" ] && git -C "$project" branch -D "$branch" >/dev/null 2>&1 || true
+      [ -d "$path" ] && rm -rf "$path" 2>/dev/null || true
+      rmdir "$(dirname "$path")" 2>/dev/null || true
+    fi
+  fi
+  log "cleaned up a failed worktree dispatch${path:+ for $path}"
 }
 
 # boss_registry_file_for <workspace-id> -- registry file for the workspace's boss

@@ -155,18 +155,20 @@ case "${1:-} ${2:-}" in
     if [ -n "${HERDR_TAB_CREATE_LOG:-}" ]; then
       printf '%s\n' "$*" >>"$HERDR_TAB_CREATE_LOG"
     fi
-    label=""
+    label=""; ws="ws-1"; cwd=""
     i=1
     while [ "$i" -le "$#" ]; do
       eval "arg=\${$i}"
-      if [ "$arg" = "--label" ]; then
-        i=$((i + 1))
-        eval "label=\${$i}"
-      fi
+      case "$arg" in
+        --label) i=$((i + 1)); eval "label=\${$i}" ;;
+        --workspace) i=$((i + 1)); eval "ws=\${$i}" ;;
+        --cwd) i=$((i + 1)); eval "cwd=\${$i}" ;;
+      esac
       i=$((i + 1))
     done
     [ -n "$label" ] || label="change"
-    printf '{"result":{"root_pane":{"pane_id":"pane-%s","tab_id":"tab-%s","workspace_id":"ws-1"},"tab":{"tab_id":"tab-%s"}}}\n' "$label" "$label" "$label"
+    printf '{"result":{"root_pane":{"pane_id":"pane-%s","tab_id":"tab-%s","workspace_id":"%s","cwd":"%s"},"tab":{"tab_id":"tab-%s","workspace_id":"%s"}}}\n' \
+      "$label" "$label" "$ws" "$cwd" "$label" "$ws"
     ;;
   "agent start")
     if [ -n "${HERDR_AGENT_START_LOG:-}" ]; then
@@ -205,6 +207,94 @@ case "${1:-} ${2:-}" in
       printf '%s %s\n' "${3:-}" "${4:-}" >>"$HERDR_RENAME_LOG"
     fi
     printf '%s\n' '{"result":{}}'
+    ;;
+  "worktree create"|"worktree open"|"worktree list"|"worktree remove")
+    action="${2:-}"
+    cwd=""; branch=""; base=""; path=""; label=""; workspace=""
+    seen_cwd=0; seen_path=0
+    i=3
+    while [ "$i" -le "$#" ]; do
+      eval "arg=\${$i}"
+      case "$arg" in
+        --cwd) seen_cwd=1; i=$((i + 1)); eval "cwd=\${$i}" ;;
+        --branch) i=$((i + 1)); eval "branch=\${$i}" ;;
+        --base) i=$((i + 1)); eval "base=\${$i}" ;;
+        --path) seen_path=1; i=$((i + 1)); eval "path=\${$i}" ;;
+        --label) i=$((i + 1)); eval "label=\${$i}" ;;
+        --workspace) i=$((i + 1)); eval "workspace=\${$i}" ;;
+      esac
+      i=$((i + 1))
+    done
+    [ -n "$cwd" ] || cwd="$PWD"
+    map_file="${HERDR_WORKTREE_MAP:-}"
+    if [ "$action" = "create" ]; then
+      if [ "${HERDR_WORKTREE_CREATE_FAIL:-0}" = "after" ]; then
+        git -C "$cwd" worktree add -q -b "$branch" "$path" "${base:-HEAD}" >/dev/null 2>&1 || true
+        printf '%s\n' '{"error":{"code":"worktree_create_failed","message":"stub failure after create"}}'
+        exit 1
+      fi
+      if [ "${HERDR_WORKTREE_CREATE_FAIL:-0}" = "1" ]; then
+        printf '%s\n' '{"error":{"code":"worktree_create_failed","message":"stub create failure"}}'
+        exit 1
+      fi
+      git -C "$cwd" worktree add -q -b "$branch" "$path" "${base:-HEAD}" >/dev/null 2>&1 || {
+        printf '%s\n' '{"error":{"code":"worktree_create_failed","message":"git worktree add failed"}}'
+        exit 1
+      }
+      [ -n "$label" ] || label="$(basename "$path")"
+      ws="ws-wt-$label"
+      if [ -n "$map_file" ]; then
+        mkdir -p "$(dirname "$map_file")"
+        jq -nc --arg w "$ws" --arg p "$path" --arg b "$cwd" '{workspace:$w,path:$p,base:$b}' >>"$map_file"
+      fi
+      if [ "${HERDR_WORKTREE_CREATE_MINIMAL:-0}" = "1" ]; then
+        printf '%s\n' '{"result":{}}'
+      else
+        printf '{"result":{"worktree":{"path":"%s","branch":"%s","open_workspace_id":"%s"},"workspace":{"workspace_id":"%s"}}}\n' \
+          "$path" "$branch" "$ws" "$ws"
+      fi
+      exit 0
+    fi
+    if [ "$action" = "remove" ]; then
+      if [ -n "${HERDR_WORKTREE_REMOVE_LOG:-}" ]; then
+        printf '%s\n' "$*" >>"$HERDR_WORKTREE_REMOVE_LOG"
+      fi
+      if [ "$seen_cwd" -eq 1 ] || [ "$seen_path" -eq 1 ]; then
+        if [ "$seen_cwd" -eq 1 ]; then printf '%s\n' 'unknown option: --cwd'
+        else printf '%s\n' 'unknown option: --path'; fi
+        exit 0
+      fi
+      if [ -n "$workspace" ] && [ -n "$map_file" ] && [ -f "$map_file" ]; then
+        entry="$(jq -sr --arg w "$workspace" \
+          'map(select(.workspace == $w)) | .[-1] // empty | [.base, .path] | @tsv' \
+          "$map_file" 2>/dev/null || true)"
+        if [ -n "$entry" ]; then
+          rbase="${entry%%$'\t'*}"
+          rpath="${entry#*$'\t'}"
+          git -C "$rbase" worktree remove --force "$rpath" >/dev/null 2>&1 || true
+        fi
+      fi
+      printf '%s\n' '{"result":{}}'
+      exit 0
+    fi
+    if [ "$action" = "open" ]; then
+      [ -n "$label" ] || label="$(basename "$path")"
+      printf '{"result":{"worktree":{"path":"%s","branch":"%s","open_workspace_id":"ws-wt-%s"}}}\n' \
+        "$path" "$branch" "$label"
+      exit 0
+    fi
+    # list: linked worktrees only; the real row carries open_workspace_id.
+    rows="[]"; cur=""; br=""
+    while IFS= read -r line; do
+      case "$line" in
+        "worktree "*) cur="${line#worktree }" ;;
+        "branch "*) br="${line#branch }"; br="${br#refs/heads/}"
+          rows="$(printf '%s' "$rows" | jq -c --arg p "$cur" --arg b "$br" \
+            --arg w "ws-wt-$(basename "$cur")" '. + [{path:$p,branch:$b,open_workspace_id:$w}]')" ;;
+      esac
+    done < <(git -C "$cwd" worktree list --porcelain 2>/dev/null | tail -n +5)
+    printf '{"result":{"worktrees":%s}}\n' "$rows"
+    exit 0
     ;;
   *)
     printf '%s\n' '{"result":{}}'
@@ -271,6 +361,11 @@ run_boss() {
     HERDR_AGENT_START_LOG="${HERDR_AGENT_START_LOG:-}" \
     HERDR_TAB_CREATE_LOG="${HERDR_TAB_CREATE_LOG:-}" \
     HERDR_PROMPT_LOG="${HERDR_PROMPT_LOG:-}" \
+    HERDR_WORKTREE_CREATE_FAIL="${HERDR_WORKTREE_CREATE_FAIL:-}" \
+    HERDR_WORKTREE_CREATE_MINIMAL="${HERDR_WORKTREE_CREATE_MINIMAL:-}" \
+    HERDR_WORKTREE_MAP="${HERDR_WORKTREE_MAP:-$TMP/herdr-worktrees.jsonl}" \
+    HERDR_WORKTREE_REMOVE_LOG="${HERDR_WORKTREE_REMOVE_LOG:-}" \
+    FAIL_MARKER="${FAIL_MARKER:-}" \
     OPENCODE_STUB_VERSION="${OPENCODE_STUB_VERSION:-}" \
     OPENCODE_STUB_DEBUG_CONFIG="${OPENCODE_STUB_DEBUG_CONFIG:-}" \
     OPENCODE_STUB_CWD_LOG="${OPENCODE_STUB_CWD_LOG:-}" \
@@ -290,6 +385,11 @@ run_boss_fail() {
     HERDR_AGENT_START_LOG="${HERDR_AGENT_START_LOG:-}" \
     HERDR_TAB_CREATE_LOG="${HERDR_TAB_CREATE_LOG:-}" \
     HERDR_PROMPT_LOG="${HERDR_PROMPT_LOG:-}" \
+    HERDR_WORKTREE_CREATE_FAIL="${HERDR_WORKTREE_CREATE_FAIL:-}" \
+    HERDR_WORKTREE_CREATE_MINIMAL="${HERDR_WORKTREE_CREATE_MINIMAL:-}" \
+    HERDR_WORKTREE_MAP="${HERDR_WORKTREE_MAP:-$TMP/herdr-worktrees.jsonl}" \
+    HERDR_WORKTREE_REMOVE_LOG="${HERDR_WORKTREE_REMOVE_LOG:-}" \
+    FAIL_MARKER="${FAIL_MARKER:-}" \
     OPENCODE_STUB_VERSION="${OPENCODE_STUB_VERSION:-}" \
     OPENCODE_STUB_DEBUG_CONFIG="${OPENCODE_STUB_DEBUG_CONFIG:-}" \
     OPENCODE_STUB_CWD_LOG="${OPENCODE_STUB_CWD_LOG:-}" \
@@ -310,6 +410,11 @@ run_boss_state() {
     HERDR_AGENT_START_LOG="${HERDR_AGENT_START_LOG:-}" \
     HERDR_TAB_CREATE_LOG="${HERDR_TAB_CREATE_LOG:-}" \
     HERDR_PROMPT_LOG="${HERDR_PROMPT_LOG:-}" \
+    HERDR_WORKTREE_CREATE_FAIL="${HERDR_WORKTREE_CREATE_FAIL:-}" \
+    HERDR_WORKTREE_CREATE_MINIMAL="${HERDR_WORKTREE_CREATE_MINIMAL:-}" \
+    HERDR_WORKTREE_MAP="${HERDR_WORKTREE_MAP:-$TMP/herdr-worktrees.jsonl}" \
+    HERDR_WORKTREE_REMOVE_LOG="${HERDR_WORKTREE_REMOVE_LOG:-}" \
+    FAIL_MARKER="${FAIL_MARKER:-}" \
     OPENCODE_STUB_VERSION="${OPENCODE_STUB_VERSION:-}" \
     OPENCODE_STUB_DEBUG_CONFIG="${OPENCODE_STUB_DEBUG_CONFIG:-}" \
     OPENCODE_STUB_CWD_LOG="${OPENCODE_STUB_CWD_LOG:-}" \
@@ -330,6 +435,11 @@ run_boss_fail_state() {
     HERDR_AGENT_START_LOG="${HERDR_AGENT_START_LOG:-}" \
     HERDR_TAB_CREATE_LOG="${HERDR_TAB_CREATE_LOG:-}" \
     HERDR_PROMPT_LOG="${HERDR_PROMPT_LOG:-}" \
+    HERDR_WORKTREE_CREATE_FAIL="${HERDR_WORKTREE_CREATE_FAIL:-}" \
+    HERDR_WORKTREE_CREATE_MINIMAL="${HERDR_WORKTREE_CREATE_MINIMAL:-}" \
+    HERDR_WORKTREE_MAP="${HERDR_WORKTREE_MAP:-$TMP/herdr-worktrees.jsonl}" \
+    HERDR_WORKTREE_REMOVE_LOG="${HERDR_WORKTREE_REMOVE_LOG:-}" \
+    FAIL_MARKER="${FAIL_MARKER:-}" \
     OPENCODE_STUB_VERSION="${OPENCODE_STUB_VERSION:-}" \
     OPENCODE_STUB_DEBUG_CONFIG="${OPENCODE_STUB_DEBUG_CONFIG:-}" \
     OPENCODE_STUB_CWD_LOG="${OPENCODE_STUB_CWD_LOG:-}" \
@@ -343,6 +453,8 @@ run_boss_fail_state() {
 run_lib() {
   env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="${BOSS_CONFIG:-$CONFIG}" BOSS_STATE_DIR="$STATE" \
     HERDR_INTEGRATION_STATUS="${HERDR_INTEGRATION_STATUS:-}" \
+    HERDR_WORKTREE_MAP="${HERDR_WORKTREE_MAP:-$TMP/herdr-worktrees.jsonl}" \
+    HERDR_WORKTREE_REMOVE_LOG="${HERDR_WORKTREE_REMOVE_LOG:-}" \
     OPENCODE_STUB_VERSION="${OPENCODE_STUB_VERSION:-}" \
     OPENCODE_STUB_DEBUG_CONFIG="${OPENCODE_STUB_DEBUG_CONFIG:-}" \
     OPENCODE_STUB_CWD_LOG="${OPENCODE_STUB_CWD_LOG:-}" \
@@ -404,6 +516,24 @@ EOF
 park_change() {
   local project="$1" change="$2"
   run_lib append_event "$(run_lib events_file_for "$project" "$change")" park '{}'
+}
+
+# make_git_project <dir> -- a git repository with a committed README, so a plan
+# commit has a clean base to start from.
+make_git_project() {
+  local dir="$1"
+  make_project "$dir"
+  printf 'base\n' >"$dir/README.md"
+  git -C "$dir" init -q
+  git -C "$dir" config user.name "Explorer"
+  git -C "$dir" config user.email "explorer@example.com"
+  git -C "$dir" add README.md openspec/config.yaml
+  git -C "$dir" commit -qm "initial code"
+}
+
+# plan_commit <project> <change> -- convenience wrapper around the CLI.
+plan_commit() {
+  run_boss plan commit "$2" --project "$1"
 }
 
 # =============================================================== tests ====
@@ -2186,6 +2316,409 @@ else
 $(cat "$TMP/shared-run.diff")
   awk 'FNR==NR { if (\$0==\"<!-- shared:run:begin -->\") {inb=1; next} if (\$0==\"<!-- shared:run:end -->\") {inb=0; next} if (inb) block=block \$0 \"\\n\"; next } \$0==\"<!-- shared:run:begin -->\" {print; printf \"%s\", block; skip=1; next} \$0==\"<!-- shared:run:end -->\" {skip=0} !skip' vision/SKILL.md boss/SKILL.md > boss/SKILL.md.new && mv boss/SKILL.md.new boss/SKILL.md"
 fi
+
+# 58. Plan commit commits only the plan paths; clean and dirty-code cases.
+P_WT="$TMP/project-worktree"
+make_git_project "$P_WT"
+make_change "$P_WT" wt-change '- [ ] 1.1 Code.'
+printf 'code\n' >"$P_WT/code.txt"
+git -C "$P_WT" add code.txt
+git -C "$P_WT" commit -qm "code"
+base_before="$(git -C "$P_WT" rev-parse HEAD)"
+out="$(plan_commit "$P_WT" wt-change)"
+check_eq "plan commit: status" "committed" "$(printf '%s' "$out" | jq -r '.status')"
+check_contains "plan commit: names plan path" "openspec/changes/wt-change/tasks.md" \
+  "$(printf '%s' "$out" | jq -r '.paths | join(" ")')"
+check_eq "plan commit: commit id" "$(git -C "$P_WT" rev-parse HEAD)" \
+  "$(printf '%s' "$out" | jq -r '.commit')"
+plan_files="$(git -C "$P_WT" show --name-only --format= HEAD)"
+check_contains "plan commit: includes change" "openspec/changes/wt-change/tasks.md" "$plan_files"
+check_not_contains "plan commit: no code" "code.txt" "$plan_files"
+head_after="$(git -C "$P_WT" rev-parse HEAD)"
+out="$(plan_commit "$P_WT" wt-change)"
+check_eq "plan commit: clean no-op" "clean" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "plan commit: clean keeps head" "$head_after" "$(git -C "$P_WT" rev-parse HEAD)"
+printf 'dirty\n' >"$P_WT/dirty.txt"
+out="$(plan_commit "$P_WT" wt-change)"
+check_eq "plan commit: dirty code ignored" "clean" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "plan commit: dirty code stays" "dirty" "$(cat "$P_WT/dirty.txt")"
+check_not_contains "plan commit: dirty code not committed" "dirty.txt" \
+  "$(git -C "$P_WT" show --name-only --format= HEAD)"
+rm -f "$P_WT/dirty.txt"
+
+# 59. Worktree dispatch requires a committed plan and a clean base.
+P_WTP="$TMP/project-worktree-plan"
+make_git_project "$P_WTP"
+make_change "$P_WTP" plan-dirty '- [ ] 1.1 Code.'
+WTST_P="$TMP/worktree-plan-state"
+mkdir -p "$WTST_P"
+err="$(run_boss_fail_state "$WTST_P" dispatch plan-dirty --project "$P_WTP" --worktree)"
+check_contains "worktree dispatch: plan_uncommitted" "plan_uncommitted" "$err"
+check_eq "worktree dispatch: plan_uncommitted no state" "0" \
+  "$(find "$WTST_P/applies" -name '*plan-dirty.json' 2>/dev/null | wc -l | tr -d ' ')"
+plan_commit "$P_WTP" plan-dirty >/dev/null
+printf 'dirty\n' >"$P_WTP/dirty.txt"
+VTAB_P="$TMP/worktree-plan-tab.log"
+err="$(HERDR_TAB_CREATE_LOG="$VTAB_P" run_boss_fail_state "$WTST_P" dispatch plan-dirty --project "$P_WTP" --worktree)"
+check_contains "worktree dispatch: base_dirty" "base_dirty" "$err"
+check_contains "worktree dispatch: names dirty path" "dirty.txt" "$err"
+check_eq "worktree dispatch: base_dirty no tab" "" "$(cat "$VTAB_P" 2>/dev/null)"
+check_eq "worktree dispatch: base_dirty no state" "0" \
+  "$(find "$WTST_P/applies" -name '*plan-dirty.json' 2>/dev/null | wc -l | tr -d ' ')"
+rm -f "$P_WTP/dirty.txt"
+
+# A failed create leaves no tab, state, branch or worktree behind.
+P_WTF="$TMP/project-worktree-fail"
+make_git_project "$P_WTF"
+make_change "$P_WTF" fail-create '- [ ] 1.1 Code.'
+plan_commit "$P_WTF" fail-create >/dev/null
+WTST_F="$TMP/worktree-fail-state"
+mkdir -p "$WTST_F"
+VTAB_F="$TMP/worktree-fail-tab.log"
+err="$(HERDR_WORKTREE_CREATE_FAIL=after HERDR_TAB_CREATE_LOG="$VTAB_F" \
+  run_boss_fail_state "$WTST_F" dispatch fail-create --project "$P_WTF" --worktree)"
+check_contains "worktree create fail: error" "worktree_create_failed" "$err"
+check_eq "worktree create fail: no tab" "" "$(cat "$VTAB_F" 2>/dev/null)"
+check_eq "worktree create fail: no state" "0" \
+  "$(find "$WTST_F/applies" -name '*fail-create.json' 2>/dev/null | wc -l | tr -d ' ')"
+check_eq "worktree create fail: no branch" "0" \
+  "$(git -C "$P_WTF" branch --list 'boss/fail-create' | wc -l | tr -d ' ')"
+check_eq "worktree create fail: no worktree" "0" \
+  "$(git -C "$P_WTF" worktree list --porcelain | grep -c 'worktrees/.*/fail-create' || true)"
+
+# 60. Worktree dispatch, state, status and the base staying unchanged.
+WTST="$TMP/worktree-state"
+mkdir -p "$WTST"
+WT_BASE_BRANCH="$(git -C "$P_WT" rev-parse --abbrev-ref HEAD)"
+VTAB="$TMP/worktree-tab.log"
+out="$(HERDR_TAB_CREATE_LOG="$VTAB" run_boss_state "$WTST" \
+  dispatch wt-change --project "$P_WT" --worktree)"
+check_eq "worktree dispatch: status" "started" "$(printf '%s' "$out" | jq -r '.status')"
+WT="$(printf '%s' "$out" | jq -r '.worktree')"
+if [ -z "$WT" ] || [ ! -d "$WT" ]; then bad "worktree dispatch produced no worktree"; WT="$TMP/missing-worktree"; fi
+WT_EXPECTED="$WTST/worktrees/$(run_lib sha1_hex "$P_WT")/wt-change"
+check_eq "worktree dispatch: path" "$WT_EXPECTED" "$WT"
+check_eq "worktree dispatch: branch" "boss/wt-change" "$(printf '%s' "$out" | jq -r '.branch')"
+WTSF="$WTST/applies/$(run_lib sha1_hex "$P_WT")-wt-change.json"
+check_eq "worktree state: worktree" "$WT" "$(jq -r '.worktree' "$WTSF")"
+check_eq "worktree state: branch" "boss/wt-change" "$(jq -r '.branch' "$WTSF")"
+check_eq "worktree state: workspace" "ws-wt-wt-change" "$(jq -r '.worktree_workspace' "$WTSF")"
+check_eq "worktree state: merge_state" "none" "$(jq -r '.merge_state' "$WTSF")"
+check_eq "worktree state: merged" "false" "$(jq -r '.merged' "$WTSF")"
+check_eq "worktree state: merge_test" "not_run" "$(jq -r '.merge_test' "$WTSF")"
+check_eq "worktree state: kept" "false" "$(jq -r '.kept' "$WTSF")"
+check_eq "worktree state: base commit" "$(git -C "$P_WT" rev-parse HEAD)" "$(jq -r '.base_head' "$WTSF")"
+check_contains "worktree tab: uses worktree cwd" "--cwd $WT" "$(cat "$VTAB")"
+check_contains "worktree tab: uses worktree workspace" "--workspace ws-wt-wt-change" "$(cat "$VTAB")"
+check_eq "worktree dispatch: base clean" "" "$(git -C "$P_WT" status --porcelain)"
+check_eq "worktree dispatch: base branch unchanged" "$WT_BASE_BRANCH" \
+  "$(git -C "$P_WT" rev-parse --abbrev-ref HEAD)"
+status="$(HERDR_LIVE_PANES=pane-wt-change run_boss_state "$WTST" \
+  status wt-change --project "$P_WT" --json)"
+check_eq "worktree status: worktree" "$WT" "$(printf '%s' "$status" | jq -r '.worktree')"
+check_eq "worktree status: branch" "boss/wt-change" "$(printf '%s' "$status" | jq -r '.branch')"
+check_eq "worktree status: merge state" "none" "$(printf '%s' "$status" | jq -r '.merge_state')"
+
+# A create result without path/branch falls back to 'herdr worktree list'.
+P_WTM="$TMP/project-worktree-minimal"
+make_git_project "$P_WTM"
+make_change "$P_WTM" wt-min '- [ ] 1.1 Code.'
+plan_commit "$P_WTM" wt-min >/dev/null
+WTST_M="$TMP/worktree-minimal-state"
+mkdir -p "$WTST_M"
+out="$(HERDR_WORKTREE_CREATE_MINIMAL=1 run_boss_state "$WTST_M" \
+  dispatch wt-min --project "$P_WTM" --worktree)"
+check_eq "worktree minimal: fallback path" \
+  "$WTST_M/worktrees/$(run_lib sha1_hex "$P_WTM")/wt-min" \
+  "$(printf '%s' "$out" | jq -r '.worktree')"
+check_eq "worktree minimal: fallback branch" "boss/wt-min" \
+  "$(printf '%s' "$out" | jq -r '.branch')"
+check_eq "worktree minimal: fallback workspace" "ws-wt-wt-min" \
+  "$(printf '%s' "$out" | jq -r '.workspace_id')"
+WTM="$(jq -r '.worktree' "$WTST_M/applies/$(run_lib sha1_hex "$P_WTM")-wt-min.json")"
+REMOVE_MIN="$TMP/worktree-minimal-remove.log"
+HERDR_WORKTREE_REMOVE_LOG="$REMOVE_MIN" \
+  run_lib herdr_worktree_remove "$P_WTM" "$WTM" >/dev/null
+check_contains "worktree minimal: path lookup finds workspace" \
+  "--workspace ws-wt-wt-min" "$(cat "$REMOVE_MIN" 2>/dev/null)"
+check_eq "worktree minimal: path lookup removes" "0" \
+  "$([ -e "$WTM" ] && printf 1 || printf 0)"
+
+# 61. Review reads tasks, validation, tests and git from the worktree.
+printf 'worktree\n' >"$WT/new.txt"
+printf -- '- [x] 1.1 Code.\n' >"$WT/openspec/changes/wt-change/tasks.md"
+base_status_before="$(git -C "$P_WT" status --porcelain)"
+out="$(run_boss_state "$WTST" review wt-change --project "$P_WT" --json)"
+check_eq "worktree review: worktree field" "$WT" "$(printf '%s' "$out" | jq -r '.worktree')"
+check_eq "worktree review: project stays base" "$P_WT" "$(printf '%s' "$out" | jq -r '.project')"
+check_eq "worktree review: tasks from worktree" "0" "$(printf '%s' "$out" | jq -r '.quality.tasks.open')"
+check_contains "worktree review: worktree diff" "new.txt" \
+  "$(printf '%s' "$out" | jq -r '.quality.git.changed_files | join(" ")')"
+check_eq "worktree review: base untouched" "$base_status_before" "$(git -C "$P_WT" status --porcelain)"
+
+# 62. Clean finish merges, tests the base and cleans up.
+git -C "$WT" add -A
+git -C "$WT" commit -qm "apply wt-change"
+REMOVE_FIN="$TMP/worktree-finish-remove.log"
+out="$(HERDR_LIVE_PANES=pane-wt-change HERDR_WORKTREE_REMOVE_LOG="$REMOVE_FIN" \
+  run_boss_state "$WTST" finish wt-change --project "$P_WT")"
+check_eq "worktree finish: status" "finished" "$(printf '%s' "$out" | jq -r '.status')"
+check_contains "worktree finish: herdr removes by workspace" \
+  "--workspace ws-wt-wt-change" "$(cat "$REMOVE_FIN" 2>/dev/null)"
+check_not_contains "worktree finish: no --cwd" "--cwd" "$(cat "$REMOVE_FIN" 2>/dev/null)"
+check_not_contains "worktree finish: no --path" "--path" "$(cat "$REMOVE_FIN" 2>/dev/null)"
+check_eq "worktree finish: merged" "true" "$(printf '%s' "$out" | jq -r '.merged')"
+check_eq "worktree finish: base has change" "worktree" "$(cat "$P_WT/new.txt")"
+check_eq "worktree finish: worktree removed" "0" "$([ -e "$WT" ] && printf 1 || printf 0)"
+check_eq "worktree finish: branch removed" "0" \
+  "$(git -C "$P_WT" branch --list 'boss/wt-change' | wc -l | tr -d ' ')"
+check_eq "worktree finish: state removed" "0" "$([ -f "$WTSF" ] && printf 1 || printf 0)"
+check_eq "worktree finish: base clean" "" "$(git -C "$P_WT" status --porcelain)"
+check_contains "worktree finish: event" '"event":"finish"' \
+  "$(cat "$WTST/cycles/$(run_lib sha1_hex "$P_WT")-wt-change.events.jsonl")"
+
+# 63. --no-merge and --keep-worktree preserve the worktree; a later finish cleans.
+P_WTK="$TMP/project-worktree-keep"
+make_git_project "$P_WTK"
+make_change "$P_WTK" wt-keep '- [ ] 1.1 Code.'
+printf 'code\n' >"$P_WTK/code.txt"
+git -C "$P_WTK" add code.txt; git -C "$P_WTK" commit -qm code
+plan_commit "$P_WTK" wt-keep >/dev/null
+WTST_K="$TMP/worktree-keep-state"
+mkdir -p "$WTST_K"
+out="$(run_boss_state "$WTST_K" dispatch wt-keep --project "$P_WTK" --worktree)"
+WTK="$(printf '%s' "$out" | jq -r '.worktree')"
+if [ -z "$WTK" ] || [ ! -d "$WTK" ]; then bad "worktree keep: no worktree"; WTK="$TMP/missing-worktree"; fi
+KSF="$WTST_K/applies/$(run_lib sha1_hex "$P_WTK")-wt-keep.json"
+printf 'kept\n' >"$WTK/kept.txt"
+git -C "$WTK" add -A; git -C "$WTK" commit -qm "kept work"
+out="$(HERDR_LIVE_PANES=pane-wt-keep run_boss_state "$WTST_K" \
+  finish wt-keep --project "$P_WTK" --no-merge)"
+check_eq "no-merge: status" "kept" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "no-merge: worktree kept" "1" "$([ -d "$WTK" ] && printf 1 || printf 0)"
+check_eq "no-merge: branch kept" "1" \
+  "$(git -C "$P_WTK" branch --list 'boss/wt-keep' | wc -l | tr -d ' ')"
+check_eq "no-merge: state kept" "1" "$([ -f "$KSF" ] && printf 1 || printf 0)"
+check_eq "no-merge: no finish event" "0" \
+  "$(run_lib event_count "$WTST_K/cycles/$(run_lib sha1_hex "$P_WTK")-wt-keep.events.jsonl" finish)"
+out="$(run_boss_state "$WTST_K" finish wt-keep --project "$P_WTK" --keep-worktree)"
+check_eq "keep-worktree: status" "kept" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "keep-worktree: state kept" "true" "$(jq -r '.kept' "$KSF")"
+check_eq "keep-worktree: merge done" "done" "$(jq -r '.merge_state' "$KSF")"
+check_eq "keep-worktree: worktree kept" "1" "$([ -d "$WTK" ] && printf 1 || printf 0)"
+check_eq "keep-worktree: base has change" "kept" "$(cat "$P_WTK/kept.txt")"
+out="$(run_boss_state "$WTST_K" finish wt-keep --project "$P_WTK")"
+check_eq "keep-worktree: second finish" "finished" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "keep-worktree: removed" "0" "$([ -e "$WTK" ] && printf 1 || printf 0)"
+check_eq "keep-worktree: state removed" "0" "$([ -f "$KSF" ] && printf 1 || printf 0)"
+
+# 64. A merge conflict aborts, keeps the worktree and names the path.
+P_WTC="$TMP/project-worktree-conflict"
+make_git_project "$P_WTC"
+make_change "$P_WTC" wt-conflict '- [ ] 1.1 Code.'
+plan_commit "$P_WTC" wt-conflict >/dev/null
+WTST_C="$TMP/worktree-conflict-state"
+mkdir -p "$WTST_C"
+out="$(run_boss_state "$WTST_C" dispatch wt-conflict --project "$P_WTC" --worktree)"
+WTC="$(printf '%s' "$out" | jq -r '.worktree')"
+if [ -z "$WTC" ] || [ ! -d "$WTC" ]; then bad "worktree conflict: no worktree"; WTC="$TMP/missing-worktree"; fi
+printf 'worktree\n' >"$WTC/README.md"
+git -C "$WTC" add README.md; git -C "$WTC" commit -qm worktree
+printf 'base-edit\n' >"$P_WTC/README.md"
+git -C "$P_WTC" add README.md; git -C "$P_WTC" commit -qm base
+CSF="$WTST_C/applies/$(run_lib sha1_hex "$P_WTC")-wt-conflict.json"
+err="$(HERDR_LIVE_PANES=pane-wt-conflict run_boss_fail_state "$WTST_C" \
+  finish wt-conflict --project "$P_WTC")"
+check_contains "merge conflict: code" "merge_conflict" "$err"
+check_contains "merge conflict: path" "README.md" "$err"
+check_eq "merge conflict: state kept" "conflict" "$(jq -r '.merge_state' "$CSF")"
+check_eq "merge conflict: worktree kept" "1" "$([ -d "$WTC" ] && printf 1 || printf 0)"
+check_eq "merge conflict: branch kept" "1" \
+  "$(git -C "$P_WTC" branch --list 'boss/wt-conflict' | wc -l | tr -d ' ')"
+check_eq "merge conflict: base clean" "" "$(git -C "$P_WTC" status --porcelain)"
+check_eq "merge conflict: base content" "base-edit" "$(cat "$P_WTC/README.md")"
+
+# 65. A red integration test keeps the state; a second finish retries.
+P_WTT="$TMP/project-worktree-test"
+make_git_project "$P_WTT"
+make_change "$P_WTT" wt-test '- [ ] 1.1 Code.'
+printf 'code\n' >"$P_WTT/code.txt"
+git -C "$P_WTT" add code.txt; git -C "$P_WTT" commit -qm code
+plan_commit "$P_WTT" wt-test >/dev/null
+WTCONF="$TMP/worktree-test.toml"
+printf 'default = "opencode"\n[projects]\nwt-test = "%s"\n[tests]\nwt-test = "test ! -f \\"$FAIL_MARKER\\""\n[runners.opencode]\nkind = "opencode"\nargs = []\napply = "/opsx-apply {change}"\n[missions]\nworktrees = "auto"\n' "$P_WTT" >"$WTCONF"
+WTST_T="$TMP/worktree-test-state"
+mkdir -p "$WTST_T"
+out="$(BOSS_CONFIG="$WTCONF" run_boss_state "$WTST_T" dispatch wt-test --project "$P_WTT" --worktree)"
+WTT="$(printf '%s' "$out" | jq -r '.worktree')"
+if [ -z "$WTT" ] || [ ! -d "$WTT" ]; then bad "worktree test: no worktree"; WTT="$TMP/missing-worktree"; fi
+printf 'tested\n' >"$WTT/tested.txt"
+git -C "$WTT" add -A; git -C "$WTT" commit -qm "tested work"
+TSF="$WTST_T/applies/$(run_lib sha1_hex "$P_WTT")-wt-test.json"
+FAIL_MARKER="$TMP/worktree-test-fail-marker"
+touch "$FAIL_MARKER"
+err="$(BOSS_CONFIG="$WTCONF" HERDR_LIVE_PANES=pane-wt-test run_boss_fail_state "$WTST_T" \
+  finish wt-test --project "$P_WTT")"
+check_contains "merge test: red code" "merge_test_failed" "$err"
+check_eq "merge test: merged" "true" "$(jq -r '.merged' "$TSF")"
+check_eq "merge test: state" "test_failed" "$(jq -r '.merge_state' "$TSF")"
+check_eq "merge test: result" "fail" "$(jq -r '.merge_test' "$TSF")"
+check_eq "merge test: base has change" "tested" "$(cat "$P_WTT/tested.txt")"
+rm -f "$FAIL_MARKER"
+out="$(BOSS_CONFIG="$WTCONF" run_boss_state "$WTST_T" finish wt-test --project "$P_WTT")"
+check_eq "merge test: retry finishes" "finished" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "merge test: retry removed worktree" "0" "$([ -e "$WTT" ] && printf 1 || printf 0)"
+check_eq "merge test: retry removed state" "0" "$([ -f "$TSF" ] && printf 1 || printf 0)"
+
+# 66. Park keeps the worktree; resume and retrigger reuse it.
+P_WTPARK="$TMP/project-worktree-park"
+make_git_project "$P_WTPARK"
+make_change "$P_WTPARK" wt-park '- [ ] 1.1 [Nutzer] Konto verknüpfen.'
+plan_commit "$P_WTPARK" wt-park >/dev/null
+WTST_PA="$TMP/worktree-park-state"
+mkdir -p "$WTST_PA"
+TAB_PA="$TMP/worktree-park-tab.log"
+PROMPT_PA="$TMP/worktree-park-prompt.log"
+out="$(HERDR_TAB_CREATE_LOG="$TAB_PA" run_boss_state "$WTST_PA" \
+  dispatch wt-park --project "$P_WTPARK" --worktree)"
+WTPA="$(printf '%s' "$out" | jq -r '.worktree')"
+if [ -z "$WTPA" ] || [ ! -d "$WTPA" ]; then bad "worktree park: no worktree"; WTPA="$TMP/missing-worktree"; fi
+PSF="$WTST_PA/applies/$(run_lib sha1_hex "$P_WTPARK")-wt-park.json"
+run_boss_state "$WTST_PA" park wt-park --project "$P_WTPARK" >/dev/null
+check_eq "worktree park: parked" "true" "$(jq -r '.parked' "$PSF")"
+check_eq "worktree park: worktree kept" "1" "$([ -d "$WTPA" ] && printf 1 || printf 0)"
+out="$(HERDR_TAB_CREATE_LOG="$TAB_PA" run_boss_state "$WTST_PA" \
+  resume wt-park --project "$P_WTPARK" --note "account linked")"
+check_eq "worktree resume: status" "started" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "worktree resume: same worktree" "$WTPA" "$(jq -r '.worktree' "$PSF")"
+check_eq "worktree resume: same branch" "boss/wt-park" "$(jq -r '.branch' "$PSF")"
+check_eq "worktree resume: one worktree" "1" \
+  "$(git -C "$P_WTPARK" worktree list --porcelain | grep -c 'worktrees/.*/wt-park' || true)"
+tabs_before="$(wc -l <"$TAB_PA" | tr -d ' ')"
+out="$(HERDR_PROMPT_LOG="$PROMPT_PA" HERDR_LIVE_PANES=pane-wt-park \
+  run_boss_state "$WTST_PA" retrigger wt-park --project "$P_WTPARK")"
+check_eq "worktree retrigger: same agent" "retriggered" "$(printf '%s' "$out" | jq -r '.status')"
+check_contains "worktree retrigger: prompt sent" "account linked" "$(cat "$PROMPT_PA")"
+check_eq "worktree retrigger: no new tab" "$tabs_before" "$(wc -l <"$TAB_PA" | tr -d ' ')"
+
+# A missing worktree fails instead of falling back to the base checkout.
+P_WTMISS="$TMP/project-worktree-missing"
+make_git_project "$P_WTMISS"
+make_change "$P_WTMISS" wt-miss '- [ ] 1.1 Code.'
+MST="$TMP/worktree-missing-state"
+mkdir -p "$MST/applies"
+jq -n --arg p "$P_WTMISS" --arg w "$TMP/does-not-exist-worktree" \
+  '{change:"wt-miss",project:$p,runner:"opencode",agent:"apply-wt-miss",pane_id:null,
+    tab_id:null,workspace_id:"ws-1",worktree:$w,branch:"boss/wt-miss",
+    worktree_workspace:"ws-wt-wt-miss",base_head:null,waiter_pid:null,parked:true}' \
+  >"$MST/applies/$(run_lib sha1_hex "$P_WTMISS")-wt-miss.json"
+err="$(run_boss_fail_state "$MST" resume wt-miss --project "$P_WTMISS")"
+check_contains "worktree missing: resume" "worktree_missing" "$err"
+err="$(run_boss_fail_state "$MST" retrigger wt-miss --project "$P_WTMISS")"
+check_contains "worktree missing: retrigger" "worktree_missing" "$err"
+
+# 67. Worktree mode resolution and the mission path.
+P_WTALWAYS="$TMP/project-worktree-always"
+make_git_project "$P_WTALWAYS"
+make_change "$P_WTALWAYS" wt-always '- [ ] 1.1 Code.'
+plan_commit "$P_WTALWAYS" wt-always >/dev/null
+ACONF2="$TMP/worktree-always.toml"
+printf 'default = "opencode"\n[projects]\nwt-always = "%s"\n[runners.opencode]\nkind = "opencode"\nargs = []\napply = "/opsx-apply {change}"\n[missions]\nworktrees = "always"\n' "$P_WTALWAYS" >"$ACONF2"
+WTST_A="$TMP/worktree-always-state"
+mkdir -p "$WTST_A"
+out="$(BOSS_CONFIG="$ACONF2" run_boss_state "$WTST_A" dispatch wt-always --project "$P_WTALWAYS")"
+check_contains "worktree mode always: creates" "worktrees/" "$(printf '%s' "$out" | jq -r '.worktree')"
+B_WTCHANGE="$TMP/project-worktree-never"
+make_git_project "$B_WTCHANGE"
+make_change "$B_WTCHANGE" wt-never '- [ ] 1.1 Code.'
+plan_commit "$B_WTCHANGE" wt-never >/dev/null
+out="$(BOSS_CONFIG="$ACONF2" run_boss_state "$WTST_A" dispatch wt-never --project "$B_WTCHANGE" --no-worktree)"
+check_eq "worktree mode always: no-worktree flag wins" "null" "$(printf '%s' "$out" | jq -r '.worktree')"
+ICONF2="$TMP/worktree-invalid.toml"
+printf 'default = "opencode"\n[runners.opencode]\nkind = "opencode"\nargs = []\napply = "/opsx-apply {change}"\n[missions]\nworktrees = "sometimes"\n' >"$ICONF2"
+err="$(BOSS_CONFIG="$ICONF2" run_boss_fail_state "$WTST_A" dispatch wt-never --project "$B_WTCHANGE")"
+check_contains "worktree mode invalid" "invalid_worktrees" "$err"
+
+P_WTMISSION="$TMP/project-worktree-mission"
+make_git_project "$P_WTMISSION"
+make_change "$P_WTMISSION" wt-mission '- [ ] 1.1 Code.'
+make_mission "$P_WTMISSION" v1 "- wt-mission"
+plan_commit "$P_WTMISSION" wt-mission >/dev/null
+WTST_MI="$TMP/worktree-mission-state"
+mkdir -p "$WTST_MI"
+out="$(run_boss_state "$WTST_MI" mission next v1 --project "$P_WTMISSION" --worktree)"
+check_eq "mission next worktree: status" "started" "$(printf '%s' "$out" | jq -r '.status')"
+check_contains "mission next worktree: path" "worktrees/" "$(printf '%s' "$out" | jq -r '.worktree')"
+
+# 68. Doctor reports worktree states, orphans, a dirty base and fixes only
+# merged kept worktrees.
+P_WTDOC="$TMP/project-worktree-doctor"
+make_git_project "$P_WTDOC"
+make_change "$P_WTDOC" wt-doc '- [ ] 1.1 Code.'
+plan_commit "$P_WTDOC" wt-doc >/dev/null
+WTST_D="$TMP/worktree-doctor-state"
+mkdir -p "$WTST_D/applies" "$WTST_D/worktrees/$(run_lib sha1_hex "$P_WTDOC")/orphan"
+jq -n --arg p "$P_WTDOC" --arg w "$TMP/doctor-missing-worktree" \
+  '{change:"wt-doc",project:$p,runner:"opencode",agent:"apply-wt-doc",pane_id:"p-wt-doc",
+    tab_id:"t-wt-doc",workspace_id:"ws-wt-wt-doc",worktree:$w,branch:"boss/wt-doc",
+    worktree_workspace:"ws-wt-wt-doc",base_head:null,merge_state:"none",merged:false,
+    merge_test:"not_run",kept:false,waiter_pid:null}' \
+  >"$WTST_D/applies/$(run_lib sha1_hex "$P_WTDOC")-wt-doc.json"
+printf 'dirty\n' >"$P_WTDOC/dirty.txt"
+doctor="$(run_boss_state "$WTST_D" doctor --project "$P_WTDOC" --json 2>/dev/null)"
+check_eq "doctor worktree: missing path" "warn" \
+  "$(printf '%s' "$doctor" | jq -r '.checks[] | select(.id=="worktree_state") | .status')"
+check_contains "doctor worktree: names path" "path missing" \
+  "$(printf '%s' "$doctor" | jq -r '.checks[] | select(.id=="worktree_state") | .hint')"
+check_eq "doctor worktree: orphan" "warn" \
+  "$(printf '%s' "$doctor" | jq -r '.checks[] | select(.id=="worktree_orphans") | .status')"
+check_eq "doctor worktree: dirty base" "warn" \
+  "$(printf '%s' "$doctor" | jq -r '.checks[] | select(.id=="worktree_base") | .status')"
+check_contains "doctor worktree: dirty path" "dirty.txt" \
+  "$(printf '%s' "$doctor" | jq -r '.checks[] | select(.id=="worktree_base") | .hint')"
+rm -f "$P_WTDOC/dirty.txt"
+rm -rf "$WTST_D/worktrees/$(run_lib sha1_hex "$P_WTDOC")/orphan"
+
+# --fix removes a merged, kept worktree but leaves an unmerged one.
+WT_DOC="$WTST_D/worktrees/$(run_lib sha1_hex "$P_WTDOC")/wt-doc"
+git -C "$P_WTDOC" worktree add -q -b boss/wt-doc "$WT_DOC" HEAD
+DSF="$WTST_D/applies/$(run_lib sha1_hex "$P_WTDOC")-wt-doc.json"
+jq --arg w "$WT_DOC" '.worktree=$w | .merged=true | .kept=true | .merge_state="done"' \
+  "$DSF" >"$DSF.tmp" && mv "$DSF.tmp" "$DSF"
+printf '{"workspace":"ws-wt-wt-doc","path":"%s","base":"%s"}\n' "$WT_DOC" "$P_WTDOC" \
+  >>"$TMP/herdr-worktrees.jsonl"
+REMOVE_DOC="$TMP/worktree-doctor-remove.log"
+HERDR_WORKTREE_REMOVE_LOG="$REMOVE_DOC" \
+  run_boss_state "$WTST_D" doctor --project "$P_WTDOC" --json --fix >/dev/null 2>&1
+check_eq "doctor fix: merged worktree removed" "0" "$([ -e "$WT_DOC" ] && printf 1 || printf 0)"
+check_contains "doctor fix: herdr removes by workspace" \
+  "--workspace ws-wt-wt-doc" "$(cat "$REMOVE_DOC" 2>/dev/null)"
+check_not_contains "doctor fix: no --cwd" "--cwd" "$(cat "$REMOVE_DOC" 2>/dev/null)"
+check_not_contains "doctor fix: no --path" "--path" "$(cat "$REMOVE_DOC" 2>/dev/null)"
+check_eq "doctor fix: merged state removed" "0" "$([ -f "$DSF" ] && printf 1 || printf 0)"
+check_eq "doctor fix: branch removed" "0" \
+  "$(git -C "$P_WTDOC" branch --list 'boss/wt-doc' | wc -l | tr -d ' ')"
+WT_DOC2="$WTST_D/worktrees/$(run_lib sha1_hex "$P_WTDOC")/wt-unmerged"
+mkdir -p "$(dirname "$WT_DOC2")"
+git -C "$P_WTDOC" worktree add -q -b boss/wt-unmerged "$WT_DOC2" HEAD
+jq -n --arg p "$P_WTDOC" --arg w "$WT_DOC2" \
+  '{change:"wt-unmerged",project:$p,runner:"opencode",agent:"apply-wt-unmerged",
+    pane_id:"p-wt-unmerged",tab_id:"t-wt-unmerged",workspace_id:"ws-1",worktree:$w,
+    branch:"boss/wt-unmerged",worktree_workspace:"ws-1",base_head:null,
+    merge_state:"none",merged:false,merge_test:"not_run",kept:true,waiter_pid:null}' \
+  >"$WTST_D/applies/$(run_lib sha1_hex "$P_WTDOC")-wt-unmerged.json"
+run_boss_state "$WTST_D" doctor --project "$P_WTDOC" --json --fix >/dev/null 2>&1
+check_eq "doctor fix: unmerged worktree kept" "1" "$([ -d "$WT_DOC2" ] && printf 1 || printf 0)"
+
+# 69. The documentation and both skills describe the worktree lifecycle.
+readme="$(cat "$ROOT/README.md")"
+skill="$(cat "$ROOT/vision/SKILL.md")"
+for needle in "boss plan commit" "worktrees" "worktree" "merge_conflict" "merge_test_failed"; do
+  check_contains "worktree readme: $needle" "$needle" "$readme"
+done
+for needle in "boss plan commit" "worktree" "merge" "resume"; do
+  check_contains "worktree skill: $needle" "$needle" "$skill"
+done
 
 # 57. The installer bundles the boss skill, keeps foreign directories and
 # removes only what it owns.

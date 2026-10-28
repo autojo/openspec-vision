@@ -270,6 +270,82 @@ The `boss mission start` skeleton includes `## Build Environment`,
 and `## Start` in addition to the original charter sections; fill them during
 P5.
 
+## Worktree applies
+
+A change can run in an isolated git worktree instead of the project checkout.
+The base stays clean while the apply edits, tests and commits in its own
+worktree; `boss finish` merges the branch back and removes the worktree.
+
+Choose the mode in `boss.toml`:
+
+```toml
+[missions]
+worktrees = "auto"   # auto | always | never, default auto
+```
+
+`auto` keeps today's base-checkout behaviour in this change. `always` sends
+every dispatch into a worktree. `--worktree` and `--no-worktree` override the
+configured mode on `boss dispatch` and `boss mission next`:
+
+```bash
+boss dispatch <change> --project <name|path> --worktree
+boss mission next <slug> --project <name|path> --worktree
+boss dispatch <change> --project <name|path> --no-worktree
+```
+
+Before the first worktree dispatch, commit the planning artifacts on the base
+branch. `boss plan commit` stages and commits only `openspec/vision.md`,
+`openspec/missions/` and `openspec/changes/` with the message
+`plan: <change> artifacts`; code paths are never added:
+
+```bash
+boss plan commit <change> --project <name|path>
+```
+
+The result is `committed` with the commit id and paths, or `clean` when the plan
+paths already match `HEAD`. Worktree dispatch refuses an uncommitted plan with
+`plan_uncommitted` and a dirty base outside `openspec/` with `base_dirty`,
+naming the paths. Commit or stash those paths first.
+
+The worktree lives outside the project tree at
+`$BOSS_STATE_DIR/worktrees/<sha1(project)>/<change>`, on branch
+`boss/<change>`, in its own Herdr workspace. The apply state stays keyed by the
+base project and change and records `worktree`, `branch`,
+`worktree_workspace`, `base_head`, `merge_state`, `merged`, `merge_test` and
+`kept`. `boss status <change> --project <base>` and `boss review` find the
+apply from the base and read git, tasks, validation and tests from the
+worktree; the mission and plan stay in the base. A legacy state without these
+fields keeps the base-checkout behaviour.
+
+`boss finish` verifies the worktree, merges `boss/<change>` into the base
+(`--ff-only` when the base is still at `base_head`, otherwise a `--no-ff`
+merge), runs the configured or detected test command on the merged base, then
+closes the tab, removes the worktree, deletes the branch and the state:
+
+```bash
+boss finish <change> --project <name|path>
+```
+
+A merge conflict aborts the merge, sets `merge_state=conflict`, keeps the
+worktree and state, and reports `merge_conflict` with the conflicting paths. A
+red integration test keeps the state with `merged=true` and
+`merge_state=test_failed`, reports `merge_test_failed`, and lets a later
+`boss finish` retry the test after the fix on the base. `--keep-worktree`
+merges and tests but keeps the worktree, branch and state (`kept=true`,
+`merge_state=done`) for inspection; `--no-merge` closes the tab and keeps them
+for a manual merge without recording a finish. A later `boss finish` cleans up
+either kept path.
+
+`boss park` keeps the worktree and branch for the human handoff. `boss resume`
+reuses the same worktree and branch and starts a fresh agent there; `boss
+retrigger` continues in the same worktree, or starts a new agent there when the
+old one is gone. A missing worktree fails with `worktree_missing` instead of
+silently using the base checkout. `boss doctor` reports a missing worktree
+path, a `conflict`/`test_failed` state, an uncommitted change dir, orphaned
+worktrees under the state root, a dirty base and an uncommitted plan.
+`boss doctor --fix` removes only merged worktrees that belong to a kept or
+finished state; unmerged worktrees are only reported.
+
 ## Reconcile gate
 
 `boss reconcile <slug> --json` is read-only context. Before starting a change
