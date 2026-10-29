@@ -327,3 +327,48 @@ the source and version it was copied from.
 - **WHEN** the runtime is bundled
 - **THEN** the repository contains the MIT license and a vendor record with the
   source commit
+
+### Requirement: Isolated run phase
+
+The vision skill's RUN phase SHALL commit the plan before the first isolated
+dispatch and SHALL use the worktree lifecycle for dispatch, review, finish and
+resume. PLAN and P4 behaviour is unchanged by this capability.
+
+#### Scenario: Plan commit before the first worktree
+
+- **WHEN** the RUN phase starts an isolated apply
+- **THEN** the plan is committed on the base branch first
+
+#### Scenario: Worktree run
+
+- **WHEN** a change runs in a worktree
+- **THEN** the run reviews, merges, tests and cleans up through the worktree
+  lifecycle
+
+#### Scenario: Single change without a plan
+
+- **WHEN** the vision skill runs a single change without planning
+- **THEN** it may use the same worktree lifecycle without requiring a mission
+
+### Requirement: Parallel run phase and lock assignment
+
+Vision P4 SHALL assign `touches:` (or `none`) to every change, and the RUN phase
+SHALL fill slots within the effective `max_parallel` using the shared RUN block
+and the lock checks. The shared block SHALL stay byte-identical to the boss
+skill's copy.
+
+#### Scenario: P4 assigns locks
+
+- **WHEN** P4 finalises the mission change list
+- **THEN** each change carries a `touches:` list or an explicit `none`
+
+#### Scenario: RUN fills slots
+
+- **WHEN** the RUN phase has a free slot and a disjoint startable change
+- **THEN** it dispatches that change and continues with other work
+
+#### Scenario: Shared block stays in sync
+
+- **WHEN** the parallel fill steps are added
+- **THEN** the vision and boss shared blocks remain identical and the drift test
+  passes
