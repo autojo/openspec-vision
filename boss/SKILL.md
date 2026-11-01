@@ -4,7 +4,7 @@ description: Runs one existing OpenSpec change or a small ad-hoc batch from a ce
 allowed-tools: Bash(openspec:*), Bash(boss:*)
 license: MIT
 metadata:
-  version: "1.1.0"
+  version: "1.1.1"
   sharedRun: "shared:run block, identical in vision/SKILL.md and boss/SKILL.md"
 ---
 

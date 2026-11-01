@@ -4,7 +4,7 @@ description: Plans a very large software project feature by feature and then run
 allowed-tools: Bash(openspec:*), Bash(boss:*)
 license: MIT
 metadata:
-  version: "1.1.0"
+  version: "1.1.1"
   sharedRun: "shared:run block, identical in vision/SKILL.md and boss/SKILL.md"
 ---
 

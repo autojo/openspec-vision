@@ -80,7 +80,7 @@ BOSS_LOG_FILE="${BOSS_LOG_FILE:-}"
 # Version of the runtime. 'boss --version' prints it together with the commit
 # of the checkout it runs from (when there is one), so an installed copy can be
 # traced back to the source it was vendored from.
-BOSS_VERSION="1.1.0"
+BOSS_VERSION="1.1.1"
 
 # Locking: a lock is a directory created with mkdir, which is atomic on every
 # POSIX filesystem (NFS included) and needs no flock. A lock is broken when its
@@ -2351,6 +2351,46 @@ resource_warning() {
   fi
   [ -n "$parts" ] && printf 'resource warning: %s\n' "$parts"
   return 0
+}
+
+# run_with_deadline <seconds> <command> [args...] -- run a command and stop it
+# after the deadline, keeping the command's exit status. GNU 'timeout' is used
+# when present; macOS ships neither it nor a coreutils build, so a watchdog
+# subshell enforces the deadline there. Callers must not silently skip work
+# when 'timeout' is missing - a skipped integration test reads as not_run.
+run_with_deadline() {
+  local secs="$1" pid watchdog rc waited
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+    return $?
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+    return $?
+  fi
+  case "$secs" in
+    ''|*[!0-9]*) secs=300 ;;
+    0) "$@"; return $? ;;
+  esac
+  "$@" &
+  pid=$!
+  (
+    waited=0
+    while [ "$waited" -lt "$secs" ]; do
+      sleep 1
+      waited=$((waited + 1))
+      kill -0 "$pid" 2>/dev/null || exit 0
+    done
+    kill -TERM "$pid" 2>/dev/null
+    sleep 1
+    kill -KILL "$pid" 2>/dev/null
+  ) >/dev/null 2>&1 &
+  watchdog=$!
+  wait "$pid"
+  rc=$?
+  kill "$watchdog" 2>/dev/null || true
+  return "$rc"
 }
 
 # waiter_alive <pid> -- 0 when pid is a running boss-waiter. The script runs

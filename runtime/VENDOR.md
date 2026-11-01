@@ -27,6 +27,8 @@ added or changed here and has no upstream counterpart:
 - state and dispatch locking (`lock_acquire` and friends in `bin/boss-lib.sh`)
 - the deny policy (`BOSS_POLICY_DENY_DEFAULT`, `policy_check`,
   `--disallowedTools` for claude runners)
+- `run_with_deadline` in `bin/boss-lib.sh`, so the integration test runs on
+  macOS instead of being skipped for the missing `timeout(1)`
 
 ## Updating
 

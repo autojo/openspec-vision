@@ -429,8 +429,8 @@ finish_worktree() {
     log "test command '$test_cmd' not found in PATH; reporting not_run"
     test_cmd=""
   fi
-  if [ -n "$test_cmd" ] && command -v timeout >/dev/null 2>&1; then
-    if (cd "$project" && timeout "$BOSS_REVIEW_TEST_TIMEOUT_S" bash -c "$test_cmd" >/dev/null 2>&1); then
+  if [ -n "$test_cmd" ]; then
+    if (cd "$project" && run_with_deadline "$BOSS_REVIEW_TEST_TIMEOUT_S" bash -c "$test_cmd" >/dev/null 2>&1); then
       test_result="pass"
     else
       test_result="fail"

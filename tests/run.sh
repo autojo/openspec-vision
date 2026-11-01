@@ -307,7 +307,17 @@ cat >"$BIN/setsid" <<'EOF'
 exit 0
 EOF
 
-chmod +x "$BIN/openspec" "$BIN/herdr" "$BIN/opencode" "$BIN/setsid"
+# deadline <seconds> <command>... -- run a command, stopping it after the
+# deadline. This is the runtime's own helper (run_with_deadline), so the suite
+# behaves the same on Linux and on macOS, where timeout(1) does not exist and a
+# bare 'timeout' call would only produce 'command not found'.
+cat >"$BIN/deadline" <<EOF
+#!/usr/bin/env bash
+. "$ROOT/runtime/bin/boss-lib.sh"
+run_with_deadline "\$@"
+EOF
+
+chmod +x "$BIN/openspec" "$BIN/herdr" "$BIN/opencode" "$BIN/setsid" "$BIN/deadline"
 
 # A tiny Herdr socket server for the pane.report_metadata call.
 python3 - "$SOCKET" <<'PY' &
@@ -721,7 +731,7 @@ make_project "$P"
 make_change "$P" quiet $'- [ ] 1.1 [Nutzer] Konto verknüpfen.'
 run_boss park quiet --project "$P" >/dev/null
 state_file="$STATE/applies/$(run_lib sha1_hex "$P")-quiet.json"
-if timeout 3 env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="$CONFIG" BOSS_STATE_DIR="$STATE" bash "$ROOT/runtime/bin/boss-waiter" "$state_file" >/dev/null 2>&1; then
+if "$BIN/deadline" 3 env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="$CONFIG" BOSS_STATE_DIR="$STATE" bash "$ROOT/runtime/bin/boss-waiter" "$state_file" >/dev/null 2>&1; then
   ok
 else
   bad "waiter: parked change did not exit quietly"
@@ -2038,13 +2048,13 @@ env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="$CONFIG" BOSS_STATE_DIR="$A7ST" \
 BOSS_LOG_FILE="$TMP/boss.log" \
   HERDR_ENV=1 HERDR_PANE_ID=p-live HERDR_WORKSPACE_ID=ws-1 HERDR_LIVE_PANES=p-live \
   HERDR_AGENTS_JSON='[{"name":"apply-lost-check","pane_id":"p-live","workspace_id":"ws-1"}]' \
-  HERDR_AGENT_WAIT_FAIL=1 timeout 2 bash "$ROOT/runtime/bin/boss-waiter" \
+  HERDR_AGENT_WAIT_FAIL=1 "$BIN/deadline" 2 bash "$ROOT/runtime/bin/boss-waiter" \
   "$A7ST/applies/$(run_lib sha1_hex "$P_A7")-lost-check.json" >/dev/null 2>&1 || true
 check_not_contains "liveness: alive no lost" '"event":"lost"' "$(cat "$A7EV" 2>/dev/null)"
 env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="$CONFIG" BOSS_STATE_DIR="$A7ST" \
 BOSS_LOG_FILE="$TMP/boss.log" \
   HERDR_ENV=1 HERDR_PANE_ID=p-live HERDR_WORKSPACE_ID=ws-1 HERDR_LIVE_PANES= \
-  HERDR_AGENTS_JSON='[]' HERDR_AGENT_WAIT_FAIL=1 timeout 2 bash "$ROOT/runtime/bin/boss-waiter" \
+  HERDR_AGENTS_JSON='[]' HERDR_AGENT_WAIT_FAIL=1 "$BIN/deadline" 2 bash "$ROOT/runtime/bin/boss-waiter" \
   "$A7ST/applies/$(run_lib sha1_hex "$P_A7")-lost-check.json" >/dev/null 2>&1 || true
 check_contains "liveness: gone reports lost" '"event":"lost"' "$(cat "$A7EV" 2>/dev/null)"
 
@@ -2101,7 +2111,7 @@ env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="$CONFIG" BOSS_STATE_DIR="$IST" \
 BOSS_LOG_FILE="$TMP/boss.log" \
   HERDR_ENV=1 HERDR_PANE_ID=p-int HERDR_WORKSPACE_ID=ws-1 HERDR_LIVE_PANES=p-int \
   HERDR_AGENTS_JSON='[{"name":"apply-interrupt-me","pane_id":"p-int","workspace_id":"ws-1"}]' \
-  timeout 2 bash "$ROOT/runtime/bin/boss-waiter" "$ISTATE" >/dev/null 2>&1 || true
+  "$BIN/deadline" 2 bash "$ROOT/runtime/bin/boss-waiter" "$ISTATE" >/dev/null 2>&1 || true
 check_contains "interrupt: wake state" '"state":"interrupted"' \
   "$(cat "$IST/cycles/$(run_lib sha1_hex "$P_INT")-interrupt-me.events.jsonl")"
 
@@ -2218,9 +2228,14 @@ check_contains "doctor fix: removal hint" "removed dead registry" \
   "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="boss_registry") | .hint')"
 
 # 53. Installer leaves a running waiter untouched and reports it.
+# A real script named boss-waiter, not 'exec -a' - bash 3.2 (macOS /bin/bash)
+# has no -a, and the installer looks for the process by that name.
 IWH="$TMP/install-waiter-home"
-mkdir -p "$IWH"
-bash -c 'exec -a /tmp/boss-waiter sleep 30' &
+IWD="$TMP/dummy-waiter"
+mkdir -p "$IWH" "$IWD"
+printf '#!/bin/sh\nsleep 30\n' >"$IWD/boss-waiter"
+chmod +x "$IWD/boss-waiter"
+"$IWD/boss-waiter" &
 DUMMY_WAITER=$!
 sleep 0.2
 out="$(HOME="$IWH" PATH="$BIN:$PATH" bash "$ROOT/install.sh" 2>&1)"

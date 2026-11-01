@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.1
+
+### Fixed
+
+- The integration test (`[tests]` in the config, `merge_test` in the review)
+  was skipped on macOS, where `timeout(1)` does not exist (coreutils installs it
+  as `gtimeout`). The runtime now runs it through `run_with_deadline`, which
+  uses `timeout`/`gtimeout` when present and a watchdog subshell otherwise, so
+  the result is no longer a silent `not_run` on macOS.
+- The regression suite failed on macOS: it called `timeout` directly and made a
+  dummy waiter with `exec -a` (bash 4). It now uses the runtime's
+  `run_with_deadline` through a `deadline` stub and a real script named
+  `boss-waiter`, so the checks run on bash 3.2 as well.
+
 ## 1.1.0
 
 Correctness and hardening pass over the runtime, driven by a review of the
