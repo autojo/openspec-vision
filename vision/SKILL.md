@@ -4,8 +4,8 @@ description: Plans a very large software project feature by feature and then run
 allowed-tools: Bash(openspec:*), Bash(boss:*)
 license: MIT
 metadata:
-  version: "1.0"
-  embeddedFrom: "boss skill, 2026-10-06"
+  version: "1.1.0"
+  sharedRun: "shared:run block, identical in vision/SKILL.md and boss/SKILL.md"
 ---
 
 # Vision – plan a large project, then run it to completion
@@ -476,6 +476,10 @@ opencode integration v13 or newer. Re-run `./install.sh` after updating Herdr.
      `next` again.
    - `executer_busy` -> an apply is already running; end your turn and wait for
      the wake. Do not poll.
+   - The dispatch result carries `policy`: `enforced` or `verified` means the
+     runner denies the destructive commands an apply never needs, `missing`,
+     `unavailable` or `off` means it does not. Journal that once per run and
+     continue - never stop for it, and never treat it as a charter decision.
    - dispatched -> end your turn. The waiter wakes you when the apply settles;
      never poll `boss status`.
 

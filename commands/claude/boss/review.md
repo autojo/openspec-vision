@@ -1,7 +1,7 @@
 ---
 name: "Boss: Review"
 description: "Gather deterministic review facts for an apply: tasks, validate, tests, git, friction"
-allowed-tools: Bash
+allowed-tools: Bash(boss:*)
 category: "Boss"
 tags: ["boss", "workflow"]
 ---

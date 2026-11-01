@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # this file defines globals that the other
+# runtime files read; a per-line directive cannot cover a cross-file use.
 # Shared helpers for the openspec-boss scripts (bin/boss, bin/boss-waiter).
 # Sourced, never executed directly. Comments and messages are in English.
 
@@ -75,6 +77,32 @@ BOSS_OPENCODE_MAJOR="${BOSS_OPENCODE_MAJOR:-}"
 # When set (by bin/boss-waiter), log() appends to this file instead of stderr.
 BOSS_LOG_FILE="${BOSS_LOG_FILE:-}"
 
+# Version of the runtime. 'boss --version' prints it together with the commit
+# of the checkout it runs from (when there is one), so an installed copy can be
+# traced back to the source it was vendored from.
+BOSS_VERSION="1.1.0"
+
+# Locking: a lock is a directory created with mkdir, which is atomic on every
+# POSIX filesystem (NFS included) and needs no flock. A lock is broken when its
+# holder is gone or when it is older than BOSS_LOCK_STALE_S, so a killed command
+# never blocks the state. BOSS_LOCK_TIMEOUT_MS bounds the wait; state writes
+# continue without the lock rather than failing when it cannot be had.
+BOSS_LOCK_TIMEOUT_MS="${BOSS_LOCK_TIMEOUT_MS:-5000}"
+BOSS_LOCK_STALE_S="${BOSS_LOCK_STALE_S:-60}"
+BOSS_LOCKS_DIR="$BOSS_STATE_DIR/locks"
+
+# Commands an apply never needs. A runner can extend the list with
+# 'deny = [...]' in its [runners.<name>] table; the doctor verifies that the
+# agent configuration in effect actually denies them and dispatch reports the
+# result as 'policy'. This is defence in depth: the apply agent still runs with
+# broad permissions, and the charter remains the authoritative boundary.
+BOSS_POLICY_DENY_DEFAULT='git push --force
+git push -f
+git push --mirror
+git push --delete
+git filter-branch
+git filter-repo'
+
 now_iso() {
   date '+%Y-%m-%dT%H:%M:%S%z'
 }
@@ -93,12 +121,114 @@ epoch_of_iso() {
   [ -n "$out" ] && printf '%s' "$out"
 }
 
-# now_ms -- current time in milliseconds since the epoch. BSD/macOS 'date' has
-# no '%N', so this multiplies whole seconds by 1000 instead. Every deadline and
-# every comparison uses this same helper, so the coarser resolution is
-# consistent and timeouts keep working.
+# now_ms -- current time in milliseconds since the epoch. GNU 'date' prints
+# real milliseconds for '%3N'; BSD/macOS 'date' has no '%N' and prints a literal
+# '3N', which the probe below detects once, and whole seconds are used instead.
+# Every deadline and comparison uses this helper, so the coarser resolution is
+# consistent and timeouts keep working on either platform.
+BOSS_NOW_MS_PRECISE="${BOSS_NOW_MS_PRECISE:-}"
 now_ms() {
+  local out
+  if [ -z "$BOSS_NOW_MS_PRECISE" ]; then
+    out="$(date +%s%3N 2>/dev/null || true)"
+    case "$out" in
+      *[!0-9]*|"") BOSS_NOW_MS_PRECISE=0 ;;
+      *) BOSS_NOW_MS_PRECISE=1 ;;
+    esac
+  fi
+  if [ "$BOSS_NOW_MS_PRECISE" = "1" ]; then
+    out="$(date +%s%3N 2>/dev/null || true)"
+    case "$out" in *[!0-9]*|"") out="" ;; esac
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+  fi
   printf '%s\n' "$(( $(date +%s) * 1000 ))"
+}
+
+# --- Locking ------------------------------------------------------------
+# lock_holder_alive <lock-dir> -- 0 when the recorded holder process is alive.
+lock_holder_alive() {
+  local pid
+  pid="$(cat "$1/pid" 2>/dev/null || true)"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+# lock_age_s <lock-dir> -- age of the lock directory in seconds (0 when the
+# mtime cannot be read, which keeps the lock treated as fresh).
+lock_age_s() {
+  local mtime
+  mtime="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true)"
+  case "$mtime" in ''|*[!0-9]*) printf '0'; return 0 ;; esac
+  printf '%s' "$(( $(date +%s) - mtime ))"
+}
+
+# lock_acquire <lock-dir> [<timeout-ms>] -- take the lock or return 1 after the
+# timeout. A lock whose holder is gone, or that is older than BOSS_LOCK_STALE_S,
+# is broken and retried, so a killed process cannot block the state forever.
+lock_acquire() {
+  local dir="$1" timeout="${2:-$BOSS_LOCK_TIMEOUT_MS}" deadline
+  deadline=$(( $(now_ms) + timeout ))
+  mkdir -p "$(dirname "$dir")" 2>/dev/null || true
+  while :; do
+    if mkdir "$dir" 2>/dev/null; then
+      printf '%s\n' "$$" >"$dir/pid" 2>/dev/null || true
+      return 0
+    fi
+    if ! lock_holder_alive "$dir" || [ "$(lock_age_s "$dir")" -ge "$BOSS_LOCK_STALE_S" ]; then
+      rm -rf "$dir" 2>/dev/null || true
+      continue
+    fi
+    [ "$(now_ms)" -lt "$deadline" ] || return 1
+    sleep 0.05 2>/dev/null || sleep 1
+  done
+}
+
+# lock_release <lock-dir> -- drop the lock, but only when this process holds it,
+# so a lock broken by someone else is never removed twice.
+lock_release() {
+  local dir="$1" pid
+  [ -n "$dir" ] || return 0
+  pid="$(cat "$dir/pid" 2>/dev/null || true)"
+  if [ -z "$pid" ] || [ "$pid" = "$$" ]; then
+    rm -rf "$dir" 2>/dev/null || true
+  fi
+}
+
+# lock_key <text> -- a filesystem-safe key for a lock path (sha1 of the text).
+lock_key() {
+  sha1_hex "$1"
+}
+
+# state_lock <state-file> -- lock path guarding one apply's state file.
+state_lock() {
+  printf '%s/%s.lock\n' "$BOSS_LOCKS_DIR" "$(lock_key "${1:-state}")"
+}
+
+# dispatch_lock <project> <change> -- lock path serializing the dispatch of one
+# change, so two bosses cannot pass the 'already running' check and start two
+# applies for the same change at the same time.
+dispatch_lock() {
+  printf '%s/%s.lock\n' "$BOSS_LOCKS_DIR" "$(lock_key "dispatch:$1:$2")"
+}
+
+# boss_version_line -- one line naming the runtime version and, when it can be
+# determined, the commit the running copy came from (a checkout, or the stamp
+# the installer wrote next to the binaries).
+boss_version_line() {
+  local dir="${BIN_DIR:-}" commit=""
+  if [ -n "$dir" ]; then
+    commit="$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || true)"
+    if [ -n "$commit" ] && [ -n "$(git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+      # A checkout with uncommitted runtime changes is not that commit.
+      commit="$commit-dirty"
+    fi
+    [ -n "$commit" ] || commit="$(cat "$dir/.boss-runtime-commit" 2>/dev/null || true)"
+  fi
+  if [ -n "$commit" ]; then
+    printf 'boss %s (%s)\n' "$BOSS_VERSION" "$commit"
+  else
+    printf 'boss %s\n' "$BOSS_VERSION"
+  fi
 }
 
 log() {
@@ -121,6 +251,12 @@ die_json() {
   # half-created apply behind. Cleanup never masks the original error.
   if [ -n "${BOSS_FAILED_WORKTREE:-}" ]; then
     worktree_cleanup_failed || true
+  fi
+  # A dispatch that dies must not keep the dispatch lock (the next attempt in
+  # another session would see 'dispatch_busy' for the rest of the stale window).
+  if [ -n "${BOSS_DISPATCH_LOCK:-}" ]; then
+    lock_release "$BOSS_DISPATCH_LOCK"
+    BOSS_DISPATCH_LOCK=""
   fi
   if [ -n "${BOSS_FAILED_TAB:-}" ]; then
     local tail
@@ -145,8 +281,15 @@ die_json() {
 
 # usage_error <message> -- usage JSON on stderr, exit 2 (same convention as herdr)
 usage_error() {
-  local msg="$1"
-  printf '{"error":"usage","message":"%s"}\n' "$msg" >&2
+  local msg="$1" json
+  # A usage error must stay valid JSON even when the offending argument carries
+  # a quote: jq escapes it, and the sed fallback covers a system without jq.
+  json="$(jq -nc --arg m "$msg" '{error: "usage", message: $m}' 2>/dev/null)" || json=""
+  if [ -z "$json" ]; then
+    json="$(printf '{"error":"usage","message":"%s"}' \
+      "$(printf '%s' "$msg" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g')")"
+  fi
+  printf '%s\n' "$json" >&2
   exit 2
 }
 
@@ -390,16 +533,24 @@ opencode_major_version() {
 # runner with absent or empty args gets '--auto' on OpenCode V2; V1 and an
 # unknown version get no extra argument and keep their legacy behavior.
 runner_args_of() {
-  local runner="$1" args kind version
+  local runner="$1" with_policy="${2:-1}" args kind version
   args="$(printf '%s' "$runner" | jq -r '.args[]? // empty')"
   if [ -n "$args" ]; then
     printf '%s\n' "$args"
-    return 0
+  else
+    kind="$(printf '%s' "$runner" | jq -r '.kind // empty')"
+    if [ "$kind" = "opencode" ]; then
+      version="$(opencode_major_version)"
+      [ "$version" = "2" ] && printf '%s\n' '--auto'
+    fi
   fi
-  kind="$(printf '%s' "$runner" | jq -r '.kind // empty')"
-  [ "$kind" = "opencode" ] || return 0
-  version="$(opencode_major_version)"
-  [ "$version" = "2" ] && printf '%s\n' '--auto'
+  # The deny block goes last: '--disallowedTools' takes several values, so
+  # anything after it would be read as a tool name. It applies to the apply
+  # agent; the boss session itself may be granted a force-push of its own
+  # branch, so cmd_session passes 0 here.
+  if [ "$with_policy" = "1" ]; then
+    policy_claude_args "$runner"
+  fi
   return 0
 }
 
@@ -534,6 +685,156 @@ opencode_permission_probe() {
          message: (if ($denied | length) > 0
                    then "broad deny for " + ($denied | join(", "))
                    else "no broad deny for shell, edit, read or external directory" end)}'
+}
+
+# --- Policy: destructive commands an apply never needs -------------------
+# policy_denies <runner-json> -- the deny patterns of the runner, one per line:
+# the runner's own 'deny = [...]' when the field is present (an empty array
+# disables the list), otherwise BOSS_POLICY_DENY_DEFAULT.
+policy_denies() {
+  printf '%s' "$1" | jq -r --arg d "$BOSS_POLICY_DENY_DEFAULT" \
+    'if has("deny") then (.deny[]? // empty) else $d end' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+    | grep -v '^$' || true
+}
+
+# policy_rule_covers <deny-rule> <required-pattern> -- 0 when every command
+# matching <required-pattern> is denied by <deny-rule>. A rule is a glob over
+# the command line: '*' covers everything, 'git push --force*' covers the
+# pattern when the pattern starts with that prefix, otherwise they must match.
+policy_rule_covers() {
+  local rule="$1" pat="$2" prefix
+  case "$rule" in
+    "*") return 0 ;;
+    *"*")
+      prefix="${rule%\*}"
+      [ -n "$prefix" ] || return 0
+      case "$pat" in
+        "$prefix"*) return 0 ;;
+      esac
+      ;;
+  esac
+  [ "$rule" = "$pat" ]
+}
+
+# policy_claude_args <runner-json> -- agent-start arguments that deny the
+# destructive commands at the CLI level for a claude runner. Nothing is printed
+# for other kinds. '--disallowedTools' takes several values, so the block goes
+# last and every pattern becomes one 'Bash(prefix:*)' entry.
+policy_claude_args() {
+  local kind pattern count=0
+  kind="$(printf '%s' "$1" | jq -r '.kind // empty')"
+  [ "$kind" = "claude" ] || return 0
+  local patterns
+  patterns="$(policy_denies "$1")"
+  [ -n "$patterns" ] || return 0
+  printf '%s\n' "--disallowedTools"
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] || continue
+    printf '%s\n' "Bash($pattern:*)"
+    count=$((count + 1))
+  done <<EOF
+$patterns
+EOF
+  [ "$count" -gt 0 ] || return 0
+}
+
+# policy_check <runner-json> [<project-dir>] -- how the deny list is enforced
+# for this runner, as compact JSON:
+#   status enforced     the runner's start arguments carry the denies (claude)
+#   status verified     the effective OpenCode rules deny every pattern
+#   status missing      patterns are not denied by the effective rules
+#   status unavailable  the effective rules cannot be read (no opencode V2)
+#   status off          the runner has an empty deny list
+# The check never fails a run; it makes the boundary visible in dispatch and
+# in 'boss doctor'.
+policy_check() {
+  local runner="$1" dir="${2:-}" effective="${3:-}" kind denies mode_json
+  kind="$(printf '%s' "$runner" | jq -r '.kind // empty')"
+  denies="$(policy_denies "$runner")"
+  mode_json="$(runner_mode_of "$runner")"
+
+  if [ -z "$denies" ]; then
+    jq -nc --arg k "$kind" --argjson m "$mode_json" \
+      '{status: "off", kind: $k, mode: $m.permission_mode, denies: [],
+        missing: [], source: null,
+        hint: "the runner has an empty deny list; only the charter bounds the apply"}'
+    return 0
+  fi
+
+  if [ "$kind" = "claude" ]; then
+    jq -nc --arg k "$kind" --argjson m "$mode_json" \
+      --argjson d "$(printf '%s' "$denies" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+      '{status: "enforced", kind: $k, mode: $m.permission_mode, denies: $d,
+        missing: [], source: "agent args (--disallowedTools)",
+        hint: "dispatch passes --disallowedTools for every deny pattern"}'
+    return 0
+  fi
+
+  if [ "$kind" != "opencode" ]; then
+    jq -nc --arg k "$kind" --argjson m "$mode_json" \
+      --argjson d "$(printf '%s' "$denies" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+      '{status: "unavailable", kind: $k, mode: $m.permission_mode, denies: $d,
+        missing: [], source: null,
+        hint: "no generic way to verify the deny list for this runner kind"}'
+    return 0
+  fi
+
+  local perms missing="" pattern
+  # A caller that already probed the effective rules passes them in, so the
+  # agent CLI is asked only once per command.
+  if [ -z "$effective" ]; then
+    effective="$(opencode_effective_permissions "$dir")"
+  fi
+  perms="$(printf '%s' "$effective" | jq -c '.permissions // empty' 2>/dev/null || true)"
+  if [ -z "$perms" ] || [ "$perms" = "null" ] || [ "$perms" = "empty" ]; then
+    jq -nc --arg k "$kind" --argjson m "$mode_json" \
+      --argjson d "$(printf '%s' "$denies" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+      --arg e "$(printf '%s' "$effective" | jq -r '.error // "no effective rules"')" \
+      '{status: "unavailable", kind: $k, mode: $m.permission_mode, denies: $d,
+        missing: [], source: null,
+        hint: ("the effective OpenCode rules could not be read: " + $e)}'
+    return 0
+  fi
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] || continue
+    if ! policy_opencode_denied "$perms" "$pattern"; then
+      missing="$missing$pattern
+"
+    fi
+  done <<EOF
+$denies
+EOF
+  if [ -z "$missing" ]; then
+    jq -nc --arg k "$kind" --argjson m "$mode_json" \
+      --argjson d "$(printf '%s' "$denies" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+      --arg s "$(printf '%s' "$effective" | jq -r '.source // ""')" \
+      '{status: "verified", kind: $k, mode: $m.permission_mode, denies: $d,
+        missing: [], source: $s, hint: "the effective OpenCode rules deny every pattern"}'
+  else
+    jq -nc --arg k "$kind" --argjson m "$mode_json" \
+      --argjson d "$(printf '%s' "$denies" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+      --argjson miss "$(printf '%s' "$missing" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+      --arg s "$(printf '%s' "$effective" | jq -r '.source // ""')" \
+      '{status: "missing", kind: $k, mode: $m.permission_mode, denies: $d,
+        missing: $miss, source: $s,
+        hint: "add a deny rule for each missing pattern to the OpenCode config"}'
+  fi
+}
+
+# policy_opencode_denied <permissions-json> <pattern> -- 0 when a deny rule of
+# the effective OpenCode V2 rules covers every command matching <pattern>.
+policy_opencode_denied() {
+  local perms="$1" pattern="$2" rule
+  while IFS= read -r rule; do
+    [ -n "$rule" ] || continue
+    policy_rule_covers "$rule" "$pattern" && return 0
+  done < <(printf '%s' "$perms" | jq -r '
+    .[]? | select(type == "object")
+    | select(((.effect // "") | ascii_downcase) == "deny")
+    | select(((.action // "") | ascii_downcase) | test("^(shell|bash|command|\\*)"))
+    | (.resource // "*")')
+  return 1
 }
 
 # boss_agents -- compact '.agents' array from 'herdr agent list', or '[]' when
@@ -858,7 +1159,6 @@ boss_caller_identity() {
 boss_use_caller() {
   local resp
   resp="$(boss_caller_identity "${1:-}")" || exit 1
-  BOSS_CALLER_JSON="$resp"
   BOSS_CALLER_PANE="$(printf '%s' "$resp" | jq -r '.pane_id // empty')"
   BOSS_CALLER_WORKSPACE="$(printf '%s' "$resp" | jq -r '.workspace_id // empty')"
   BOSS_CALLER_CWD="$(printf '%s' "$resp" | jq -r '.cwd // empty')"
@@ -1344,14 +1644,22 @@ compose_apply_prompt() {
 
 # write_state_field <state-file> <key> <string-value> -- atomic update
 write_state_field() {
-  local f="$1" k="$2" v="$3" t
+  local f="$1" k="$2" v="$3" t lock rc=0 acquired=0
+  # Read-modify-write of a JSON document: the waiter, retrigger, finish and
+  # park all update the same file, so the update is serialized. A lock that
+  # cannot be had within the timeout is not fatal - the write proceeds, and the
+  # last writer still leaves a complete document because of the atomic rename.
+  lock="$(state_lock "$f")"
+  if lock_acquire "$lock"; then acquired=1; else log "warning: state lock busy for $f; writing without it"; fi
   t="$(mktemp)"
   if jq --arg k "$k" --arg v "$v" '.[$k] = $v' "$f" >"$t" 2>/dev/null; then
     mv "$t" "$f"
   else
     rm -f "$t"
-    return 1
+    rc=1
   fi
+  [ "$acquired" -eq 1 ] && lock_release "$lock"
+  return "$rc"
 }
 
 # state_file_for <project-path> <change> -- path of the state file for an apply
@@ -1725,11 +2033,9 @@ mission_done_state() {
     proposal=true
   fi
 
-  local tasks_json tasks_open tasks_done tasks_total human_open external_open agent_open human_tasks external_tasks parked=false
+  local tasks_json tasks_open human_open external_open agent_open human_tasks external_tasks parked=false
   tasks_json="$(mission_tasks_json "$project" "$change")"
   tasks_open="$(printf '%s' "$tasks_json" | jq -r '.open')"
-  tasks_done="$(printf '%s' "$tasks_json" | jq -r '.done')"
-  tasks_total="$(printf '%s' "$tasks_json" | jq -r '.total')"
   human_open="$(printf '%s' "$tasks_json" | jq -r '.human_open')"
   external_open="$(printf '%s' "$tasks_json" | jq -r '.external_open')"
   agent_open="$(printf '%s' "$tasks_json" | jq -r '.agent_open')"
@@ -1785,6 +2091,7 @@ mission_done_state() {
 }
 
 # expand_home <path> -- expand a leading ~
+# shellcheck disable=SC2088  # a literal tilde prefix, not an unexpanded path
 expand_home() {
   case "$1" in
     "~") printf '%s' "$HOME" ;;
@@ -1880,6 +2187,7 @@ PY
 # A state whose recorded pane no longer hosts a live agent is stale and does
 # not consume a slot; when the agent list cannot be read, every unfinished
 # state counts (fail-safe).
+# shellcheck disable=SC2120  # the optional argument skips one state file
 open_apply_count() {
   local skip="${1:-}" f n=0 agents="" have_agents=0 ms parked pane
   [ -d "$BOSS_APPLIES_DIR" ] || { printf '0\n'; return 0; }
@@ -2053,13 +2361,13 @@ waiter_alive() {
   local pid="$1" args
   [ -n "$pid" ] && [ "$pid" != "null" ] || return 1
   if command -v ps >/dev/null 2>&1; then
-    ps -p "$pid" -o args= 2>/dev/null | grep -q 'boss-waiter' && return 0
+    ps -p "$pid" -o args= 2>/dev/null | grep -qE '(^|/)boss-waiter( |$)' && return 0
     return 1
   fi
   kill -0 "$pid" 2>/dev/null || return 1
   [ -r "/proc/$pid/cmdline" ] || return 1
   args="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
-  printf '%s' "$args" | grep -q 'boss-waiter'
+  printf '%s' "$args" | grep -qE '(^|/)boss-waiter( |$)'
 }
 
 # kill_waiter <pid> -- stop a running waiter, if the pid really is a boss-waiter

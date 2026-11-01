@@ -1,7 +1,7 @@
 ---
 name: "Boss: Session"
 description: "Start a boss tab in a project's workspace with the scoped runner config"
-allowed-tools: Bash
+allowed-tools: Bash(boss:*)
 category: "Boss"
 tags: ["boss", "workflow"]
 ---

@@ -1,7 +1,7 @@
 ---
 name: "Boss: Retarget"
 description: "Move a running apply's dispatcher to the verified caller or an explicit target"
-allowed-tools: Bash
+allowed-tools: Bash(boss:*)
 category: "Boss"
 tags: ["boss", "workflow"]
 ---

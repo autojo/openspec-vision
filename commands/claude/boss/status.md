@@ -1,7 +1,7 @@
 ---
 name: "Boss: Status"
 description: "Show the state of an apply: agent, tasks, diff, tab/pane"
-allowed-tools: Bash
+allowed-tools: Bash(boss:*)
 category: "Boss"
 tags: ["boss", "workflow"]
 ---

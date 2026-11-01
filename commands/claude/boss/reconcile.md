@@ -1,7 +1,7 @@
 ---
 name: "Boss: Reconcile"
 description: "Assemble the read-only context for the post-apply mission reconciliation"
-allowed-tools: Bash
+allowed-tools: Bash(boss:*)
 category: "Boss"
 tags: ["boss", "workflow"]
 ---

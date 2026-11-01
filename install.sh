@@ -21,7 +21,8 @@ boss_skill_dirs=(
   "$claude_dir/skills/boss"
 )
 boss_skill_marker=".vision-managed"
-runtime_files=(boss boss-lib.sh boss-waiter)
+runtime_files=(boss boss-lib.sh boss-waiter
+  boss-apply.sh boss-status.sh boss-review.sh boss-run.sh boss-doctor.sh boss-mission.sh)
 opencode_commands_dir="$opencode_dir/commands"
 claude_commands_dir="$claude_dir/commands/boss"
 config_dir="$HOME/.config/openspec-boss"
@@ -180,13 +181,32 @@ install_boss_skill() {
 }
 
 install_runtime() {
-  local name
+  local name commit origin_prev=""
   mkdir -p -- "$bin_dir"
+  # Another installer (the older openspec-boss checkout) writes the same paths.
+  # Say so instead of silently replacing it, so a mixed installation is visible.
+  if [ -f "$bin_dir/boss" ] && [ -f "$bin_dir/.boss-runtime-origin" ]; then
+    origin_prev="$(cat "$bin_dir/.boss-runtime-origin" 2>/dev/null || true)"
+  elif [ -f "$bin_dir/boss" ]; then
+    origin_prev="an installer that left no origin marker"
+  fi
+  if [ -n "$origin_prev" ] && [ "$origin_prev" != "vision-skill" ]; then
+    warn "replacing the boss runtime in $bin_dir (previous origin: $origin_prev)"
+  fi
   for name in "${runtime_files[@]}"; do
     [ -f "$runtime_src/$name" ] || { fail "missing $runtime_src/$name"; return 1; }
     copy_file "$runtime_src/$name" "$bin_dir/$name" 0755
   done
-  info "installed the boss runtime into $bin_dir"
+  # Stamp the commit the copy came from, so 'boss --version' of an installed
+  # runtime names its source (a checkout may have none).
+  commit="$(git -C "$src" rev-parse --short HEAD 2>/dev/null || true)"
+  if [ -n "$commit" ] && [ -n "$(git -C "$src" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    # The copy contains changes that are not in that commit.
+    commit="$commit-dirty"
+  fi
+  printf '%s\n' "${commit:-unknown}" >"$bin_dir/.boss-runtime-commit"
+  printf '%s\n' "vision-skill" >"$bin_dir/.boss-runtime-origin"
+  info "installed the boss runtime into $bin_dir${commit:+ (commit $commit)}"
 }
 
 install_wrappers() {
@@ -311,6 +331,7 @@ uninstall_all() {
   for name in "${runtime_files[@]}"; do
     rm -f -- "$bin_dir/$name"
   done
+  rm -f -- "$bin_dir/.boss-runtime-commit" "$bin_dir/.boss-runtime-origin"
   info "removed the boss runtime from $bin_dir"
   remove_wrappers
   info "kept config $config_dir and state $state_dir"

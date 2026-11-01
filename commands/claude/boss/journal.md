@@ -1,7 +1,7 @@
 ---
 name: "Boss: Journal"
 description: "Append a dated entry to the project's autonomous-decision journal"
-allowed-tools: Bash
+allowed-tools: Bash(boss:*)
 category: "Boss"
 tags: ["boss", "workflow"]
 ---

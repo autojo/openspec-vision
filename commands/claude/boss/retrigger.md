@@ -1,7 +1,7 @@
 ---
 name: "Boss: Retrigger"
 description: "Send the apply command to the existing apply agent again"
-allowed-tools: Bash
+allowed-tools: Bash(boss:*)
 category: "Boss"
 tags: ["boss", "workflow"]
 ---

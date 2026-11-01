@@ -21,6 +21,7 @@ done
 BOSS_LIB_DIR="$(cd "$(dirname "$BOSS_SELF")" && pwd -P)" || exit 1
 # shellcheck source=./boss-lib.sh
 . "$BOSS_LIB_DIR/boss-lib.sh"
+# shellcheck disable=SC2034  # shared global, read by boss-<module>.sh
 BIN_DIR="$(dirname "$(resolve_path "${BASH_SOURCE[0]}")")"
 unset BOSS_SELF BOSS_LINK BOSS_LIB_DIR
 
@@ -51,6 +52,7 @@ fi
 
 log_file="$BOSS_LOGS_DIR/$change-$(date '+%Y%m%dT%H%M%S').log"
 mkdir -p "$BOSS_LOGS_DIR" || exit 1
+# shellcheck disable=SC2034  # read by log() in boss-lib.sh
 BOSS_LOG_FILE="$log_file"
 # Detached, the waiter's stderr goes to /dev/null; point it at the log so a
 # bash error (a set -u violation, a broken command) is recorded instead of
@@ -124,13 +126,20 @@ else
 fi
 
 update_state() {
-  local st="$1" t
+  local st="$1" t lock acquired=0
+  # The boss updates the same document (retrigger, finish, park), so the
+  # read-modify-write is serialized. A busy lock is not fatal: the write still
+  # lands atomically below.
+  lock="$(state_lock "$state_file")"
+  if lock_acquire "$lock"; then acquired=1; else log "warning: state lock busy; updating without it"; fi
   t="$(mktemp)"
   if jq --arg st "$st" --arg at "$(now_iso)" '.last_state = $st | .last_state_at = $at' "$state_file" >"$t" 2>/dev/null; then
     mv "$t" "$state_file"
   else
     rm -f "$t"
   fi
+  [ "$acquired" -eq 1 ] && lock_release "$lock"
+  return 0
 }
 
 # report_stall -- tell the boss the apply is still working, without ending it.
@@ -395,7 +404,7 @@ main() {
         || log "warning: could not record blocked event"
       printf -v text 'Apply %s in %s: blocked.\nVisible dialog of the apply pane:\n%s\nNext step: boss status %s' "$change" "$project" "$dialog" "$change"
       # After an answer the agent may go straight to idle without working.
-      next_wait=(--until working --until idle --until done)
+      next_wait=(--until working --until idle --until "done")
     else
       printf -v text 'Apply %s in %s: %s. Next step: boss status %s' "$change" "$project" "$report_state" "$change"
       next_wait=(--until working --until blocked)

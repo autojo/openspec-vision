@@ -1,9 +1,9 @@
 ---
 name: "Boss: Dispatch"
 description: "Start the apply of an OpenSpec change in its own Herdr tab"
-allowed-tools: Bash
+allowed-tools: Bash(boss:*)
 category: "Boss"
 tags: ["boss", "workflow"]
 ---
 
-Run `boss dispatch $ARGUMENTS` and summarize the JSON result for the user (change, runner, agent, tab/pane, status). On error, report the error message from stderr.
+Run `boss dispatch $ARGUMENTS` and summarize the JSON result for the user (change, runner, agent, tab/pane, status, policy). On error, report the error message from stderr.

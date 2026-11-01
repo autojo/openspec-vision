@@ -1,7 +1,7 @@
 ---
 name: "Boss: Inbox"
 description: "List the durable wake items and acknowledge handled ones"
-allowed-tools: Bash
+allowed-tools: Bash(boss:*)
 category: "Boss"
 tags: ["boss", "workflow"]
 ---

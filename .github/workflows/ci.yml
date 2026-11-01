@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The runtime is a Bash program that must work on Linux and on macOS, where
+# /bin/bash is 3.2. The matrix therefore runs the full suite on both, and the
+# static checks (shellcheck) on Linux only - the runners do not ship a current
+# shellcheck for the macOS image, and the earlier steps add nothing there.
+
+jobs:
+  checks:
+    name: static checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck jq
+
+      - name: Bash syntax
+        run: |
+          for f in runtime/bin/* scripts/*.sh install.sh tests/run.sh; do
+            bash -n "$f"
+          done
+
+      - name: shellcheck
+        run: shellcheck -S warning runtime/bin/* scripts/*.sh install.sh tests/run.sh
+
+      - name: Runtime manifest
+        run: ./scripts/runtime-manifest.sh --verify
+
+      - name: Command wrappers are current
+        run: ./scripts/gen-commands.sh --check
+
+      - name: OpenSpec instruction files are current
+        run: ./scripts/check-generated.sh
+
+  tests:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report bash and tool versions
+        run: |
+          bash --version | head -1
+          jq --version
+          python3 --version
+
+      - name: Regression suite
+        run: ./tests/run.sh

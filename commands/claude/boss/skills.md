@@ -1,7 +1,7 @@
 ---
 name: "Boss: Skills"
 description: "Show where project and global agent skills live"
-allowed-tools: Bash
+allowed-tools: Bash(boss:*)
 category: "Boss"
 tags: ["boss", "workflow"]
 ---

@@ -1,7 +1,7 @@
 ---
 name: "Boss: Wait"
 description: "Make sure a waiter is armed for an apply so its next completion is reported"
-allowed-tools: Bash
+allowed-tools: Bash(boss:*)
 category: "Boss"
 tags: ["boss", "workflow"]
 ---

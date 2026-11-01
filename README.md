@@ -61,8 +61,10 @@ A single run installs, as regular copies and never as symbolic links:
 - the `vision` skill into `~/.config/opencode/skills/vision/` and
   `~/.claude/skills/vision/`, and the bundled `boss` skill into
   `~/.config/opencode/skills/boss/` and `~/.claude/skills/boss/`;
-- the bundled runtime (`boss`, `boss-lib.sh`, `boss-waiter`) from `runtime/bin/`
-  into `~/.local/bin`, with executable mode;
+- the bundled runtime from `runtime/bin/` into `~/.local/bin`, with executable
+  mode: `boss`, `boss-lib.sh`, `boss-waiter` and the command modules
+  `boss-apply.sh`, `boss-status.sh`, `boss-review.sh`, `boss-run.sh`,
+  `boss-doctor.sh`, `boss-mission.sh`;
 - the 17 opencode `boss-*.md` wrappers into `~/.config/opencode/commands/` and
   the 17 Claude wrappers into `~/.claude/commands/boss/`;
 - the Herdr integration for `opencode` and `claude`.
@@ -87,6 +89,13 @@ replace a running waiter.
 This is a copy-only install: after pulling an update, re-run `./install.sh` to
 refresh the installed files. No separate `boss-mode` installation is needed at
 runtime.
+
+The installer writes two markers next to the binaries: `.boss-runtime-commit`
+(the commit the copy came from) and `.boss-runtime-origin` (`vision-skill`).
+`boss --version` prints both, so an installed runtime can be traced back to its
+source. If another installer had written `~/.local/bin/boss` before, the run
+says so instead of replacing it silently - the older standalone checkout uses
+the same paths, and exactly one of the two may own them.
 
 Run `./install.sh --uninstall` to remove the installed skills, runtime binaries
 and command wrappers. Both owned skills are removed; a boss directory this
@@ -593,6 +602,75 @@ list likewise replaces the V1 default.
 private server per apply instead, add `--standalone` to that runner's explicit
 `args`; this is an explicit isolation option, not a default, because it starts
 and manages a separate server process.
+
+## Trust model and limits
+
+The apply agents are the only place where the runtime deliberately hands over
+control, so the boundaries are worth stating once:
+
+- **Broad permissions by design.** An apply tab runs its agent with
+  auto-approval (`OPENCODE_CONFIG_CONTENT` with allow for OpenCode V1,
+  `--auto` for V2, `--permission-mode bypassPermissions` for Claude). The
+  reason is the same in every case: a session that stops on a permission
+  prompt is a session nobody wakes up, and the whole loop assumes nobody is
+  watching.
+- **The charter is the boundary.** What an apply may do (branches, pushes,
+  destructive operations) is decided before the run in the mission charter and
+  enforced by the agent reading the skill. That is a prompt-level boundary, not
+  a sandbox.
+- **The deny list is defence in depth.** Every apply additionally gets a small
+  list of commands it never needs (`BOSS_POLICY_DENY_DEFAULT`: force-push,
+  mirror-push, `git push --delete`, `git filter-branch`, `git filter-repo`).
+  For a `claude` runner the dispatcher passes them as `--disallowedTools`. For
+  OpenCode the agent reads the deny rules from its own configuration, so
+  `boss doctor` and every dispatch result report a `policy` object: `enforced`,
+  `verified`, `missing`, `unavailable` or `off`. A runner can tune the list with
+  `deny = [...]` in its `[runners.<name>]` table; `deny = []` turns it off.
+  The check never blocks a dispatch - it makes a weak configuration visible.
+- **`boss review` runs the project's test command.** It executes what it
+  detects (`just test`, `npm test`, `pytest`, `make test`, or the `[tests]`
+  override). That is code from the target repository, run with the user's
+  rights, exactly as a developer would run it.
+- **Worktrees isolate, they do not sandbox.** Parallel applies run in their own
+  worktree and branch, which keeps two changes out of each other's index; it is
+  not a security boundary either.
+
+If you need a real boundary, run the apply agent in a container or on a
+separate station (see `vision/references/external-review.md` for the review
+pass on such a station).
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `runtime/bin/boss` | entry point: config, runner resolution, dispatch table |
+| `runtime/bin/boss-lib.sh` | shared helpers: paths, JSON, locks, policy, herdr |
+| `runtime/bin/boss-apply.sh` | dispatch, claim, session, worktrees, readiness |
+| `runtime/bin/boss-status.sh` | `status` |
+| `runtime/bin/boss-review.sh` | `review` (tasks, validate, tests, git, friction) |
+| `runtime/bin/boss-run.sh` | wait, inbox, journal, retrigger, finish, park, resume |
+| `runtime/bin/boss-doctor.sh` | `doctor` |
+| `runtime/bin/boss-mission.sh` | missions and `reconcile` |
+| `runtime/bin/boss-waiter` | detached watcher for one apply |
+| `scripts/gen-commands.sh` | generates the 34 command wrappers from `commands/commands.tsv` |
+| `scripts/runtime-manifest.sh` | records/verifies the vendored runtime hashes |
+| `scripts/check-generated.sh` | fails when the OpenSpec instruction files are stale |
+| `tests/run.sh` | regression suite (stub herdr/openspec/opencode, temp HOME) |
+
+Files under `.opencode/` and `.claude/commands/opsx/` are output of
+`openspec update`, not hand-written; `scripts/check-generated.sh` fails when
+they are stale. The `boss-*.md` wrappers are generated from
+`commands/commands.tsv` - edit the table, run `scripts/gen-commands.sh`, and
+check the result with `--check`.
+
+The runtime in `runtime/bin/` is a vendored snapshot (see `runtime/VENDOR.md`);
+`runtime/MANIFEST.sha256` records its hashes so a change is always deliberate.
+
+## Language
+
+Code, comments, messages and this README are English. The OpenSpec specs in
+`openspec/specs/` were written in German and are kept that way as the historical
+record; new or substantially rewritten specs should be English.
 
 ## Tests
 

@@ -354,6 +354,7 @@ base_config() {
 
 run_boss() {
   env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="${BOSS_CONFIG:-$CONFIG}" BOSS_STATE_DIR="$STATE" \
+  BOSS_LOG_FILE="$TMP/boss.log" \
     HERDR_ENV=1 HERDR_PANE_ID="${BOSS_TEST_PANE:-p-boss}" HERDR_WORKSPACE_ID="${BOSS_TEST_WORKSPACE:-ws-1}" \
     HERDR_SOCKET_PATH="$SOCKET" HERDR_LIVE_PANES="${HERDR_LIVE_PANES:-}" \
     HERDR_RENAME_LOG="${HERDR_RENAME_LOG:-}" \
@@ -378,6 +379,7 @@ run_boss() {
 
 run_boss_fail() {
   env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="${BOSS_CONFIG:-$CONFIG}" BOSS_STATE_DIR="$STATE" \
+  BOSS_LOG_FILE="$TMP/boss.log" \
     HERDR_ENV=1 HERDR_PANE_ID="${BOSS_TEST_PANE:-p-boss}" HERDR_WORKSPACE_ID="${BOSS_TEST_WORKSPACE:-ws-1}" \
     HERDR_SOCKET_PATH="$SOCKET" HERDR_LIVE_PANES="${HERDR_LIVE_PANES:-}" \
     HERDR_RENAME_LOG="${HERDR_RENAME_LOG:-}" \
@@ -403,6 +405,7 @@ run_boss_fail() {
 run_boss_state() {
   local st="$1"; shift
   env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="${BOSS_CONFIG:-$CONFIG}" BOSS_STATE_DIR="$st" \
+  BOSS_LOG_FILE="$TMP/boss.log" \
     HERDR_ENV=1 HERDR_PANE_ID="${BOSS_TEST_PANE:-p-boss}" HERDR_WORKSPACE_ID="${BOSS_TEST_WORKSPACE:-ws-1}" \
     HERDR_SOCKET_PATH="$SOCKET" HERDR_LIVE_PANES="${HERDR_LIVE_PANES:-}" \
     HERDR_RENAME_LOG="${HERDR_RENAME_LOG:-}" \
@@ -428,6 +431,7 @@ run_boss_state() {
 run_boss_fail_state() {
   local st="$1"; shift
   env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="${BOSS_CONFIG:-$CONFIG}" BOSS_STATE_DIR="$st" \
+  BOSS_LOG_FILE="$TMP/boss.log" \
     HERDR_ENV=1 HERDR_PANE_ID="${BOSS_TEST_PANE:-p-boss}" HERDR_WORKSPACE_ID="${BOSS_TEST_WORKSPACE:-ws-1}" \
     HERDR_SOCKET_PATH="$SOCKET" HERDR_LIVE_PANES="${HERDR_LIVE_PANES:-}" \
     HERDR_RENAME_LOG="${HERDR_RENAME_LOG:-}" \
@@ -452,6 +456,7 @@ run_boss_fail_state() {
 
 run_lib() {
   env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="${BOSS_CONFIG:-$CONFIG}" BOSS_STATE_DIR="$STATE" \
+  BOSS_LOG_FILE="$TMP/boss.log" \
     HERDR_INTEGRATION_STATUS="${HERDR_INTEGRATION_STATUS:-}" \
     HERDR_WORKTREE_MAP="${HERDR_WORKTREE_MAP:-$TMP/herdr-worktrees.jsonl}" \
     HERDR_WORKTREE_REMOVE_LOG="${HERDR_WORKTREE_REMOVE_LOG:-}" \
@@ -470,6 +475,7 @@ run_lib() {
 run_lib_state() {
   local st="$1"; shift
   env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="${BOSS_CONFIG:-$CONFIG}" BOSS_STATE_DIR="$st" \
+  BOSS_LOG_FILE="$TMP/boss.log" \
     HERDR_AGENTS_JSON="${HERDR_AGENTS_JSON:-}" \
     HERDR_INTEGRATION_STATUS="${HERDR_INTEGRATION_STATUS:-}" \
     HERDR_WORKTREE_MAP="${HERDR_WORKTREE_MAP:-$TMP/herdr-worktrees.jsonl}" \
@@ -786,12 +792,14 @@ NOWS="$TMP/no-ws-state"
 mkdir -p "$NOWS"
 sf="$NOWS/applies/$(run_lib sha1_hex "$P")-no-ws.json"
 err="$(env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="$CONFIG" BOSS_STATE_DIR="$NOWS" \
+BOSS_LOG_FILE="$TMP/boss.log" \
   HERDR_ENV=1 HERDR_PANE_ID=p-boss HERDR_WORKSPACE_ID="" \
   HERDR_SOCKET_PATH="$SOCKET" HERDR_PANES_JSON="$PANES_MATCH" \
   bash "$ROOT/runtime/bin/boss" claim 2>&1)"
 check_contains "claim: missing workspace fails" "HERDR_WORKSPACE_ID" "$err"
 if [ -f "$NOWS/bosses/ws-1.json" ]; then bad "claim: missing workspace wrote registry"; else ok; fi
 err="$(env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="$CONFIG" BOSS_STATE_DIR="$NOWS" \
+BOSS_LOG_FILE="$TMP/boss.log" \
   HERDR_ENV=1 HERDR_PANE_ID=p-boss HERDR_WORKSPACE_ID="" \
   HERDR_SOCKET_PATH="$SOCKET" HERDR_PANES_JSON="$PANES_MATCH" \
   bash "$ROOT/runtime/bin/boss" dispatch no-ws --project "$P" 2>&1)"
@@ -1372,8 +1380,11 @@ check_eq "opencode version: v1" "1" \
   "$(OPENCODE_STUB_VERSION='opencode v1.18.4' run_lib opencode_major_version)"
 check_eq "opencode version: unknown" "unknown" \
   "$(OPENCODE_STUB_VERSION='opencode not-a-version' run_lib opencode_major_version 2>/dev/null)"
-warn="$(OPENCODE_STUB_VERSION='opencode not-a-version' run_lib opencode_major_version 2>&1 >/dev/null)"
-check_contains "opencode version: unknown warns" "cannot determine the OpenCode major version" "$warn"
+# The runtime logs to BOSS_LOG_FILE (the harness sets it), so the warning is
+# asserted on the log, not on stderr.
+: >"$TMP/boss.log"
+OPENCODE_STUB_VERSION='opencode not-a-version' run_lib opencode_major_version >/dev/null 2>&1
+check_contains "opencode version: unknown warns" "cannot determine the OpenCode major version" "$(cat "$TMP/boss.log")"
 
 # 29. Runner defaults: V2 adds --auto and no inline env; V1 keeps the inline
 # default. Explicit args and env always win (the five precedence cases).
@@ -1584,7 +1595,7 @@ doctor="$(OPENCODE_STUB_VERSION='opencode v1.18.4' OPENCODE_CONFIG_CONTENT='{"pe
   run_boss_state "$D2" doctor --project "$P" --json 2>/dev/null)"
 check_eq "doctor v1: env allow ok" "ok" \
   "$(printf '%s' "$doctor" | jq -r '.checks[] | select(.id=="boss_permission") | .status')"
-doctor="$(OPENCODE_STUB_VERSION='opencode v1.18.4' OPENCODE_CONFIG_CONTENT= \
+doctor="$(OPENCODE_STUB_VERSION='opencode v1.18.4' OPENCODE_CONFIG_CONTENT="" \
   run_boss_state "$D2" doctor --project "$P" --json 2>/dev/null)"
 check_eq "doctor v1: missing env warns" "warn" \
   "$(printf '%s' "$doctor" | jq -r '.checks[] | select(.id=="boss_permission") | .status')"
@@ -1974,7 +1985,7 @@ check_eq "session: mismatch code" "caller_session_mismatch" "$(printf '%s' "$out
 check_eq "session: mismatch flag" "false" "$(printf '%s' "$out" | jq -r '.session_match')"
 out="$(HERDR_ENV=1 HERDR_PANE_ID=p-boss HERDR_WORKSPACE_ID=ws-1 \
   HERDR_PANES_JSON="$PANES_MATCH" HERDR_AGENTS_JSON="$AG_SESSION" \
-  OPENCODE_SESSION_ID= run_lib boss_caller_identity_json "")"
+  OPENCODE_SESSION_ID="" run_lib boss_caller_identity_json "")"
 check_eq "session: no session fallback" "ok" "$(printf '%s' "$out" | jq -r '.status')"
 out="$(HERDR_ENV=1 HERDR_PANE_ID=p-boss HERDR_WORKSPACE_ID=ws-1 \
   HERDR_PANES_JSON="$PANES_MATCH" HERDR_AGENTS_JSON="$AG_SESSION" \
@@ -2024,12 +2035,14 @@ jq -n --arg p "$P_A7" '{change:"lost-check",project:$p,pane_id:"p-live",tab_id:"
 A7EV="$A7ST/cycles/$(run_lib sha1_hex "$P_A7")-lost-check.events.jsonl"
 mkdir -p "$A7ST/cycles"
 env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="$CONFIG" BOSS_STATE_DIR="$A7ST" \
+BOSS_LOG_FILE="$TMP/boss.log" \
   HERDR_ENV=1 HERDR_PANE_ID=p-live HERDR_WORKSPACE_ID=ws-1 HERDR_LIVE_PANES=p-live \
   HERDR_AGENTS_JSON='[{"name":"apply-lost-check","pane_id":"p-live","workspace_id":"ws-1"}]' \
   HERDR_AGENT_WAIT_FAIL=1 timeout 2 bash "$ROOT/runtime/bin/boss-waiter" \
   "$A7ST/applies/$(run_lib sha1_hex "$P_A7")-lost-check.json" >/dev/null 2>&1 || true
 check_not_contains "liveness: alive no lost" '"event":"lost"' "$(cat "$A7EV" 2>/dev/null)"
 env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="$CONFIG" BOSS_STATE_DIR="$A7ST" \
+BOSS_LOG_FILE="$TMP/boss.log" \
   HERDR_ENV=1 HERDR_PANE_ID=p-live HERDR_WORKSPACE_ID=ws-1 HERDR_LIVE_PANES= \
   HERDR_AGENTS_JSON='[]' HERDR_AGENT_WAIT_FAIL=1 timeout 2 bash "$ROOT/runtime/bin/boss-waiter" \
   "$A7ST/applies/$(run_lib sha1_hex "$P_A7")-lost-check.json" >/dev/null 2>&1 || true
@@ -2085,6 +2098,7 @@ check_eq "interrupt: retrigger clears" "false" \
 # A waiter that sees the interrupted flag reports 'interrupted', not 'idle'.
 jq '.interrupted = true | .interrupted_at = "2026-01-01T00:00:00+0000"' "$ISTATE" >"$ISTATE.tmp" && mv "$ISTATE.tmp" "$ISTATE"
 env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="$CONFIG" BOSS_STATE_DIR="$IST" \
+BOSS_LOG_FILE="$TMP/boss.log" \
   HERDR_ENV=1 HERDR_PANE_ID=p-int HERDR_WORKSPACE_ID=ws-1 HERDR_LIVE_PANES=p-int \
   HERDR_AGENTS_JSON='[{"name":"apply-interrupt-me","pane_id":"p-int","workspace_id":"ws-1"}]' \
   timeout 2 bash "$ROOT/runtime/bin/boss-waiter" "$ISTATE" >/dev/null 2>&1 || true
@@ -2335,7 +2349,7 @@ make_change "$P_WT" wt-change '- [ ] 1.1 Code.'
 printf 'code\n' >"$P_WT/code.txt"
 git -C "$P_WT" add code.txt
 git -C "$P_WT" commit -qm "code"
-base_before="$(git -C "$P_WT" rev-parse HEAD)"
+_base_before="$(git -C "$P_WT" rev-parse HEAD)"
 out="$(plan_commit "$P_WT" wt-change)"
 check_eq "plan commit: status" "committed" "$(printf '%s' "$out" | jq -r '.status')"
 check_contains "plan commit: names plan path" "openspec/changes/wt-change/tasks.md" \
@@ -3175,6 +3189,104 @@ if [ ! -e "$IU/.local/bin/boss" ]; then ok; else bad "installer uninstall: runti
 if [ -d "$IU/.config/openspec-boss" ] && [ -d "$IU/.local/state/openspec-boss" ]; then ok; else
   bad "installer uninstall: removed config or state"
 fi
+
+# The installer stamps where the runtime copy came from: every module is
+# installed, 'boss --version' of the installed copy names that stamp, and the
+# origin marker lets the older boss-mode installer refuse to overwrite it.
+IR="$TMP/install-runtime-home"
+mkdir -p "$IR"
+if out="$(install_in "$IR")"; then ok; else bad "installer runtime: run failed: $out"; fi
+check_contains "installer runtime: install reported" "installed the boss runtime into" "$out"
+for name in boss boss-lib.sh boss-waiter boss-apply.sh boss-status.sh \
+  boss-review.sh boss-run.sh boss-doctor.sh boss-mission.sh; do
+  if [ -x "$IR/.local/bin/$name" ] && [ ! -L "$IR/.local/bin/$name" ]; then ok; else
+    bad "installer runtime: $name is missing, not executable or a symlink"
+  fi
+done
+check_eq "installer runtime: origin marker" "vision-skill" \
+  "$(cat "$IR/.local/bin/.boss-runtime-origin" 2>/dev/null)"
+stamp="$(cat "$IR/.local/bin/.boss-runtime-commit" 2>/dev/null || true)"
+if printf '%s' "$stamp" | grep -Eq '^[0-9a-f]{7,}(-dirty)?$'; then ok; else
+  bad "installer runtime: commit stamp is unexpected: '$stamp'"
+fi
+out="$("$IR/.local/bin/boss" --version 2>/dev/null | tr -d '\r')"
+check_contains "installer runtime: --version names the stamp" "($stamp)" "$out"
+
+# A runtime left by another installer is reported, never silently replaced.
+IP="$TMP/install-prev-home"
+mkdir -p "$IP/.local/bin"
+printf '#!/bin/sh\n' >"$IP/.local/bin/boss"
+chmod +x "$IP/.local/bin/boss"
+if out="$(install_in "$IP")"; then ok; else bad "installer previous runtime: run failed: $out"; fi
+check_contains "installer previous runtime: unmarked copy reported" \
+  "an installer that left no origin marker" "$out"
+printf 'openspec-boss\n' >"$IP/.local/bin/.boss-runtime-origin"
+if out="$(install_in "$IP")"; then ok; else bad "installer previous runtime: rerun failed: $out"; fi
+check_contains "installer previous runtime: foreign origin reported" \
+  "previous origin: openspec-boss" "$out"
+if out="$(install_in "$IP" --uninstall)"; then ok; else bad "installer previous runtime: uninstall failed: $out"; fi
+if [ ! -e "$IP/.local/bin/.boss-runtime-commit" ] && [ ! -e "$IP/.local/bin/.boss-runtime-origin" ]; then
+  ok
+else
+  bad "installer previous runtime: uninstall left the runtime markers"
+fi
+
+# ------------------------------------------------------- runtime hygiene ---
+# The version is part of the contract: an installed copy must name its source.
+out="$(run_boss --version 2>/dev/null)"
+check_contains "runtime: --version names the version" "boss " "$out"
+
+# A usage error must stay valid JSON even when the argument carries a quote.
+out="$(run_boss status '--x"oops' 2>&1 >/dev/null)"
+if printf '%s' "$out" | jq -e . >/dev/null 2>&1; then ok; else bad "usage error is not valid JSON: $out"; fi
+check_eq "usage error: code survives quoting" "usage" "$(printf '%s' "$out" | jq -r '.error')"
+
+# The vendored runtime still matches its recorded hashes.
+if "$ROOT/scripts/runtime-manifest.sh" >/dev/null 2>&1; then ok; else bad "runtime differs from runtime/MANIFEST.sha256"; fi
+
+# The 34 command wrappers are generated from commands/commands.tsv.
+if "$ROOT/scripts/gen-commands.sh" --check >/dev/null 2>&1; then ok; else bad "command wrappers are stale"; fi
+
+# Locking: a lock held by a living process is not taken, and a released lock is.
+LD="$TMP/locktest"; mkdir -p "$LD"
+bash -c '. "$1"; lock_acquire "$2" 1000; sleep 3' _ "$ROOT/runtime/bin/boss-lib.sh" "$LD/x" &
+locker=$!
+sleep 0.5
+if bash -c '. "$1"; lock_acquire "$2" 200' _ "$ROOT/runtime/bin/boss-lib.sh" "$LD/x" 2>/dev/null; then
+  bad "lock: a held lock was taken"
+else
+  ok
+fi
+kill "$locker" 2>/dev/null; wait "$locker" 2>/dev/null
+if bash -c '. "$1"; lock_acquire "$2" 1000 && lock_release "$2"' _ "$ROOT/runtime/bin/boss-lib.sh" "$LD/x" 2>/dev/null; then
+  ok
+else
+  bad "lock: a released lock could not be taken"
+fi
+
+# A config that cannot be written must fail loudly instead of reporting success.
+if [ "$(id -u)" -ne 0 ]; then
+  RO="$TMP/readonly"; mkdir -p "$RO"; chmod 500 "$RO"
+  out="$(BOSS_CONFIG="$RO/sub/boss.toml" run_boss review demo 2>&1)"
+  check_contains "config: unwritable path is reported" "config_write" "$out"
+  chmod 700 "$RO"
+fi
+
+# The deny policy: a claude runner carries --disallowedTools, and the check
+# reports it as enforced.
+args_out="$(. "$ROOT/runtime/bin/boss-lib.sh"; runner_args_of '{"name":"c","kind":"claude","args":["--permission-mode","bypassPermissions"],"apply":"x"}')"
+check_contains "policy: --disallowedTools is passed" "--disallowedTools" "$args_out"
+check_contains "policy: force push is denied" "Bash(git push --force:*)" "$args_out"
+policy_out="$(. "$ROOT/runtime/bin/boss-lib.sh"; policy_check '{"name":"c","kind":"claude","args":[],"apply":"x"}' "$TMP")"
+check_eq "policy: claude runner is enforced" "enforced" "$(printf '%s' "$policy_out" | jq -r .status)"
+policy_out="$(. "$ROOT/runtime/bin/boss-lib.sh"; policy_check '{"name":"c","kind":"claude","args":[],"apply":"x","deny":[]}' "$TMP")"
+check_eq "policy: empty deny list is off" "off" "$(printf '%s' "$policy_out" | jq -r .status)"
+
+# The doctor reports the policy of the default runner.
+PH="$TMP/hygiene"; mkdir -p "$PH/project/openspec/changes" "$PH/state"
+printf 'default = "c"\n\n[runners.c]\nkind = "claude"\nargs = []\napply = "/opsx:apply {change}"\n' >"$PH/boss.toml"
+out="$(BOSS_CONFIG="$PH/boss.toml" run_boss_state "$PH/state" doctor --project "$PH/project" --json 2>/dev/null)"
+check_eq "doctor: policy check runs" "ok" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="policy") | .status')"
 
 # --------------------------------------------------------------- result ---
 

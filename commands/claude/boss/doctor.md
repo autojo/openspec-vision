@@ -1,7 +1,7 @@
 ---
 name: "Boss: Doctor"
 description: "Preflight the permissions and prerequisites of a run (read-only; --fix for safe repairs)"
-allowed-tools: Bash
+allowed-tools: Bash(boss:*)
 category: "Boss"
 tags: ["boss", "workflow"]
 ---

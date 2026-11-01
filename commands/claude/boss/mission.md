@@ -1,7 +1,7 @@
 ---
 name: "Boss: Mission"
 description: "Plan a large task as an ordered list of changes (start/status/next)"
-allowed-tools: Bash
+allowed-tools: Bash(boss:*)
 category: "Boss"
 tags: ["boss", "workflow"]
 ---

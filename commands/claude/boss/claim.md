@@ -1,7 +1,7 @@
 ---
 name: "Boss: Claim"
 description: "Claim this Herdr workspace as boss (or release it)"
-allowed-tools: Bash
+allowed-tools: Bash(boss:*)
 category: "Boss"
 tags: ["boss", "workflow"]
 ---

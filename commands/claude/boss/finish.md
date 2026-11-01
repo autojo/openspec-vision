@@ -1,7 +1,7 @@
 ---
 name: "Boss: Finish"
 description: "Close the apply tab and clean up (requires archive/sync)"
-allowed-tools: Bash
+allowed-tools: Bash(boss:*)
 category: "Boss"
 tags: ["boss", "workflow"]
 ---
