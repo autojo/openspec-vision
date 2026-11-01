@@ -8,7 +8,9 @@
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
-TMP="$(mktemp -d)"
+# Physical TMP: the runtime keys state files on the canonical project path, and
+# macOS TMPDIR lies under /var, which is a symlink to /private/var.
+TMP="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'rm -rf "$TMP"' EXIT
 
 BIN="$TMP/bin"
@@ -986,6 +988,18 @@ check_eq "dispatch same: no cross flag" "false" "$(jq -r '.boss_cross_workspace'
 check_eq "dispatch same: no cross-project flag" "false" "$(jq -r '.boss_cross_project' "$sf")"
 check_eq "dispatch same: wake target workspace" "ws-1" "$(printf '%s' "$out" | jq -r '.wake_target.workspace')"
 check_eq "dispatch same: no warnings" "0" "$(printf '%s' "$out" | jq -r '.warnings | length')"
+
+# 21b. A project opened through a symlink is the same project. A pane reports
+# the directory the user opened, the calling process sees the physical path -
+# on macOS every TMPDIR is such a case (/var and /tmp are symlinks).
+SYM_REAL="$TMP/project-symlink-real"
+make_project "$SYM_REAL"
+make_change "$SYM_REAL" symlinked '- [ ] 1.1 Code.'
+ln -s "$SYM_REAL" "$TMP/project-symlink"
+out="$(cd "$TMP/project-symlink" && run_boss dispatch symlinked --project "$TMP/project-symlink")"
+check_eq "symlinked project: status" "started" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "symlinked project: state keys on the real path" "1" \
+  "$([ -f "$STATE/applies/$(run_lib sha1_hex "$SYM_REAL")-symlinked.json" ] && printf 1 || printf 0)"
 
 P="$TMP/project-cross-project"
 make_project "$P"

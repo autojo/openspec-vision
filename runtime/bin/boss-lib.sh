@@ -889,9 +889,15 @@ boss_pane_meta() {
 }
 
 # boss_cwd_related <a> <b> -- 0 when the paths are equal or one contains the other.
+# Both sides are resolved first: a pane reports the directory as it was opened
+# (often through a symlink - macOS has /tmp and /var as links), while the calling
+# process sees the physical path via 'pwd -P'. Comparing the raw strings would
+# report a caller identity mismatch for the same directory.
 boss_cwd_related() {
   local a="${1:-}" b="${2:-}"
   [ -n "$a" ] && [ -n "$b" ] || return 1
+  a="$(canonical_path "$a")"
+  b="$(canonical_path "$b")"
   [ "$a" = "$b" ] && return 0
   case "$a/" in "$b"/*) return 0 ;; esac
   case "$b/" in "$a"/*) return 0 ;; esac

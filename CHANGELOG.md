@@ -13,6 +13,12 @@
   dummy waiter with `exec -a` (bash 4). It now uses the runtime's
   `run_with_deadline` through a `deadline` stub and a real script named
   `boss-waiter`, so the checks run on bash 3.2 as well.
+- A project reached through a symlink was treated as a different project: the
+  caller identity check compared the path a pane reports (as opened) with the
+  physical path the process sees, and refused with `caller_pane_mismatch`. On
+  macOS every TMPDIR is such a case, because `/var` and `/tmp` are symlinks.
+  `boss_cwd_related` resolves both sides now, and the suite creates its TMP
+  physically so its state-file arithmetic matches the runtime.
 
 ## 1.1.0
 

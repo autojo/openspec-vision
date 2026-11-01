@@ -29,6 +29,8 @@ added or changed here and has no upstream counterpart:
   `--disallowedTools` for claude runners)
 - `run_with_deadline` in `bin/boss-lib.sh`, so the integration test runs on
   macOS instead of being skipped for the missing `timeout(1)`
+- `boss_cwd_related` compares physical paths, so a project opened through a
+  symlink (macOS `/tmp`, `/var`) is not reported as a caller identity mismatch
 
 ## Updating
 

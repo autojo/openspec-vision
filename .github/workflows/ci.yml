@@ -68,13 +68,14 @@ jobs:
             grep -E '^FAIL: ' "$RUNNER_TEMP/tests.log" | head -25 | while IFS= read -r line; do
               printf '::error::%s\n' "$line"
             done
-            # The lines before a failure carry the stderr of the command that
-            # produced nothing, which is what the check reports.
-            grep -n '^FAIL: ' "$RUNNER_TEMP/tests.log" | head -6 | cut -d: -f1 | while IFS= read -r n; do
+            # The lines before the first failure carry the stderr of the command
+            # that produced nothing, which is what the check reports.
+            n="$(grep -n '^FAIL: ' "$RUNNER_TEMP/tests.log" | head -1 | cut -d: -f1)"
+            if [ -n "$n" ]; then
               start=$((n > 12 ? n - 12 : 1))
               sed -n "${start},${n}p" "$RUNNER_TEMP/tests.log" | while IFS= read -r ctx; do
                 printf '::notice::ctx: %s\n' "$ctx"
               done
-            done
+            fi
           fi
           exit "$rc"
