@@ -57,4 +57,17 @@ jobs:
           python3 --version
 
       - name: Regression suite
-        run: ./tests/run.sh
+        # The suite prints one 'FAIL: <name>' line per failed check. Surface
+        # them as annotations, so the failing checks are visible on the run page
+        # without downloading the log.
+        run: |
+          set +e
+          ./tests/run.sh 2>&1 | tee "$RUNNER_TEMP/tests.log"
+          rc="${PIPESTATUS[0]}"
+          if [ "$rc" -ne 0 ]; then
+            grep -E '^FAIL: ' "$RUNNER_TEMP/tests.log" | head -25 | while IFS= read -r line; do
+              printf '::error::%s\n' "$line"
+            done
+            tail -40 "$RUNNER_TEMP/tests.log"
+          fi
+          exit "$rc"
