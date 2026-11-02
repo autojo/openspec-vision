@@ -102,13 +102,18 @@ A runner with `start = "acp"` (for example Goose) is driven by the bundled
 supervisor detached and creates the tab only as a transcript view; never send
 keystrokes to it, never read its pane for state, and do not call
 `herdr agent wait` for that apply. `boss status` reports the ACP phase
-(`working`, `blocked`, `idle`), model, mode and last stop reason.
+(`working`, `blocked`, `idle`), the runner, model, mode and last stop reason,
+plus `acp.last_update` (the last message text or tool activity, not a streamed
+token) and `acp.stalled`. The aggregate `boss status` uses the same liveness
+rule as the per-apply view (the supervisor pid), so a live supervisor is never
+printed as `waiter: DEAD`.
 
 Permissions follow the runner policy. `policy = "ask"` leaves an unmatched
 request pending and wakes you with `blocked`; every pending request is queued by
-tool-call id, so `boss status` may list several. Answer one with
-`boss answer <change> <option> --tool-call <id>` (the option ids and ids are
-shown by `boss status`), or cancel every queued request with
+tool-call id, so `boss status` may list several. One blocked transition wakes
+you once, and that wake names the number of pending requests and their ids.
+Answer one with `boss answer <change> <option> --tool-call <id>` (the option
+ids and ids are shown by `boss status`), or cancel every queued request with
 `boss interrupt <change>`. With exactly one pending request the option alone is
 enough; several without an id are refused as `ambiguous_pending`. An applied
 `deny` rule rejects a request before the tool runs.
@@ -128,6 +133,14 @@ profile; a resume reuses it. Set `isolate = false` only when you deliberately
 want the user's global profile. `boss doctor` reports the isolation state and
 the effective store, and reports `weakened` when a non-isolated global store
 always allows `shell`, `write` or `edit`.
+
+A turn is bounded. `BOSS_ACP_TURN_TIMEOUT_S` (default 7200 s) ends a turn that
+never answers: it records `turn_timeout`, sends `session/cancel` and wakes you.
+`BOSS_ACP_STALL_S` (default 1800 s) wakes you once with `stalled` and the last
+activity when a `working` turn makes no transcript progress; `acp.stalled` is
+set, and the flag clears on the next transcript entry. A `blocked` turn is
+never a stall. Both values are above the longest expected command; raise them
+for a longer suite instead of disabling them.
 
 `boss interrupt` uses `session/cancel`, never keys. `boss finish` closes the ACP
 session; `boss resume` calls `session/load` when the agent advertises it, and an

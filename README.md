@@ -706,8 +706,23 @@ sends the apply prompt over ACP; the prompt runs
 `openspec instructions apply --change <change> --json` and never depends on a
 slash command. `session/update` notifications are appended to a JSONL
 transcript and shown in the apply tab. `boss status` reads the state file and
-the transcript tail (last update, model, mode, usage, pending permission), not
-the pane.
+the transcript tail, not the pane.
+
+The status JSON names what drives the session and what it waits for:
+
+| Field | Meaning |
+| --- | --- |
+| `runner` | the configured runner (`goose`); the aggregate row shows it too |
+| `acp.model`, `acp.mode` | the model and mode applied to the session |
+| `acp.last_update` | the last message text or tool activity (at most 200 characters). Streamed chunks are joined per message id; usage-only and whitespace-only chunks do not overwrite it |
+| `pending_permissions` | every pending request with tool-call id, command and options |
+| `pending_permission` | compatibility alias for the first entry; `null` when nothing is pending |
+| `acp.stalled` | `true` while a working turn has made no progress and the boss has been woken about it |
+
+The aggregate `boss status` derives liveness from the same process as the
+per-apply view: for an ACP apply that is the supervisor pid, so a live
+supervisor is never printed as `waiter: DEAD`. The aggregate row also names the
+pending count and the pending tool-call ids.
 
 Permissions are a policy, not a prompt: a command matching `deny` is rejected
 before it runs, a read-only tool or an allowed request proceeds, and with
@@ -727,6 +742,33 @@ boss interrupt <change>                             # cancel every pending reque
 With exactly one pending request the option alone is still enough; with more,
 an answer without a tool-call id is refused with `ambiguous_pending` and names
 the ids.
+
+One blocked transition wakes the boss once, however many requests arrive
+before the first answer: the wake names the number of pending requests and their
+ids, and the flag clears when the last request is answered. A new blocked
+transition wakes again.
+
+### Turn bounds
+
+An ACP turn is bounded twice, and both bounds are configurable:
+
+- `BOSS_ACP_TURN_TIMEOUT_S` (default `7200`, two hours) is the longest a turn
+  may wait for the prompt response. On expiry the supervisor sends
+  `session/cancel`, records `turn_timeout` as the stop reason, ends the turn and
+  wakes the boss. `0` disables the timeout explicitly.
+- `BOSS_ACP_STALL_S` (default `1800`, thirty minutes) is the longest a `working`
+  turn may go without transcript progress. The supervisor checks every
+  `min(30 s, BOSS_ACP_STALL_S / 2)`; when the interval passes it wakes the boss
+  once with state `stalled` and the last activity, and sets `acp.stalled`. Any
+  new transcript entry clears the flag and restarts the timer, so a turn that
+  recovers can be reported as stalled again later. A `blocked` turn waits for
+  the Explorer and is never a stall. `0` disables the check.
+
+The defaults sit above the longest expected command (the full suite takes about
+eight minutes) so a normal `./tests/run.sh` is not a stall. A tool call that
+keeps emitting `tool_call_update` is progress; a silent tool call is not, which
+is why the stall interval, not the tool-execution time, is the measure. Raise
+both values for a project with a longer run rather than disabling them.
 
 An automatic allow always selects the agent's `allow_once` option and never
 `allow_always`, so it cannot create a persistent agent-level grant. If the agent

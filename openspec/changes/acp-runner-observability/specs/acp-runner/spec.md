@@ -113,9 +113,8 @@ configurable and SHALL default above the longest expected command.
 - **WHEN** the agent emits a message or tool update
 - **THEN** the stall timer restarts from that update
 
-#### Scenario: Long command is not a stall
+#### Scenario: Long command with progress is not a stall
 
-- **WHEN** a tool call is running longer than the stall interval but the turn
-  timeout has not expired
-- **THEN** the runtime does not report a stall solely because the command is
-  still running
+- **WHEN** a tool call runs longer than the stall interval and emits progress
+  updates
+- **THEN** the runtime does not report a stall

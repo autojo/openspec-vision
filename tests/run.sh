@@ -471,8 +471,54 @@ def main():
             prompt = req_id
             prompt_kind = MODE
             pending.clear()
+            if MODE == "stream":
+                # One message streamed in chunks, then a whitespace-only chunk
+                # (another message id) and a usage update: last_update must
+                # describe the message, not the last token.
+                for chunk in ("Refactor the", " status JSON", " now."):
+                    note("agent_message_chunk", {"messageId": "m1",
+                                                 "content": {"type": "text", "text": chunk}})
+                note("agent_message_chunk", {"messageId": "m2",
+                                             "content": {"type": "text", "text": "  \n "}})
+                note("usage_update", {"usage": {"inputTokens": 7, "outputTokens": 9}})
+                result(req_id, {"stopReason": "end_turn", "usage": {"inputTokens": 7}})
+                prompt = None
+                prompt_kind = None
+                continue
             emit_updates()
-            if MODE in ("cancel", "cancel_unconfirmed", "slow"):
+            if MODE == "progress":
+                # A tool call that runs longer than a short stall interval but
+                # keeps emitting updates: progress, not a stall.
+                import threading
+                import time as _time
+
+                def progress_ticker():
+                    for _ in range(6):
+                        _time.sleep(0.4)
+                        note("tool_call_update", {"toolCallId": "tc1", "title": "shell",
+                                                  "status": "in_progress"})
+                    _time.sleep(0.2)
+                    note("agent_message_chunk", {"messageId": "m6",
+                                                 "content": {"type": "text",
+                                                             "text": "done"}})
+                    result(req_id, {"stopReason": "end_turn", "usage": {"inputTokens": 4}})
+
+                threading.Thread(target=progress_ticker, daemon=True).start()
+            elif MODE == "stall_resume":
+                # Silence past the stall interval, then new activity clears it.
+                import threading
+                import time as _time
+
+                def resume_ticker():
+                    _time.sleep(3.0)
+                    note("agent_message_chunk", {"messageId": "m5",
+                                                 "content": {"type": "text",
+                                                             "text": "back again"}})
+                    _time.sleep(0.2)
+                    result(req_id, {"stopReason": "end_turn", "usage": {"inputTokens": 5}})
+
+                threading.Thread(target=resume_ticker, daemon=True).start()
+            elif MODE in ("cancel", "cancel_unconfirmed", "slow"):
                 pass
             elif MODE == "ask_two":
                 ask_permission("alpha", "first", tool_id="tc-a", req_id=9100)
@@ -3805,8 +3851,11 @@ fi
 # supervisor cannot consume another scenario's slot.
 
 # A minimal user Goose profile: the per-apply profile links these read-through,
-# while its permission store stays boss-owned.
+# while its permission store stays boss-owned. Both XDG roots are pinned here:
+# a suite started from inside an ACP apply inherits that apply's profile roots
+# and would otherwise link the profile into itself.
 export XDG_CONFIG_HOME="$TMP/.config"
+export XDG_DATA_HOME="$TMP/.local/share"
 mkdir -p "$TMP/.config/goose" "$TMP/.local/share/goose/apps"
 printf 'provider: fake\n' >"$TMP/.config/goose/config.yaml"
 printf 'secret: fake\n' >"$TMP/.config/goose/secrets.yaml"
@@ -4451,6 +4500,173 @@ if [ -n "$E2E_SOCKET" ] && [ -S "$E2E_SOCKET" ]; then bad "acp e2e: socket after
 # No ACP interrupt may send keystrokes: only the display tail is ever typed.
 check_not_contains "acp e2e: no interrupt keystrokes" "esc" "$(cat "$KEYS_LOG")"
 
+
+# 73. Status names the runner and the aggregate view uses the same liveness
+# rule as the per-apply view: a live supervisor is never reported dead.
+make_change "$AP" acp-observability '- [ ] 1.1 Do the work.'
+AS13="$TMP/acp-state-13"; mkdir -p "$AS13"
+S13="$(acp_state "$AS13" "$AP" acp-observability)"
+FAKE_ACP_MODE=allow acp_boss "$AS13" dispatch acp-observability --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S13" || bad "acp observability: no stop reason"
+out="$(acp_boss "$AS13" status acp-observability --project acp-test --json 2>/dev/null)"
+check_eq "acp status: runner" "goose" "$(printf '%s' "$out" | jq -r '.runner')"
+check_eq "acp status: model" "model-a" "$(printf '%s' "$out" | jq -r '.acp.model')"
+check_eq "acp status: mode" "smart_approve" "$(printf '%s' "$out" | jq -r '.acp.mode')"
+check_eq "acp status: no pending list" "0" "$(printf '%s' "$out" | jq -r '.pending_permissions | length')"
+check_eq "acp status: no pending alias" "null" "$(printf '%s' "$out" | jq -r '.pending_permission')"
+check_eq "acp status: not stalled" "false" "$(printf '%s' "$out" | jq -r '.acp_stalled')"
+agg="$(acp_boss "$AS13" status --json 2>/dev/null)"
+check_eq "acp aggregate: waiter alive" "true" \
+  "$(printf '%s' "$agg" | jq -r '.[] | select(.change=="acp-observability") | .waiter_alive')"
+check_eq "acp aggregate: waiter pid is the supervisor" "$(jq -r '.acp.supervisor_pid' "$S13")" \
+  "$(printf '%s' "$agg" | jq -r '.[] | select(.change=="acp-observability") | .waiter_pid')"
+check_eq "acp aggregate: runner" "goose" \
+  "$(printf '%s' "$agg" | jq -r '.[] | select(.change=="acp-observability") | .runner')"
+agg_text="$(acp_boss "$AS13" status 2>/dev/null)"
+check_contains "acp aggregate: alive in text" "waiter: alive (pid $(jq -r '.acp.supervisor_pid' "$S13"))" "$agg_text"
+check_contains "acp aggregate: names the runner" "goose" "$agg_text"
+check_not_contains "acp aggregate: never reports a live supervisor as dead" "waiter: DEAD" "$agg_text"
+acp_boss "$AS13" finish acp-observability --project acp-test >/dev/null 2>&1
+
+# 74. last_update describes the last message, not its final token: streamed
+# chunks are joined, a whitespace-only chunk and a usage update are ignored.
+make_change "$AP" acp-stream '- [ ] 1.1 Do the work.'
+AS14="$TMP/acp-state-14"; mkdir -p "$AS14"
+S14="$(acp_state "$AS14" "$AP" acp-stream)"
+FAKE_ACP_MODE=stream acp_boss "$AS14" dispatch acp-stream --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S14" || bad "acp stream: no stop reason"
+out="$(acp_boss "$AS14" status acp-stream --project acp-test --json 2>/dev/null)"
+check_eq "acp last update: joined message" "Refactor the status JSON now." \
+  "$(printf '%s' "$out" | jq -r '.acp_last_update')"
+check_eq "acp last update: state field" "Refactor the status JSON now." \
+  "$(printf '%s' "$out" | jq -r '.acp.last_update')"
+check_contains "acp last update: text view" "last update: Refactor the status JSON now." \
+  "$(acp_boss "$AS14" status acp-stream --project acp-test 2>/dev/null)"
+acp_boss "$AS14" finish acp-stream --project acp-test >/dev/null 2>&1
+
+# 75. The turn timeout is bounded by default and records turn_timeout.
+defaults="$(bash -c '. "$1/runtime/bin/boss-lib.sh"; printf "%s %s" "$BOSS_ACP_TURN_TIMEOUT_S" "$BOSS_ACP_STALL_S"' _ "$ROOT")"
+check_eq "acp defaults: turn timeout and stall" "7200 1800" "$defaults"
+make_change "$AP" acp-turn-timeout '- [ ] 1.1 Do the work.'
+AS15="$TMP/acp-state-15"; mkdir -p "$AS15"
+S15="$(acp_state "$AS15" "$AP" acp-turn-timeout)"
+EV15="$(acp_events_file "$AS15" "$AP" acp-turn-timeout)"
+FAKE_ACP_MODE=slow BOSS_ACP_TURN_TIMEOUT_S=1 BOSS_ACP_STALL_S=0 \
+  acp_boss "$AS15" dispatch acp-turn-timeout --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S15" 200 || bad "acp turn timeout: no stop reason"
+check_eq "acp turn timeout: stop reason" "turn_timeout" "$(jq -r '.acp.last_stop_reason' "$S15")"
+check_eq "acp turn timeout: phase idle" "idle" "$(jq -r '.acp.phase' "$S15")"
+acp_wait_event "$EV15" settled || bad "acp turn timeout: no settled wake"
+check_eq "acp turn timeout: wake names it" "1" \
+  "$(jq -Rrc 'select(length > 0) | (fromjson? | select(type=="object")) | select(.event=="settled" and .state=="turn_timeout")' "$EV15" | wc -l | tr -d ' ')"
+check_eq "acp turn timeout: no stall" "0" "$(acp_count "$EV15" stalled)"
+acp_boss "$AS15" finish acp-turn-timeout --project acp-test --force >/dev/null 2>&1
+
+# 76. A silent working turn wakes once with 'stalled'; the phase stays
+# working and the state carries the flag.
+make_change "$AP" acp-stall '- [ ] 1.1 Do the work.'
+AS16="$TMP/acp-state-16"; mkdir -p "$AS16"
+S16="$(acp_state "$AS16" "$AP" acp-stall)"
+EV16="$(acp_events_file "$AS16" "$AP" acp-stall)"
+FAKE_ACP_MODE=slow BOSS_ACP_STALL_S=1 BOSS_ACP_TURN_TIMEOUT_S=0 \
+  acp_boss "$AS16" dispatch acp-stall --project acp-test --runner goose >/dev/null
+if acp_wait_event "$EV16" stalled 100; then ok; else bad "acp stall: no stalled wake"; fi
+check_eq "acp stall: one wake" "1" "$(acp_count "$EV16" stalled)"
+check_eq "acp stall: wake state" "stalled" \
+  "$(jq -r 'select(.event=="stalled") | .state' "$EV16" | head -n 1)"
+check_contains "acp stall: names the last activity" "tool shell" \
+  "$(jq -r 'select(.event=="stalled") | .text' "$EV16" | head -n 1)"
+check_eq "acp stall: state flag" "true" "$(jq -r '.acp.stalled' "$S16")"
+check_eq "acp stall: phase stays working" "working" "$(jq -r '.acp.phase' "$S16")"
+check_eq "acp stall: status shows it" "1" \
+  "$(acp_boss "$AS16" status acp-stall --project acp-test 2>/dev/null | grep -c 'acp stalled: yes' || true)"
+out="$(acp_boss "$AS16" status acp-stall --project acp-test --json 2>/dev/null)"
+check_eq "acp stall: json flag" "true" "$(printf '%s' "$out" | jq -r '.acp_stalled')"
+sleep 1.5
+check_eq "acp stall: still one wake" "1" "$(acp_count "$EV16" stalled)"
+acp_boss "$AS16" finish acp-stall --project acp-test --force >/dev/null 2>&1
+
+# 76a. A long-running tool call that keeps emitting updates is not a stall.
+make_change "$AP" acp-progress '- [ ] 1.1 Do the work.'
+AS17="$TMP/acp-state-17"; mkdir -p "$AS17"
+S17="$(acp_state "$AS17" "$AP" acp-progress)"
+EV17="$(acp_events_file "$AS17" "$AP" acp-progress)"
+FAKE_ACP_MODE=progress BOSS_ACP_STALL_S=1 BOSS_ACP_TURN_TIMEOUT_S=0 \
+  acp_boss "$AS17" dispatch acp-progress --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S17" 200 || bad "acp progress: no stop reason"
+check_eq "acp progress: long command is not a stall" "0" "$(acp_count "$EV17" stalled)"
+check_eq "acp progress: stop reason" "end_turn" "$(jq -r '.acp.last_stop_reason' "$S17")"
+check_eq "acp progress: not stalled" "false" "$(jq -r '.acp.stalled' "$S17")"
+acp_boss "$AS17" finish acp-progress --project acp-test >/dev/null 2>&1
+
+# 76b. New activity clears a reported stall and restarts the timer.
+make_change "$AP" acp-stall-resume '- [ ] 1.1 Do the work.'
+AS18="$TMP/acp-state-18"; mkdir -p "$AS18"
+S18="$(acp_state "$AS18" "$AP" acp-stall-resume)"
+EV18="$(acp_events_file "$AS18" "$AP" acp-stall-resume)"
+FAKE_ACP_MODE=stall_resume BOSS_ACP_STALL_S=1 BOSS_ACP_TURN_TIMEOUT_S=0 \
+  acp_boss "$AS18" dispatch acp-stall-resume --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S18" 200 || bad "acp stall resume: no stop reason"
+check_eq "acp stall resume: one stall" "1" "$(acp_count "$EV18" stalled)"
+check_eq "acp stall resume: cleared by activity" "false" "$(jq -r '.acp.stalled' "$S18")"
+check_eq "acp stall resume: stop reason" "end_turn" "$(jq -r '.acp.last_stop_reason' "$S18")"
+acp_boss "$AS18" finish acp-stall-resume --project acp-test >/dev/null 2>&1
+
+# 76c. A blocked turn waits for the Explorer and is not a stall.
+make_change "$AP" acp-stall-blocked '- [ ] 1.1 Do the work.'
+AS19="$TMP/acp-state-19"; mkdir -p "$AS19"
+S19="$(acp_state "$AS19" "$AP" acp-stall-blocked)"
+EV19="$(acp_events_file "$AS19" "$AP" acp-stall-blocked)"
+FAKE_ACP_MODE=ask BOSS_ACP_STALL_S=1 BOSS_ACP_TURN_TIMEOUT_S=0 \
+  acp_boss "$AS19" dispatch acp-stall-blocked --project acp-test --runner goose-ask >/dev/null
+if acp_wait_phase "$S19" blocked; then ok; else bad "acp stall blocked: never blocked"; fi
+sleep 2
+check_eq "acp stall blocked: blocked phase excluded" "0" "$(acp_count "$EV19" stalled)"
+acp_boss "$AS19" answer acp-stall-blocked allow_once --project acp-test >/dev/null
+acp_wait_phase "$S19" idle || bad "acp stall blocked: did not finish the turn"
+check_eq "acp stall blocked: still no stall" "0" "$(acp_count "$EV19" stalled)"
+acp_boss "$AS19" finish acp-stall-blocked --project acp-test >/dev/null 2>&1
+
+# 77. Two concurrent permission requests produce one blocked wake that names
+# the count; status lists both and the aggregate shows the count and the ids.
+make_change "$AP" acp-wake-dedupe '- [ ] 1.1 Do the work.'
+AS20="$TMP/acp-state-20"; mkdir -p "$AS20"
+S20="$(acp_state "$AS20" "$AP" acp-wake-dedupe)"
+EV20="$(acp_events_file "$AS20" "$AP" acp-wake-dedupe)"
+FAKE_ACP_MODE=ask_two acp_boss "$AS20" dispatch acp-wake-dedupe --project acp-test --runner goose-ask >/dev/null
+i=0
+while [ "$i" -lt 100 ]; do
+  [ "$(jq -r '.acp.pending_permissions | length' "$S20" 2>/dev/null || printf 0)" = "2" ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
+acp_wait_event "$EV20" wake || bad "acp wake dedupe: no wake"
+sleep 0.3
+check_eq "acp wake dedupe: two pending" "2" "$(jq -r '.acp.pending_permissions | length' "$S20")"
+check_eq "acp wake dedupe: one blocked event" "1" "$(acp_count "$EV20" blocked)"
+check_eq "acp wake dedupe: one wake" "1" "$(acp_count "$EV20" wake)"
+check_contains "acp wake dedupe: names the count" "2 ACP permission requests" \
+  "$(jq -r 'select(.event=="blocked") | .text' "$EV20" | head -n 1)"
+out="$(acp_boss "$AS20" status acp-wake-dedupe --project acp-test --json 2>/dev/null)"
+check_eq "acp wake dedupe: pending list" "2" "$(printf '%s' "$out" | jq -r '.pending_permissions | length')"
+check_eq "acp wake dedupe: alias is the first" "tc-a" "$(printf '%s' "$out" | jq -r '.pending_permission.tool_call_id')"
+dedupe_text="$(acp_boss "$AS20" status acp-wake-dedupe --project acp-test 2>/dev/null)"
+check_contains "acp wake dedupe: blocked view names the count" "pending permissions (2):" "$dedupe_text"
+check_contains "acp wake dedupe: blocked view lists the ids" "tc-b" "$dedupe_text"
+agg="$(acp_boss "$AS20" status --json 2>/dev/null)"
+check_eq "acp wake dedupe: aggregate count" "2" \
+  "$(printf '%s' "$agg" | jq -r '.[] | select(.change=="acp-wake-dedupe") | .pending_count')"
+check_eq "acp wake dedupe: aggregate ids" "tc-a,tc-b" \
+  "$(printf '%s' "$agg" | jq -r '.[] | select(.change=="acp-wake-dedupe") | .pending_ids | join(",")')"
+check_contains "acp wake dedupe: aggregate row" "pending: 2 permission requests (tc-a, tc-b)" \
+  "$(acp_boss "$AS20" status 2>/dev/null)"
+acp_boss "$AS20" answer acp-wake-dedupe allow_once --tool-call tc-a --project acp-test >/dev/null
+acp_boss "$AS20" answer acp-wake-dedupe allow_once tc-b --project acp-test >/dev/null
+acp_wait_phase "$S20" idle || bad "acp wake dedupe: did not finish the turn"
+acp_wait_event "$EV20" settled || bad "acp wake dedupe: no settled wake"
+check_eq "acp wake dedupe: settled wake after the answers" "1" \
+  "$(jq -Rrc 'select(length > 0) | (fromjson? | select(type=="object")) | select(.event=="settled")' "$EV20" | wc -l | tr -d ' ')"
+acp_boss "$AS20" finish acp-wake-dedupe --project acp-test >/dev/null 2>&1
 
 # ------------------------------------------------------- runtime hygiene ---
 # The version is part of the contract: an installed copy must name its source.

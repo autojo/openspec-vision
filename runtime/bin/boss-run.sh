@@ -1046,6 +1046,7 @@ cmd_resume() {
        | .acp.resume = true | .acp.ready = false | .acp.error = null
        | .acp.phase = "starting" | .acp.pending_permission = null
        | .acp.pending_permissions = []
+       | .acp.stalled = false | .acp.stalled_at = null
        | .acp.dead_reported = false | .last_state = "starting"'
     # Unlike a fresh dispatch, a failed resume must keep the state: it carries
     # the session id and worktree the Explorer needs to inspect or retrigger.

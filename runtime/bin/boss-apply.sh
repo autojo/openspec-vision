@@ -1130,6 +1130,7 @@ dispatch_change() {
        ready: false, phase: "starting", last_stop_reason: null,
        pending_permission: null, pending_permissions: [], apply_allows: [],
        usage: null, last_update: null,
+       stalled: false, stalled_at: null,
        error: null, dead_reported: false, load_session: null, resume: false
      } else null end)}' \
     >"$state_file" || die_json "state_write" "cannot write state file $state_file"

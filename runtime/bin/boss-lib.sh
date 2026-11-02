@@ -60,8 +60,14 @@ BOSS_WAITER_SETTLE_GRACE_MS="${BOSS_WAITER_SETTLE_GRACE_MS:-5000}"
 # supervisor early.
 BOSS_ACP_START_TIMEOUT_MS="${BOSS_ACP_START_TIMEOUT_MS:-240000}"
 # A turn that does not answer within this time is recorded as 'turn_timeout'
-# instead of waking as if the turn had ended. 0 disables the timeout.
-BOSS_ACP_TURN_TIMEOUT_S="${BOSS_ACP_TURN_TIMEOUT_S:-0}"
+# instead of waking as if the turn had ended. The default is two hours: above
+# any expected command (the full suite takes about eight minutes) and below an
+# unattended hang. 0 disables the timeout explicitly.
+BOSS_ACP_TURN_TIMEOUT_S="${BOSS_ACP_TURN_TIMEOUT_S:-7200}"
+# A working turn whose transcript has made no progress for this long wakes the
+# boss once with 'stalled' and the last activity. The supervisor checks every
+# min(30 s, this value / 2). Blocked turns are excluded. 0 disables the check.
+BOSS_ACP_STALL_S="${BOSS_ACP_STALL_S:-1800}"
 # How long 'boss interrupt' waits for the agent to confirm the cancellation
 # before it records 'cancel_unconfirmed'.
 BOSS_ACP_CANCEL_TIMEOUT_S="${BOSS_ACP_CANCEL_TIMEOUT_S:-15}"
@@ -2751,6 +2757,31 @@ acp_supervisor_alive() {
   local pid
   pid="$(acp_supervisor_pid "$1")"
   acp_pid_alive "$pid"
+}
+
+# effective_waiter_pid <state-file> -- the pid whose liveness says whether the
+# apply is watched: the ACP supervisor for an ACP apply, else waiter_pid. One
+# rule for the per-apply and the aggregate status view.
+effective_waiter_pid() {
+  local f="$1" pid
+  if acp_is_acp "$f"; then
+    pid="$(acp_supervisor_pid "$f")"
+    if [ -n "$pid" ]; then
+      printf '%s' "$pid"
+      return 0
+    fi
+  fi
+  jq -r '.waiter_pid // empty' "$f" 2>/dev/null || true
+}
+
+# effective_waiter_alive <state-file> -- 0 when the effective waiter lives.
+effective_waiter_alive() {
+  local f="$1"
+  if acp_is_acp "$f"; then
+    acp_supervisor_alive "$f"
+  else
+    waiter_alive "$(effective_waiter_pid "$f")"
+  fi
 }
 
 # acp_is_acp <state-file> -- 0 for an ACP apply (old state files are native).

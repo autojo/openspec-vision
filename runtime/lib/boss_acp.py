@@ -29,6 +29,11 @@ import time
 
 PROTOCOL_VERSION = 1
 
+# Requests of one permission burst arrive in separate messages. A blocked wake
+# waits this long so its text can name every request that opened the same
+# transition, instead of only the first one.
+BLOCKED_WAKE_COALESCE_S = 0.25
+
 # Tools that must always reach the supervisor instead of being pre-approved by
 # an agent-level permission store. Kept in both the user and the smart-approve
 # section of the generated permission.yaml.
@@ -57,6 +62,29 @@ def log(message: str) -> None:
             pass
     sys.stderr.write(line)
     sys.stderr.flush()
+
+
+def env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        log(f"warning: {name}={raw!r} is not a number; using {default}")
+        return float(default)
+
+
+def turn_timeout():
+    """Seconds a turn may wait for the prompt response; None disables it."""
+    value = env_seconds("BOSS_ACP_TURN_TIMEOUT_S", 7200)
+    return value if value > 0 else None
+
+
+def stall_interval() -> float:
+    """Seconds without transcript progress after which a turn is stalled."""
+    value = env_seconds("BOSS_ACP_STALL_S", 1800)
+    return value if value > 0 else 0.0
 
 
 def pid_alive(pid) -> bool:
@@ -307,6 +335,32 @@ def offered_modes(modes):
     return result
 
 
+LAST_UPDATE_MAX_CHARS = 200
+
+
+def summarize_text(text: str) -> str:
+    """Collapse whitespace and truncate; empty text yields ''."""
+    return " ".join(str(text).split())[:LAST_UPDATE_MAX_CHARS]
+
+
+def transcript_activity_text(record: dict) -> str:
+    """A short human summary of a transcript entry, for the stall wake.
+
+    Permission, usage and housekeeping entries carry no progress worth
+    reporting, so they only refresh the timestamp.
+    """
+    kind = str(record.get("type") or "")
+    if kind == "message":
+        return summarize_text(record.get("text") or "")
+    if kind in ("tool_call", "tool_call_update"):
+        title = str(record.get("title") or record.get("tool_call_id") or "tool")
+        status = record.get("status") or "requested"
+        return f"tool {title} ({status})"
+    if kind == "stop":
+        return f"turn ended ({record.get('stop_reason') or 'unknown'})"
+    return ""
+
+
 class AcpClient:
     """Newline-delimited JSON-RPC over the child's stdio."""
 
@@ -449,6 +503,19 @@ class Supervisor:
         self.seed_tool_ids = set()
         self.started_prompt = False
         self.wake_tasks = set()
+        # Stall detection: the timestamp of the last transcript entry, the
+        # text that entry carried, and whether the current working phase has
+        # already woken the boss about a stall.
+        self.last_activity = time.monotonic()
+        self.last_activity_text = ""
+        self.stall_wake_sent = False
+        self.stalled = bool(self.acp.get("stalled"))
+        # Blocked wakes are debounced per working -> blocked transition.
+        self.blocked_wake_sent = False
+        # Streamed message chunks with the same message id are joined, so
+        # last_update describes the message instead of its final token.
+        self.message_texts: dict[str, str] = {}
+        self.stall_task = None
 
     # ------------------------------------------------------------- state ---
     def acp_set(self, **fields) -> None:
@@ -474,6 +541,24 @@ class Supervisor:
 
         self.state.update(mutate)
         self.phase = phase
+        if phase == "working":
+            # A new working phase starts the stall window now: activity that
+            # happened before a blocked phase must not count as progress.
+            self.mark_activity()
+
+    def mark_activity(self, text: str = "") -> None:
+        """Record transcript progress and clear a stall that was reported.
+
+        Called for every transcript entry, so a stalled working turn recovers
+        as soon as the agent is active again.
+        """
+        self.last_activity = time.monotonic()
+        if text:
+            self.last_activity_text = summarize_text(text)
+        self.stall_wake_sent = False
+        if self.stalled:
+            self.stalled = False
+            self.acp_set(stalled=False, stalled_at=None)
 
     def event(self, name: str, extra: dict | None = None) -> None:
         if not self.events_file:
@@ -489,6 +574,8 @@ class Supervisor:
             log(f"warning: cannot append event {name}: {exc}")
 
     def transcript_append(self, record: dict) -> None:
+        # Every transcript entry is progress for the stall watchdog.
+        self.mark_activity(transcript_activity_text(record))
         if not self.transcript:
             return
         record = dict(record)
@@ -714,7 +801,14 @@ class Supervisor:
             self.transcript_append(
                 {"type": "message", "message_id": message_id, "text": text}
             )
-            summary = text
+            # Streaming splits one message into chunks; join them per message
+            # id so last_update describes the message, not its final token.
+            key = str(message_id or "")
+            if key:
+                self.message_texts[key] = self.message_texts.get(key, "") + text
+                summary = self.message_texts[key]
+            else:
+                summary = text
         elif kind == "tool_call":
             tool_id = str(update.get("toolCallId") or "")
             if self.replaying and tool_id and tool_id in self.seed_tool_ids:
@@ -763,13 +857,15 @@ class Supervisor:
                     if str(option.get("id")) == "model":
                         self.acp_set(model=option.get("currentValue"))
             self.transcript_append({"type": kind, "update": update})
-            summary = kind
+            summary = None
         else:
             self.transcript_append({"type": "update", "update": update})
             summary = None
-        if summary:
-            text = " ".join(str(summary).split())
-            self.acp_set(last_update=text[:500])
+        # A whitespace-only chunk and a usage-only update carry no progress
+        # worth reporting: keep the previous last_update instead of a token.
+        text = summarize_text(summary or "")
+        if text:
+            self.acp_set(last_update=text)
 
     # ---------------------------------------------------------- permission ---
     def rule_matches(self, rule: str, tool: dict) -> bool:
@@ -870,6 +966,9 @@ class Supervisor:
 
     def persist_pending(self) -> None:
         items = self.pending_list()
+        if not items:
+            # The blocked transition is over; the next request may wake again.
+            self.blocked_wake_sent = False
         # pending_permission stays as an alias for readers from before the
         # queue; it always names the first still-unanswered request.
         self.acp_set(
@@ -879,6 +978,58 @@ class Supervisor:
 
     def pending_ids(self) -> list:
         return list(self.pending.keys())
+
+    def schedule_blocked_wake(self) -> None:
+        """Wake the boss once for one working -> blocked transition.
+
+        The requests of one burst arrive as separate messages; a short
+        coalescing delay lets the wake text name all of them instead of only
+        the first one that happened to open the transition.
+        """
+        task = asyncio.create_task(self.send_blocked_wake())
+        self.wake_tasks.add(task)
+        task.add_done_callback(self.wake_tasks.discard)
+
+    async def send_blocked_wake(self) -> None:
+        await asyncio.sleep(BLOCKED_WAKE_COALESCE_S)
+        if not self.pending or self.stop_event.is_set():
+            # Answered, cancelled or shut down before the wake was due: no
+            # stale 'blocked' wake for a transition that is already over.
+            return
+        items = self.pending_list()
+        options = sorted(
+            {
+                str(option.get("optionId"))
+                for item in items
+                for option in item.get("options") or []
+                if option.get("optionId")
+            }
+        )
+        if len(items) == 1:
+            only = items[0]
+            title = only.get("title") or "permission request"
+            command = only.get("command")
+            detail = f"{title} -- {command}" if command else title
+            summary = f"blocked on an ACP permission request ({detail})"
+            tool_hint = f"--tool-call {only.get('tool_call_id')}"
+        else:
+            summary = (
+                f"blocked on {len(items)} ACP permission requests ("
+                + "; ".join(
+                    f"{item.get('tool_call_id')}: {item.get('title') or 'permission request'}"
+                    for item in items
+                )
+                + ")"
+            )
+            tool_hint = "--tool-call <id>"
+        await self.wake(
+            "blocked",
+            "blocked",
+            f"Apply {self.change} in {self.project}: {summary}. "
+            f"Options: {', '.join(options) or '(none)'}. "
+            f"Next step: boss answer {self.change} <option> {tool_hint} "
+            f"(or boss interrupt {self.change})",
+        )
 
     async def on_request(self, message: dict) -> None:
         method = message.get("method")
@@ -895,7 +1046,6 @@ class Supervisor:
         raw = tool.get("rawInput") or {}
         title = str(tool.get("title") or "permission request")
         command = str(raw.get("command") or raw.get("path") or "")
-        description = f"{title} -- {command}" if command else title
         tool_call_id = str(tool.get("toolCallId") or f"request-{request_id}")
         decision = self.decide(tool)
         from_apply_allow = False
@@ -978,10 +1128,14 @@ class Supervisor:
             "tool": tool,
             "future": future,
         }
+        was_empty = not self.pending
         self.pending[tool_call_id] = entry
         self.persist_pending()
-        first = len(self.pending) == 1
-        if first:
+        # One working -> blocked transition wakes the boss once, however many
+        # requests arrive before the first answer.
+        transition = was_empty and not self.blocked_wake_sent
+        if transition:
+            self.blocked_wake_sent = True
             self.set_phase("blocked", "blocked")
         self.event(
             "acp_permission",
@@ -1003,15 +1157,8 @@ class Supervisor:
                 "request_id": request_id,
             }
         )
-        if first:
-            self.wake_background(
-                "blocked",
-                "blocked",
-                f"Apply {self.change} in {self.project}: blocked on an ACP permission request ({description}). "
-                f"Options: {', '.join(item['optionId'] for item in recorded) or '(none)'}. "
-                f"Next step: boss answer {self.change} <option> --tool-call {tool_call_id} "
-                f"(or boss interrupt {self.change})",
-            )
+        if transition:
+            self.schedule_blocked_wake()
         chosen = await future
         self.pending.pop(tool_call_id, None)
         self.persist_pending()
@@ -1110,16 +1257,12 @@ class Supervisor:
 
     # --------------------------------------------------------------- turns ---
     async def run_turn(self, text: str) -> str:
+        self.message_texts.clear()
+        self.stall_wake_sent = False
         self.set_phase("working", "working")
         self.event("acp_prompt", {"text": text[:2000]})
         self.transcript_append({"type": "prompt", "text": text[:4000]})
-        timeout = None
-        raw_timeout = os.environ.get("BOSS_ACP_TURN_TIMEOUT_S", "0")
-        try:
-            if int(raw_timeout) > 0:
-                timeout = int(raw_timeout)
-        except ValueError:
-            timeout = None
+        timeout = turn_timeout()
         self.turn_task = asyncio.create_task(
             self.client.request(
                 "session/prompt",
@@ -1136,7 +1279,17 @@ class Supervisor:
                 self.usage = usage
                 self.acp_set(usage=usage)
         except asyncio.TimeoutError:
+            # Bounded failure path: the wait ends here even if the agent keeps
+            # working. Tell the child to cancel so it does not run a second
+            # turn behind our back, then record the reason.
             stop_reason = "turn_timeout"
+            log(f"acp: turn timed out after {timeout}s; sending session/cancel")
+            self.event("acp_timeout", {"timeout_s": timeout})
+            if self.session_id:
+                try:
+                    await self.client.notify("session/cancel", {"sessionId": self.session_id})
+                except Exception as exc:
+                    log(f"warning: cannot cancel a timed-out turn: {exc!r}")
         except AcpError as exc:
             stop_reason = "failed"
             self.acp_set(error=exc.message)
@@ -1156,6 +1309,11 @@ class Supervisor:
             message = "idle (ACP turn ended, stopReason end_turn)"
         elif stop_reason == "cancelled":
             message = "cancelled (ACP turn ended, stopReason cancelled)"
+        elif stop_reason == "turn_timeout":
+            message = (
+                "turn_timeout (ACP turn did not answer within "
+                f"BOSS_ACP_TURN_TIMEOUT_S={int(timeout or 0)}s)"
+            )
         else:
             message = f"{stop_reason} (ACP turn ended, stopReason {stop_reason})"
         await self.wake(
@@ -1221,6 +1379,8 @@ class Supervisor:
                     "isolated": self.isolated,
                     "profile_root": self.profile_root if self.isolated else None,
                     "last_stop_reason": self.acp.get("last_stop_reason"),
+                    "last_update": self.acp.get("last_update"),
+                    "stalled": bool(self.stalled),
                     "usage": self.usage,
                 }
             elif action == "answer":
@@ -1387,6 +1547,47 @@ class Supervisor:
             except asyncio.TimeoutError:
                 continue
 
+    async def stall_watchdog(self) -> None:
+        """Wake the boss once when a working turn stops making progress.
+
+        The heartbeat only proves the supervisor is alive, so the check is
+        based on transcript activity. A blocked turn waits for the Explorer by
+        design and is never a stall; a turn that becomes active again clears
+        the reported stall so a later silence can be reported again.
+        """
+        stall = stall_interval()
+        if stall <= 0:
+            log("acp: stall detection disabled (BOSS_ACP_STALL_S=0)")
+            return
+        interval = min(30.0, max(0.2, stall / 2.0))
+        while not self.stop_event.is_set():
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+            if self.phase != "working" or self.stall_wake_sent:
+                continue
+            age = time.monotonic() - self.last_activity
+            if age < stall:
+                continue
+            last = self.last_activity_text or "no transcript activity"
+            self.stall_wake_sent = True
+            self.stalled = True
+            self.acp_set(stalled=True, stalled_at=now_iso())
+            self.event(
+                "acp_stall",
+                {"age_s": int(age), "stall_s": int(stall), "last_activity": last},
+            )
+            log(f"acp: turn stalled ({int(age)}s without progress): {last}")
+            await self.wake(
+                "stalled",
+                "stalled",
+                f"Apply {self.change} in {self.project}: stalled (no transcript progress for "
+                f"{int(age)}s, last activity: {last}). "
+                f"Next step: boss status {self.change} (or boss interrupt {self.change})",
+            )
+
     async def drain_stderr(self) -> None:
         while True:
             line = await self.proc.stderr.readline()
@@ -1480,9 +1681,15 @@ class Supervisor:
             apply_allows=self.apply_allows,
             isolated=self.isolated,
             profile_root=self.profile_root if self.isolated else None,
+            stalled=False,
+            stalled_at=None,
         )
+        self.message_texts.clear()
+        self.blocked_wake_sent = False
+        self.stalled = False
         self.set_phase("starting", "starting")
         self.heartbeat_task = asyncio.create_task(self.heartbeat())
+        self.stall_task = asyncio.create_task(self.stall_watchdog())
         try:
             await self.start_control_server()
             await self.spawn_child()
@@ -1594,10 +1801,12 @@ class Supervisor:
                 os.unlink(self.socket_path)
             except FileNotFoundError:
                 pass
-        if self.heartbeat_task is not None:
-            self.heartbeat_task.cancel()
+        for task in (self.heartbeat_task, self.stall_task):
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self.heartbeat_task
+                await task
             except (asyncio.CancelledError, Exception):
                 pass
         self.event("acp_exit", {"reason": "closed", "stop_reason": self.acp.get("last_stop_reason")})
@@ -1606,6 +1815,7 @@ class Supervisor:
             supervisor_pid=None,
             pending_permission=None,
             pending_permissions=[],
+            stalled=False,
         )
         self.closed_event.set()
         log("acp: supervisor stopped")
