@@ -4078,6 +4078,12 @@ jq -n --arg p "$AP" '{change:"acp-timeout",project:$p,transport:"acp",merge_stat
 check_eq "acp test_timeout: consumes a slot" "1" \
   "$(HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$ACP_CONF" run_lib_state "$ATS" open_apply_count)"
 
+# A long state root must not overflow the Unix socket path (macOS sun_path).
+LS="$TMP/long-state-$(printf '%080d' 0)"
+LSOCK="$(run_lib_state "$LS" acp_socket_for "$LS/state.json")"
+check_eq "acp socket: long state dir stays short" "1" \
+  "$([ "${#LSOCK}" -le 90 ] && printf 1 || printf 0)"
+
 # 68. Locks remain transport-neutral: an ACP apply holds its declared lock.
 WL="$TMP/acp-lock-project"
 make_git_project "$WL"

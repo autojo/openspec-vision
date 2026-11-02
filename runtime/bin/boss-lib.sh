@@ -1739,7 +1739,15 @@ events_file_for() {
 # state file path. The socket lives in its own directory and uses a SHA1, not
 # the change name: a Unix socket path is limited to roughly 100 characters.
 acp_socket_for() {
-  printf '%s/acp/%s.sock\n' "$BOSS_STATE_DIR" "$(sha1_hex "acp:$1")"
+  local hash path
+  hash="$(sha1_hex "acp:$1")"
+  path="$BOSS_STATE_DIR/acp/$hash.sock"
+  # BSD/macOS sun_path is about 104 bytes. A long state root (a CI TMPDIR)
+  # would exceed it; fall back to the short /tmp path. The socket is 0600.
+  if [ "${#path}" -gt 90 ]; then
+    path="/tmp/boss-acp-$hash.sock"
+  fi
+  printf '%s\n' "$path"
 }
 
 # acp_transcript_for <state-file> -- the JSONL transcript of the apply.

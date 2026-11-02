@@ -378,8 +378,13 @@ cmd_session() {
   BOSS_FAILED_PANE="$pane_id"
 
   # The boss session must be a Herdr-native agent; start_runner rejects an ACP
-  # runner here with acp_session_unsupported.
-  start_runner "$start" "$agent_name" "$pane_id" "$kind" - "${agent_args[@]}"
+  # runner here with acp_session_unsupported. bash 3.2 rejects an empty array
+  # expansion under 'set -u', so pass the optional arguments only when present.
+  if [ "${#agent_args[@]}" -gt 0 ]; then
+    start_runner "$start" "$agent_name" "$pane_id" "$kind" - "${agent_args[@]}"
+  else
+    start_runner "$start" "$agent_name" "$pane_id" "$kind" -
+  fi
 
   # Same readiness rule as dispatch, so a first-run dialog cannot wedge the tab.
   await_runner_ready "$agent_name" "$pane_id" "$runner"
@@ -1121,7 +1126,12 @@ dispatch_change() {
     >"$state_file" || die_json "state_write" "cannot write state file $state_file"
   BOSS_FAILED_STATE="$state_file"
 
-  start_runner "$start" "$agent_name" "$pane_id" "$kind" "$state_file" "${agent_args[@]}"
+  # bash 3.2 rejects an empty array expansion under 'set -u'.
+  if [ "${#agent_args[@]}" -gt 0 ]; then
+    start_runner "$start" "$agent_name" "$pane_id" "$kind" "$state_file" "${agent_args[@]}"
+  else
+    start_runner "$start" "$agent_name" "$pane_id" "$kind" "$state_file"
+  fi
 
   if [ "$start" = "acp" ]; then
     # The apply tab is a live view only: it tails the transcript and is never
