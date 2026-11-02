@@ -50,13 +50,29 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
+def append_private(path: str, text: str) -> None:
+    """Append text to a file only the operator may read.
+
+    A supervisor log and an ACP transcript carry full commands and tool output,
+    so both are created with mode 0600. The mode is applied after open, which
+    also repairs a file created world-readable by an older version on its next
+    append.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    with os.fdopen(fd, "a", encoding="utf-8") as handle:
+        handle.write(text)
+
+
 def log(message: str) -> None:
     line = f"{now_iso()} {message}\n"
     path = os.environ.get("BOSS_LOG_FILE", "")
     if path:
         try:
-            with open(path, "a", encoding="utf-8") as handle:
-                handle.write(line)
+            append_private(path, line)
             return
         except OSError:
             pass
@@ -586,12 +602,15 @@ class Supervisor:
             try:
                 if os.path.getsize(self.transcript) > cap:
                     os.replace(self.transcript, self.transcript + ".1")
-                    with open(self.transcript, "a", encoding="utf-8") as handle:
-                        handle.write(json.dumps({"t": now_iso(), "type": "transcript_rotated"}) + "\n")
+                    append_private(
+                        self.transcript,
+                        json.dumps({"t": now_iso(), "type": "transcript_rotated"}) + "\n",
+                    )
             except FileNotFoundError:
                 pass
-            with open(self.transcript, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+            append_private(
+                self.transcript, json.dumps(record, separators=(",", ":")) + "\n"
+            )
         except OSError as exc:
             log(f"warning: cannot append the transcript: {exc}")
 

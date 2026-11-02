@@ -2658,6 +2658,20 @@ test_log_file() {
   mktemp "${TMPDIR:-/tmp}/boss-$name-$label-XXXXXXXX" 2>/dev/null
 }
 
+# test_command_available <root> <command> -- whether the command's program can
+# be resolved. A detected convention command is a path ('./tests/run.sh'), so it
+# is checked against <root> where test_gate_run executes it; everything else is
+# a program name checked against PATH. A command that cannot be found is not a
+# red test and must be reported as not_run.
+test_command_available() {
+  local root="$1" prog="${2%% *}"
+  case "$prog" in
+    ""|/*) [ -n "$prog" ] && [ -x "$prog" ] ;;
+    ./*|../*) [ -x "$root/$prog" ] ;;
+    *) command -v "$prog" >/dev/null 2>&1 ;;
+  esac
+}
+
 # test_gate_run <root> <command> <timeout-seconds> <log-file> -- run the
 # project's test command in <root>, capture both streams to <log-file>, and
 # print pass, fail or timeout.

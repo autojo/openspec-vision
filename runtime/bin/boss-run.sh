@@ -533,8 +533,8 @@ finish_worktree() {
   local test_cmd="" test_result="not_run" test_timeout=300 test_gate="" test_log=""
   test_cmd="$(config_test_command "$project")"
   [ -n "$test_cmd" ] || test_cmd="$(detect_test_command "$project")"
-  if [ -n "$test_cmd" ] && ! command -v "${test_cmd%% *}" >/dev/null 2>&1; then
-    log "test command '$test_cmd' not found in PATH; reporting not_run"
+  if [ -n "$test_cmd" ] && ! test_command_available "$project" "$test_cmd"; then
+    log "test command '$test_cmd' not found; reporting not_run"
     test_cmd=""
   fi
   if [ -n "$test_cmd" ]; then
@@ -751,8 +751,8 @@ cmd_finish() {
   local test_cmd="" test_result="not_run" test_timeout=300 test_gate="" test_log="" merge_test="not_run"
   test_cmd="$(config_test_command "$project")"
   [ -n "$test_cmd" ] || test_cmd="$(detect_test_command "$project")"
-  if [ -n "$test_cmd" ] && ! command -v "${test_cmd%% *}" >/dev/null 2>&1; then
-    log "test command '$test_cmd' not found in PATH; reporting not_run"
+  if [ -n "$test_cmd" ] && ! test_command_available "$project" "$test_cmd"; then
+    log "test command '$test_cmd' not found; reporting not_run"
     test_cmd=""
   fi
   if [ -n "$test_cmd" ]; then

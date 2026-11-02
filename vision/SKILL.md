@@ -269,7 +269,11 @@ After all features have changes assigned, do exactly one sort pass:
   `- spike-api (runner: claude-opus)`. Research, legal text and
   evaluations use `claude-sonnet`; licenses, regulatory/legal, privacy and other
   expensive-error domains use `claude-opus`; primarily code uses the default
-  runner (no annotation). A mixed change uses the runner of its dominant part
+  runner (no annotation). Apply-only work that suits an ACP agent may use
+  `goose`, whose permissions come from its `policy` and `mode`; an ACP runner
+  cannot host `boss session` and is rejected with `acp_session_unsupported`, so
+  a change that needs an interactive session keeps a native runner. A mixed
+  change uses the runner of its dominant part
   or is split into two changes. The runner names must exist under `[runners]`
   in `boss.toml`; `boss mission next` starts the change with that runner.
 - Assign locks to every change on the same bullet:
@@ -433,9 +437,17 @@ keystrokes to it, never read its pane for state, and do not call
 `herdr agent wait` for that apply. `boss status` reports the ACP phase
 (`working`, `blocked`, `idle`), the runner, model, mode and last stop reason,
 plus `acp.last_update` (the last message text or tool activity, not a streamed
-token) and `acp.stalled`. The aggregate `boss status` uses the same liveness
+token), `acp.stalled` and `pending_permissions` (every pending request with its
+tool-call id, command and options; `pending_permission` is the first entry as a
+compatibility alias). The aggregate `boss status` uses the same liveness
 rule as the per-apply view (the supervisor pid), so a live supervisor is never
 printed as `waiter: DEAD`.
+
+An ACP runner is apply-only: `boss session` rejects it with
+`acp_session_unsupported`. There is no hidden native path, and a change that
+needs an interactive session belongs to a native runner. The supported knobs
+are `command`, `model`, `mode`, `policy`, `deny` and `apply`; `args` and `env`
+are native-only and have no effect on an ACP child.
 
 Permissions follow the runner policy. `policy = "ask"` leaves an unmatched
 request pending and wakes you with `blocked`; every pending request is queued by
@@ -454,6 +466,12 @@ pending and the supervisor logs why. An Explorer `allow_always` answer means
 allow-once to the agent for every matching request and keeps the grant for the rest of the apply.
 Nothing is written to the global agent permission store.
 
+`allow_always` is an agent-level grant in the agent's own model: written into
+Goose's config it applies to every later session. The runner maps your answer to
+the apply-scoped `acp.apply_allows` above; a user who edits Goose's own
+`permission.yaml` creates the global grant instead. `boss doctor` reports a
+non-isolated runner with such an entry as `weakened` and names it.
+
 By default the ACP child runs with a per-apply profile below
 `$BOSS_STATE_DIR/acp/` (`XDG_CONFIG_HOME` and `XDG_DATA_HOME` point at it):
 provider files are linked, `permission.yaml` is boss-owned with empty
@@ -462,6 +480,12 @@ profile; a resume reuses it. Set `isolate = false` only when you deliberately
 want the user's global profile. `boss doctor` reports the isolation state and
 the effective store, and reports `weakened` when a non-isolated global store
 always allows `shell`, `write` or `edit`.
+
+The profile isolates Goose's configuration, permission store and sessions; it is
+not a filesystem sandbox. Shell, write and edit still run with the user's OS
+permissions on every path that user can reach. Only an OS sandbox (a container,
+a sandboxed unit) or a separate user confines them, and the worktree does not:
+it only keeps parallel applies out of each other's index.
 
 A turn is bounded. `BOSS_ACP_TURN_TIMEOUT_S` (default 7200 s) ends a turn that
 never answers: it records `turn_timeout`, sends `session/cancel` and wakes you.
@@ -476,6 +500,19 @@ session; `boss resume` calls `session/load` when the agent advertises it, and an
 `unresumable` result means use `boss retrigger` for an explicit new session. The
 apply prompt is the OpenSpec CLI workflow
 (`openspec instructions apply --change <change> --json`), not a slash command.
+
+A dispatch runs the installed runtime, never the repository branch you are
+reading. After a merged runtime change, run `./install.sh` and check
+`boss --version` before the next ACP dispatch. The apply state must show
+`acp.isolated: true` and a `profile_root`; without them the dispatch came from
+an older runtime and keeps the old behaviour, including world-readable
+transcripts and no permission queueing.
+
+The transcript and the supervisor log are created with mode `0600` because they
+contain full commands and tool output. A transcript stays until the operator
+removes it: `boss finish` deletes the state and the profile but keeps the
+transcript as the evidence for the apply. Cleanup is an operator decision; no
+retention policy is implemented.
 
 ### The mission loop
 

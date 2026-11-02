@@ -58,6 +58,11 @@ check_not_contains() {
   esac
 }
 
+# file_mode <path> -- permission bits as an octal string, on Linux and BSD/macOS.
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || printf 'unknown'
+}
+
 # --------------------------------------------------------------- stubs ---
 
 cat >"$BIN/openspec" <<'EOF'
@@ -3089,6 +3094,66 @@ timeout_s = $tg_bad"
   check_contains "test gate: invalid budget names project $tg_bad" "$P_TG" "$err"
 done
 
+# 65a.1 Detection knows the repository conventions, and the manifest checks keep
+# precedence over them. Each case is its own project so nothing is added after a
+# review has seen it.
+td_detect() {
+  local project="$1" change="$2" name="$3" state="$4"
+  printf 'default = "opencode"\n[projects]\n%s = "%s"\n[tests.%s]\ntimeout_s = 30\n[runners.opencode]\nkind = "opencode"\nargs = []\napply = "/opsx-apply {change}"\n' \
+    "$name" "$project" "$name" >"$TMP/test-detect-$name.toml"
+  BOSS_CONFIG="$TMP/test-detect-$name.toml" run_boss_state "$state" review "$change" --project "$project" --json
+}
+
+TDST="$TMP/test-detect-state"
+P_TDR="$TMP/project-test-detect-runsh"
+make_git_project "$P_TDR"
+mkdir -p "$P_TDR/tests"
+printf '#!/bin/sh\nprintf "suite ok\\n"\n' >"$P_TDR/tests/run.sh"
+chmod +x "$P_TDR/tests/run.sh"
+git -C "$P_TDR" add tests/run.sh; git -C "$P_TDR" commit -qm "convention suite"
+make_change "$P_TDR" td-runsh '- [ ] 1.1 Code.'
+make_review_state "$TDST" "$P_TDR" td-runsh
+out="$(td_detect "$P_TDR" td-runsh tdr "$TDST")"
+check_eq "test detect: tests/run.sh" "./tests/run.sh" "$(printf '%s' "$out" | jq -r '.quality.tests.command')"
+check_eq "test detect: tests/run.sh passes" "pass" "$(printf '%s' "$out" | jq -r '.quality.tests.result')"
+
+P_TDM="$TMP/project-test-detect-manifest"
+make_git_project "$P_TDM"
+mkdir -p "$P_TDM/tests"
+printf '#!/bin/sh\nprintf "convention suite\\n"\n' >"$P_TDM/tests/run.sh"
+chmod +x "$P_TDM/tests/run.sh"
+printf 'test:\n\t@printf "manifest suite\\n"\n' >"$P_TDM/Makefile"
+git -C "$P_TDM" add tests/run.sh Makefile; git -C "$P_TDM" commit -qm "manifest and convention suite"
+make_change "$P_TDM" td-manifest '- [ ] 1.1 Code.'
+make_review_state "$TDST" "$P_TDM" td-manifest
+out="$(td_detect "$P_TDM" td-manifest tdm "$TDST")"
+check_eq "test detect: manifest wins over tests/run.sh" "make test" "$(printf '%s' "$out" | jq -r '.quality.tests.command')"
+
+P_TDS="$TMP/project-test-detect-script"
+make_git_project "$P_TDS"
+mkdir -p "$P_TDS/scripts"
+printf '#!/bin/sh\nprintf "script suite\\n"\n' >"$P_TDS/scripts/test.sh"
+chmod +x "$P_TDS/scripts/test.sh"
+git -C "$P_TDS" add scripts/test.sh; git -C "$P_TDS" commit -qm "script suite"
+make_change "$P_TDS" td-script '- [ ] 1.1 Code.'
+make_review_state "$TDST" "$P_TDS" td-script
+out="$(td_detect "$P_TDS" td-script tds "$TDST")"
+check_eq "test detect: scripts/test.sh" "./scripts/test.sh" "$(printf '%s' "$out" | jq -r '.quality.tests.command')"
+check_eq "test detect: scripts/test.sh passes" "pass" "$(printf '%s' "$out" | jq -r '.quality.tests.result')"
+
+P_TDN="$TMP/project-test-detect-nonexec"
+make_git_project "$P_TDN"
+mkdir -p "$P_TDN/tests"
+printf '#!/bin/sh\nprintf "not a suite\\n"\n' >"$P_TDN/tests/run.sh"
+chmod -x "$P_TDN/tests/run.sh"
+git -C "$P_TDN" add tests/run.sh; git -C "$P_TDN" commit -qm "non-executable suite"
+make_change "$P_TDN" td-nonexec '- [ ] 1.1 Code.'
+make_review_state "$TDST" "$P_TDN" td-nonexec
+out="$(td_detect "$P_TDN" td-nonexec tdn "$TDST")"
+check_eq "test detect: non-executable tests/run.sh is not a suite" "null" \
+  "$(printf '%s' "$out" | jq -r '.quality.tests.command')"
+check_eq "test detect: non-executable suite is not_run" "not_run" "$(printf '%s' "$out" | jq -r '.quality.tests.result')"
+
 # 65b. Output capture: a bounded tail and an empty-output command.
 TG_TAIL_LOG="$TMP/test-gate-tail.log"
 awk 'BEGIN { for (i = 1; i <= 100; i++) print i }' >"$TG_TAIL_LOG"
@@ -3923,6 +3988,8 @@ check_contains "acp transcript: message update" "Hello from fake" "$(cat "$TR1")
 check_contains "acp transcript: tool update" '"type":"tool_call"' "$(cat "$TR1")"
 check_contains "acp transcript: usage update" '"type":"usage"' "$(cat "$TR1")"
 check_contains "acp transcript: stop reason" '"stop_reason":"end_turn"' "$(cat "$TR1")"
+check_eq "acp transcript: private mode" "600" "$(file_mode "$TR1")"
+check_eq "acp supervisor log: private mode" "600" "$(file_mode "$AS1/logs/acp-allow-acp.log")"
 EV1="$(acp_events_file "$AS1" "$AP" acp-allow)"
 acp_wait_event "$EV1" wake || bad "acp dispatch: no wake event"
 check_eq "acp dispatch: acp_started event" "1" "$(acp_count "$EV1" acp_started)"
@@ -3963,6 +4030,8 @@ SR="$(acp_state "$ASR" "$AP" acp-retrigger)"
 EVR="$(acp_events_file "$ASR" "$AP" acp-retrigger)"
 FAKE_ACP_MODE=allow acp_boss "$ASR" dispatch acp-retrigger --project acp-test --runner goose >/dev/null
 acp_wait_stop "$SR" || bad "acp retrigger: first turn did not finish"
+TRR="$(jq -r '.acp.transcript' "$SR")"
+chmod 666 "$TRR"
 out="$(acp_boss "$ASR" retrigger acp-retrigger --project acp-test --note "Do another pass.")"
 check_eq "acp retrigger: status" "retriggered" "$(printf '%s' "$out" | jq -r '.status')"
 i=0
@@ -3973,6 +4042,7 @@ while [ "$i" -lt 100 ]; do
 done
 check_eq "acp retrigger: second prompt" "2" "$(acp_count "$EVR" acp_prompt)"
 check_eq "acp retrigger: second stop" "2" "$(acp_count "$EVR" acp_stop)"
+check_eq "acp transcript: world-readable file is corrected" "600" "$(file_mode "$TRR")"
 acp_boss "$ASR" finish acp-retrigger --project acp-test >/dev/null 2>&1
 
 # 61. Config validation and a failed handshake leave no apply behind.
