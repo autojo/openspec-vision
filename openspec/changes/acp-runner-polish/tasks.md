@@ -7,10 +7,16 @@
 - [ ] 1.2 Document `allow_always` as an agent-level grant and the runner's
       apply-scoped mapping; describe the per-apply profile and the
       `isolate = false` escape hatch.
-- [ ] 1.3 State that `args` and `env` are native-only, and that ACP supports
+- [ ] 1.3 State explicitly that the per-apply profile is not a filesystem
+      sandbox: shell/write/edit keep the user's OS permissions, and only an OS
+      sandbox or a separate user would confine them.
+- [ ] 1.4 State that `args` and `env` are native-only, and that ACP supports
       `command`, `model`, `mode`, `policy`, `deny` and `apply`.
-- [ ] 1.4 Document the new status fields, the timeout variables and the
+- [ ] 1.5 Document the new status fields, the timeout variables and the
       one-wake-per-blocked-transition behaviour after the observability change.
+- [ ] 1.6 Document that the installed runtime, not the repository branch, runs
+      a new apply; after a merge run `./install.sh` and verify `boss --version`
+      plus `acp.isolated`/`profile_root` in the dispatch state.
 
 ## 2. Finish gate
 

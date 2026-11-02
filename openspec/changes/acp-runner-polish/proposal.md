@@ -12,14 +12,20 @@ warning for this repository because `detect_test_command` does not know
 suite exists. Transcripts are created world-readable (`0664`) and contain full
 commands and tool output. The external review report also contains a wrong
 finding: its F3 attributes the `policy` warning to the Goose runner, while the
-warning is about `opencode`.
+warning is about `opencode`. The documentation also makes the isolated profile
+sound like a filesystem boundary, and it does not say that a merged runtime
+change must be installed before the next ACP dispatch.
 
 ## What Changes
 
 - Correct the runner documentation: Goose in the assignment table, ACP session
   limitation, `args`/`env` native-only, `allow_always` persistence warning,
   isolated-profile behaviour and the meaning of `policy = "allow"` as
-  auto-allow-once.
+  auto-allow-once. State that the profile isolates Goose's own state, not the
+  filesystem: the agent keeps the user's OS permissions.
+- Document the operational prerequisite that a merged runtime change must be
+  installed (`./install.sh`) before the next ACP dispatch, and how to verify it
+  (`boss --version`, `acp.isolated`/`profile_root` in the state).
 - Teach `detect_test_command` the repository's own `tests/run.sh` and
   `scripts/test.sh` conventions, and document `[tests.<project>].timeout_s`.
 - Create ACP transcripts and supervisor logs with mode `0600`, and document a

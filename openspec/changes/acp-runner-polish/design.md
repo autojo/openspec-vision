@@ -38,6 +38,14 @@ the tasks but is not committed to the repository.
   the runner maps it to the apply; a user who edits Goose's own config gets a
   global grant and the doctor will report `weakened`.
 - Describe the per-apply profile and what it means for provider configuration.
+- State explicitly that the profile isolates Goose's configuration, permission
+  store and sessions, not the filesystem. The shell/write/edit tools still run
+  with the user's OS permissions; only an OS sandbox or a separate user would
+  confine them.
+- Document the dispatch prerequisite: the installed runtime, not the repository
+  branch, is what a new apply runs. After a runtime change is merged, run
+  `./install.sh` and verify `boss --version`; an ACP state must show
+  `acp.isolated: true` and a `profile_root` before it is trusted.
 
 ### 2. Test detection knows the repository conventions
 
