@@ -33,6 +33,14 @@ BOSS_AGENT_BUSY_RETRY_MS="${BOSS_AGENT_BUSY_RETRY_MS:-30000}"
 BOSS_AGENT_TUI_TIMEOUT_MS="${BOSS_AGENT_TUI_TIMEOUT_MS:-60000}"
 BOSS_AGENT_PROMPT_TIMEOUT_MS="${BOSS_AGENT_PROMPT_TIMEOUT_MS:-90000}"
 BOSS_RUNNER_READY_TIMEOUT_MS="${BOSS_RUNNER_READY_TIMEOUT_MS:-90000}"
+# Whether BOSS_REVIEW_TEST_TIMEOUT_S was set explicitly. The default below must
+# not outrank a project's [tests.<project>].timeout_s; only a real environment
+# value does. Recorded before the default is applied.
+if [ -n "${BOSS_REVIEW_TEST_TIMEOUT_S+x}" ] && [ -n "${BOSS_REVIEW_TEST_TIMEOUT_S}" ]; then
+  BOSS_REVIEW_TEST_TIMEOUT_S_EXPLICIT=true
+else
+  BOSS_REVIEW_TEST_TIMEOUT_S_EXPLICIT=false
+fi
 BOSS_REVIEW_TEST_TIMEOUT_S="${BOSS_REVIEW_TEST_TIMEOUT_S:-300}"
 BOSS_WAITER_STALL_MS="${BOSS_WAITER_STALL_MS:-2700000}"
 # After dispatch/retrigger/answer the apply may still sit at its old settled
@@ -2268,8 +2276,9 @@ PY
 # open_apply_count [<exclude-state-file>] -- number of applies that are still
 # running. A parked change keeps its state file for 'boss status' but holds no
 # executer, so it is not counted; a merged/kept state (merge_state=done) is
-# finished and not counted either. A merge_test_failed or merge_conflict state
-# still counts because the change is unfinished even when its agent is gone.
+# finished and not counted either. A merge_test_failed, test_timeout or
+# merge_conflict state still counts because the change is unfinished even when
+# its agent is gone.
 # A state whose recorded pane no longer hosts a live agent is stale and does
 # not consume a slot; when the agent list cannot be read, every unfinished
 # state counts (fail-safe).
@@ -2291,9 +2300,10 @@ open_apply_count() {
     if [ "$transport" = "acp" ]; then
       # Liveness follows the supervisor process, not a Herdr agent. A dead
       # supervisor no longer holds a slot; the dead path still counts when a
-      # merge conflict or failed merge test keeps the change unfinished.
+      # merge conflict, failed merge test or timed-out merge test keeps the
+      # change unfinished.
       case "$ms" in
-        test_failed|conflict) ;;
+        test_failed|test_timeout|conflict) ;;
         *)
           if ! acp_supervisor_alive "$f"; then
             acp_report_dead "$f"
@@ -2305,7 +2315,7 @@ open_apply_count() {
       continue
     fi
     case "$ms" in
-      test_failed|conflict) ;;
+      test_failed|test_timeout|conflict) ;;
       *)
         if [ "$have_agents" -eq 1 ]; then
           pane="$(jq -r '.pane_id // empty' "$f" 2>/dev/null || true)"
@@ -2457,43 +2467,107 @@ resource_warning() {
 }
 
 # run_with_deadline <seconds> <command> [args...] -- run a command and stop it
-# after the deadline, keeping the command's exit status. GNU 'timeout' is used
-# when present; macOS ships neither it nor a coreutils build, so a watchdog
-# subshell enforces the deadline there. Callers must not silently skip work
-# when 'timeout' is missing - a skipped integration test reads as not_run.
+# after the deadline, keeping the command's exit status. GNU/compatible
+# 'timeout' (with '--kill-after' via '-k') is used when present; macOS ships
+# neither it nor a coreutils build, so a Python process-group watchdog enforces
+# the deadline there. A deadline is always reported as 124, never as the
+# command's own non-zero status, and the whole process group is terminated so
+# test workers cannot survive. Callers must not silently skip work when
+# 'timeout' is missing - a skipped integration test reads as not_run.
 run_with_deadline() {
-  local secs="$1" pid watchdog rc waited
+  local secs="$1" rc
   shift
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$secs" "$@"
-    return $?
-  fi
-  if command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$secs" "$@"
-    return $?
-  fi
   case "$secs" in
     ''|*[!0-9]*) secs=300 ;;
-    0) "$@"; return $? ;;
   esac
-  "$@" &
-  pid=$!
-  (
-    waited=0
-    while [ "$waited" -lt "$secs" ]; do
-      sleep 1
-      waited=$((waited + 1))
-      kill -0 "$pid" 2>/dev/null || exit 0
-    done
-    kill -TERM "$pid" 2>/dev/null
-    sleep 1
-    kill -KILL "$pid" 2>/dev/null
-  ) >/dev/null 2>&1 &
-  watchdog=$!
-  wait "$pid"
+  if command -v timeout >/dev/null 2>&1; then
+    # -k 5 sends KILL five seconds after TERM. A command that ignores TERM then
+    # exits 137; map that to the deadline status too.
+    timeout -k 5 "$secs" "$@"
+    rc=$?
+    [ "$rc" -eq 137 ] && rc=124
+    return "$rc"
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout -k 5 "$secs" "$@"
+    rc=$?
+    [ "$rc" -eq 137 ] && rc=124
+    return "$rc"
+  fi
+  # 0 has always meant "no deadline" in the timeout paths; keep that.
+  if [ "$secs" -eq 0 ] 2>/dev/null; then
+    "$@"
+    return $?
+  fi
+  # A subshell watchdog cannot kill a process group portably (neither bash 3.2
+  # nor macOS has job control for it), so Python does the wait from the parent:
+  # start_new_session gives the command its own group, killpg reaches workers.
+  python3 - "$secs" "$@" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+secs = int(sys.argv[1])
+proc = subprocess.Popen(sys.argv[2:], start_new_session=True)
+try:
+    proc.wait(timeout=secs)
+except subprocess.TimeoutExpired:
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            break
+        try:
+            proc.wait(timeout=5)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    # Reap the direct child even when a worker stays unkillable.
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    sys.exit(124)
+rc = proc.returncode
+sys.exit(rc if rc >= 0 else 128 - rc)
+PY
+}
+
+# test_log_file <change> [<label>] -- a fresh log path for one test run, under
+# BOSS_LOGS_DIR (or the temp dir when the log directory is not writable). The
+# caller redirects both streams into it.
+test_log_file() {
+  local change="$1" label="${2:-test}" name
+  name="$(normalize_name "$change")"
+  [ -n "$name" ] || name="change"
+  if mkdir -p "$BOSS_LOGS_DIR" 2>/dev/null; then
+    # Keep the template ending in X: BSD/macOS mktemp rejects a suffix.
+    mktemp "$BOSS_LOGS_DIR/$name-$label-XXXXXXXX" 2>/dev/null && return 0
+  fi
+  mktemp "${TMPDIR:-/tmp}/boss-$name-$label-XXXXXXXX" 2>/dev/null
+}
+
+# test_gate_run <root> <command> <timeout-seconds> <log-file> -- run the
+# project's test command in <root>, capture both streams to <log-file>, and
+# print pass, fail or timeout.
+test_gate_run() {
+  local root="$1" cmd="$2" secs="$3" log="$4" rc
+  ( cd "$root" && run_with_deadline "$secs" bash -c "$cmd" ) >"$log" 2>&1
   rc=$?
-  kill "$watchdog" 2>/dev/null || true
-  return "$rc"
+  case "$rc" in
+    0) printf 'pass' ;;
+    124) printf 'timeout' ;;
+    *) printf 'fail' ;;
+  esac
+}
+
+# test_output_tail <log-file> [<lines>] -- the last <lines> (default 40) of a
+# test log, bounded so the apply state stays small.
+test_output_tail() {
+  local log="$1" lines="${2:-40}"
+  [ -f "$log" ] || return 0
+  tail -n "$lines" "$log" 2>/dev/null || true
 }
 
 # waiter_alive <pid> -- 0 when pid is a running boss-waiter. The script runs

@@ -698,6 +698,19 @@ make_change() {
   printf '%s\n' "$tasks" >"$dir/tasks.md"
 }
 
+# make_review_state <state-dir> <project> <change> -- a minimal apply state so
+# 'boss review' can locate the change without a real dispatch.
+make_review_state() {
+  local st="$1" project="$2" change="$3" name
+  name="$(run_lib normalize_name "$change")"
+  mkdir -p "$st/applies"
+  jq -n --arg p "$project" --arg c "$change" \
+    '{change:$c,project:$p,workspace_id:"ws-1",agent:("apply-" + $c),
+      pane_id:null,tab_id:null,waiter_pid:null,merge_state:"none",merged:false,
+      merge_test:"not_run"}' \
+    >"$st/applies/$(run_lib sha1_hex "$project")-$name.json"
+}
+
 make_mission() {
   local project="$1" slug="$2" changes="$3"
   cat >"$project/openspec/missions/$slug.md" <<EOF
@@ -2909,6 +2922,211 @@ check_eq "merge test: retry finishes" "finished" "$(printf '%s' "$out" | jq -r '
 check_eq "merge test: retry removed worktree" "0" "$([ -e "$WTT" ] && printf 1 || printf 0)"
 check_eq "merge test: retry removed state" "0" "$([ -f "$TSF" ] && printf 1 || printf 0)"
 
+# 65a. The test gate configuration forms, precedence and invalid values are
+# read by review. One project is registered under one name per fixture, so the
+# path lookup is unambiguous.
+P_TG="$TMP/project-test-gate"
+make_git_project "$P_TG"
+printf 'test:\n\t@printf "detected\\n"\n' >"$P_TG/Makefile"
+git -C "$P_TG" add Makefile; git -C "$P_TG" commit -qm makefile
+for tg_change in tg-legacy tg-table tg-detected tg-env tg-default tg-fail tg-missing tg-invalid; do
+  make_change "$P_TG" "$tg_change" '- [ ] 1.1 Code.'
+done
+TG_CONF="$TMP/test-gate.toml"
+TGST="$TMP/test-gate-state"
+for tg_change in tg-legacy tg-table tg-detected tg-env tg-default tg-fail tg-missing tg-invalid; do
+  make_review_state "$TGST" "$P_TG" "$tg_change"
+done
+tg_config() {
+  {
+    printf 'default = "opencode"\n[projects]\ntg = "%s"\n' "$P_TG"
+    printf '%s\n' "$1"
+    printf '[runners.opencode]\nkind = "opencode"\nargs = []\napply = "/opsx-apply {change}"\n'
+  } >"$TG_CONF"
+}
+tg_review() {
+  local change="$1"
+  BOSS_CONFIG="$TG_CONF" run_boss_state "$TGST" review "$change" --project "$P_TG" --json
+}
+
+tg_config '[tests]
+tg = "printf legacy"'
+out="$(tg_review tg-legacy)"
+check_eq "test gate: legacy command" "printf legacy" "$(printf '%s' "$out" | jq -r '.quality.tests.command')"
+check_eq "test gate: legacy passes" "pass" "$(printf '%s' "$out" | jq -r '.quality.tests.result')"
+check_eq "test gate: legacy default budget" "300" "$(printf '%s' "$out" | jq -r '.quality.tests.timeout_s')"
+
+tg_config '[tests.tg]
+command = "printf start; sleep 2"
+timeout_s = 1'
+out="$(tg_review tg-table)"
+check_eq "test gate: table command" "printf start; sleep 2" "$(printf '%s' "$out" | jq -r '.quality.tests.command')"
+check_eq "test gate: table timeout result" "timeout" "$(printf '%s' "$out" | jq -r '.quality.tests.result')"
+check_eq "test gate: table budget" "1" "$(printf '%s' "$out" | jq -r '.quality.tests.timeout_s')"
+TG_LOG="$(printf '%s' "$out" | jq -r '.quality.tests.log')"
+check_eq "test gate: timeout log exists" "1" "$([ -f "$TG_LOG" ] && printf 1 || printf 0)"
+check_contains "test gate: timeout log has output" "start" "$(cat "$TG_LOG" 2>/dev/null)"
+
+tg_config '[tests.tg]
+timeout_s = 1'
+out="$(tg_review tg-detected)"
+check_eq "test gate: timeout-only uses detected command" "make test" "$(printf '%s' "$out" | jq -r '.quality.tests.command')"
+check_eq "test gate: timeout-only budget" "1" "$(printf '%s' "$out" | jq -r '.quality.tests.timeout_s')"
+check_eq "test gate: timeout-only passes" "pass" "$(printf '%s' "$out" | jq -r '.quality.tests.result')"
+
+tg_config '[tests.tg]
+command = "printf hi"
+timeout_s = 1'
+out="$(BOSS_CONFIG="$TG_CONF" BOSS_REVIEW_TEST_TIMEOUT_S=7 run_boss_state "$TGST" review tg-env --project "$P_TG" --json)"
+check_eq "test gate: explicit env wins" "7" "$(printf '%s' "$out" | jq -r '.quality.tests.timeout_s')"
+
+tg_config '[tests]
+tg = "printf default"'
+out="$(tg_review tg-default)"
+check_eq "test gate: default budget" "300" "$(printf '%s' "$out" | jq -r '.quality.tests.timeout_s')"
+
+tg_config '[tests.tg]
+command = "exit 1"
+timeout_s = 5'
+out="$(tg_review tg-fail)"
+check_eq "test gate: red result" "fail" "$(printf '%s' "$out" | jq -r '.quality.tests.result')"
+check_eq "test gate: red budget" "5" "$(printf '%s' "$out" | jq -r '.quality.tests.timeout_s')"
+
+tg_config '[tests.tg]
+command = "no-such-boss-test-command"
+timeout_s = 5'
+out="$(tg_review tg-missing)"
+check_eq "test gate: missing command is not_run" "not_run" "$(printf '%s' "$out" | jq -r '.quality.tests.result')"
+check_eq "test gate: missing command reported as null" "null" "$(printf '%s' "$out" | jq -r '.quality.tests.command')"
+
+for tg_bad in 0 -1 '"abc"'; do
+  tg_config "[tests.tg]
+timeout_s = $tg_bad"
+  err="$(BOSS_CONFIG="$TG_CONF" run_boss_fail_state "$TGST" review tg-invalid --project "$P_TG" --json)"
+  check_contains "test gate: invalid budget $tg_bad" "invalid_test_timeout" "$err"
+  check_contains "test gate: invalid budget names project $tg_bad" "$P_TG" "$err"
+done
+
+# 65b. Output capture: a bounded tail and an empty-output command.
+TG_TAIL_LOG="$TMP/test-gate-tail.log"
+awk 'BEGIN { for (i = 1; i <= 100; i++) print i }' >"$TG_TAIL_LOG"
+check_eq "test gate: tail is bounded to 40 lines" "40" "$(run_lib test_output_tail "$TG_TAIL_LOG" 40 | wc -l | tr -d ' ')"
+TM_LOG="$TMP/test-gate-empty.log"
+TM_RESULT="$(run_lib test_gate_run "$TMP" "true" 5 "$TM_LOG")"
+check_eq "test gate: empty output passes" "pass" "$TM_RESULT"
+check_eq "test gate: empty output still has a log" "1" "$([ -f "$TM_LOG" ] && printf 1 || printf 0)"
+check_eq "test gate: empty output tail is empty" "" "$(run_lib test_output_tail "$TM_LOG" 40)"
+
+# 65c. A finish timeout keeps the worktree and state, records the budget and
+# output, and a retry with a larger budget reruns only the test and cleans up.
+P_TGTO="$TMP/project-test-timeout"
+make_git_project "$P_TGTO"
+make_change "$P_TGTO" tg-slow '- [ ] 1.1 Code.'
+plan_commit "$P_TGTO" tg-slow >/dev/null
+TGTO_CONF="$TMP/test-timeout.toml"
+printf 'default = "opencode"\n[projects]\ntg-slow = "%s"\n[tests.tg-slow]\ncommand = "printf started; sleep 2"\ntimeout_s = 1\n[runners.opencode]\nkind = "opencode"\nargs = []\napply = "/opsx-apply {change}"\n[missions]\nworktrees = "auto"\n' "$P_TGTO" >"$TGTO_CONF"
+TGTO_ST="$TMP/test-timeout-state"
+mkdir -p "$TGTO_ST"
+out="$(BOSS_CONFIG="$TGTO_CONF" run_boss_state "$TGTO_ST" dispatch tg-slow --project "$P_TGTO" --worktree)"
+TGTO_WT="$(printf '%s' "$out" | jq -r '.worktree')"
+if [ -z "$TGTO_WT" ] || [ ! -d "$TGTO_WT" ]; then bad "test gate: no worktree"; TGTO_WT="$TMP/missing-worktree"; fi
+printf 'tested\n' >"$TGTO_WT/tested.txt"
+git -C "$TGTO_WT" add -A; git -C "$TGTO_WT" commit -qm "tested work"
+TGTO_SF="$TGTO_ST/applies/$(run_lib sha1_hex "$P_TGTO")-tg-slow.json"
+err="$(BOSS_CONFIG="$TGTO_CONF" HERDR_LIVE_PANES=pane-tg-slow run_boss_fail_state "$TGTO_ST" finish tg-slow --project "$P_TGTO")"
+check_contains "test gate: timeout code" "merge_test_timeout" "$err"
+check_contains "test gate: timeout names budget" "1s" "$err"
+check_eq "test gate: timeout state" "test_timeout" "$(jq -r '.merge_state' "$TGTO_SF")"
+check_eq "test gate: timeout test result" "timeout" "$(jq -r '.merge_test' "$TGTO_SF")"
+check_eq "test gate: timeout merged" "true" "$(jq -r '.merged' "$TGTO_SF")"
+check_eq "test gate: timeout timestamp recorded" "1" \
+  "$([ -n "$(jq -r '.merge_test_at // empty' "$TGTO_SF")" ] && printf 1 || printf 0)"
+TGTO_LOG="$(jq -r '.merge_test_output.path' "$TGTO_SF")"
+check_eq "test gate: timeout log recorded" "1" "$([ -f "$TGTO_LOG" ] && printf 1 || printf 0)"
+check_contains "test gate: timeout tail" "started" "$(jq -r '.merge_test_output.tail' "$TGTO_SF")"
+check_eq "test gate: timeout keeps worktree" "1" "$([ -d "$TGTO_WT" ] && printf 1 || printf 0)"
+check_eq "test gate: timeout base has change" "tested" "$(cat "$P_TGTO/tested.txt")"
+TGTO_HEAD="$(git -C "$P_TGTO" rev-parse HEAD)"
+out="$(BOSS_CONFIG="$TGTO_CONF" BOSS_REVIEW_TEST_TIMEOUT_S=10 run_boss_state "$TGTO_ST" finish tg-slow --project "$P_TGTO")"
+check_eq "test gate: retry finishes" "finished" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "test gate: retry does not merge again" "$TGTO_HEAD" "$(git -C "$P_TGTO" rev-parse HEAD)"
+check_eq "test gate: retry removes worktree" "0" "$([ -e "$TGTO_WT" ] && printf 1 || printf 0)"
+check_eq "test gate: retry removes state" "0" "$([ -f "$TGTO_SF" ] && printf 1 || printf 0)"
+
+# 65c2. The base-checkout finish path uses the same gate: a red test keeps
+# test_failed, a timeout keeps test_timeout, and a larger budget finishes.
+P_TGB="$TMP/project-test-base-timeout"
+make_git_project "$P_TGB"
+make_change "$P_TGB" tgb '- [ ] 1.1 Code.'
+TGB_MARKER="$TMP/test-base-fail-marker"
+TGB_CONF="$TMP/test-base-timeout.toml"
+printf 'default = "opencode"\n[projects]\ntgb = "%s"\n[tests.tgb]\ncommand = "if [ -f '\''%s'\'' ]; then exit 1; else sleep 2; fi"\ntimeout_s = 1\n[runners.opencode]\nkind = "opencode"\nargs = []\napply = "/opsx-apply {change}"\n' "$P_TGB" "$TGB_MARKER" >"$TGB_CONF"
+TGB_ST="$TMP/test-base-timeout-state"
+mkdir -p "$TGB_ST"
+out="$(BOSS_CONFIG="$TGB_CONF" run_boss_state "$TGB_ST" dispatch tgb --project "$P_TGB")"
+check_eq "test gate base: dispatch is base checkout" "null" "$(printf '%s' "$out" | jq -r '.worktree')"
+TGB_SF="$TGB_ST/applies/$(run_lib sha1_hex "$P_TGB")-tgb.json"
+touch "$TGB_MARKER"
+err="$(BOSS_CONFIG="$TGB_CONF" run_boss_fail_state "$TGB_ST" finish tgb --project "$P_TGB")"
+check_contains "test gate base: red code" "merge_test_failed" "$err"
+check_eq "test gate base: red state" "test_failed" "$(jq -r '.merge_state' "$TGB_SF")"
+check_eq "test gate base: red result" "fail" "$(jq -r '.merge_test' "$TGB_SF")"
+check_eq "test gate base: red log recorded" "1" \
+  "$([ -f "$(jq -r '.merge_test_output.path' "$TGB_SF")" ] && printf 1 || printf 0)"
+rm -f "$TGB_MARKER"
+err="$(BOSS_CONFIG="$TGB_CONF" run_boss_fail_state "$TGB_ST" finish tgb --project "$P_TGB")"
+check_contains "test gate base: timeout code" "merge_test_timeout" "$err"
+check_eq "test gate base: timeout state" "test_timeout" "$(jq -r '.merge_state' "$TGB_SF")"
+check_eq "test gate base: timeout result" "timeout" "$(jq -r '.merge_test' "$TGB_SF")"
+out="$(BOSS_CONFIG="$TGB_CONF" BOSS_REVIEW_TEST_TIMEOUT_S=10 run_boss_state "$TGB_ST" finish tgb --project "$P_TGB")"
+check_eq "test gate base: retry finishes" "finished" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "test gate base: retry removes state" "0" "$([ -f "$TGB_SF" ] && printf 1 || printf 0)"
+
+
+# 65d. A timed-out apply consumes a slot and status names it separately.
+TGC_ST="$TMP/test-timeout-count-state"
+mkdir -p "$TGC_ST/applies"
+jq -n --arg p "$P_TGTO" '{change:"tg-slow",project:$p,pane_id:null,merge_state:"test_timeout",merged:true,merge_test:"timeout"}' \
+  >"$TGC_ST/applies/tg-slow.json"
+check_eq "test gate: timeout consumes a slot" "1" \
+  "$(HERDR_AGENTS_JSON='[]' run_lib_state "$TGC_ST" open_apply_count)"
+TGS_ST="$TMP/test-timeout-status-state"
+mkdir -p "$TGS_ST/applies"
+TGS_SF="$TGS_ST/applies/$(run_lib sha1_hex "$P_TGTO")-tg-slow.json"
+jq -n --arg p "$P_TGTO" '{change:"tg-slow",project:$p,agent:"apply-tg-slow",pane_id:null,tab_id:null,workspace_id:"ws-1",waiter_pid:null,merge_state:"test_timeout",merged:true,merge_test:"timeout"}' \
+  >"$TGS_SF"
+out="$(HERDR_AGENTS_JSON='[]' run_boss_state "$TGS_ST" status tg-slow --project "$P_TGTO")"
+check_contains "test gate: status names timeout" "merge: test_timeout (merged: true, test: timeout)" "$out"
+
+# 65e. The deadline helper keeps a non-zero early exit distinct and enforces
+# the fallback with a process-group kill when no timeout(1) is on PATH.
+run_lib run_with_deadline 1 sleep 3; TG_RC=$?
+check_eq "deadline: GNU path returns 124" "124" "$TG_RC"
+run_lib run_with_deadline 5 bash -c 'exit 1'; TG_RC=$?
+check_eq "deadline: early failure stays distinct" "1" "$TG_RC"
+TG_HIDE="$TMP/no-timeout-path"; mkdir -p "$TG_HIDE"
+for tg_tool in bash python3 sleep ps; do
+  tg_where="$(command -v "$tg_tool" 2>/dev/null || true)"
+  [ -n "$tg_where" ] && ln -sf "$tg_where" "$TG_HIDE/$tg_tool"
+done
+cat >"$TMP/wd-fallback.sh" <<EOF
+#!/usr/bin/env bash
+. "$ROOT/runtime/bin/boss-lib.sh"
+run_with_deadline 1 bash -c 'sleep 30 & printf "%s" "\$!" >"$TMP/wd-child.pid"; wait'
+printf 'rc=%s\n' "\$?"
+EOF
+chmod +x "$TMP/wd-fallback.sh"
+tg_out="$(env PATH="$TG_HIDE" "$TMP/wd-fallback.sh" 2>&1)"
+check_eq "deadline: fallback returns 124" "rc=124" "$tg_out"
+TG_CHILD="$(cat "$TMP/wd-child.pid" 2>/dev/null || true)"
+TG_CHILD_STATE=""
+[ -n "$TG_CHILD" ] && TG_CHILD_STATE="$(ps -p "$TG_CHILD" -o stat= 2>/dev/null | tr -d ' ')"
+case "$TG_CHILD_STATE" in
+  ""|Z*) ok ;;
+  *) bad "deadline: fallback left a child behind (state $TG_CHILD_STATE)" ;;
+esac
+
+
 # 66. Park keeps the worktree; resume and retrigger reuse it.
 P_WTPARK="$TMP/project-worktree-park"
 make_git_project "$P_WTPARK"
@@ -3852,6 +4070,13 @@ check_eq "acp slots: crash wake" "1" "$(acp_count "$(acp_events_file "$AS11" "$A
 S11B="$(acp_state "$AS11" "$AP" acp-slot-b)"
 if [ -f "$S11B" ]; then ok; else bad "acp slots: second apply state missing"; fi
 acp_boss "$AS11" finish acp-slot-b --project acp-test >/dev/null 2>&1
+
+# A timed-out ACP merge test still holds a slot without a live supervisor.
+ATS="$TMP/acp-timeout-slot-state"; mkdir -p "$ATS/applies"
+jq -n --arg p "$AP" '{change:"acp-timeout",project:$p,transport:"acp",merge_state:"test_timeout",merged:true,merge_test:"timeout",acp:{supervisor_pid:null}}' \
+  >"$ATS/applies/acp-timeout.json"
+check_eq "acp test_timeout: consumes a slot" "1" \
+  "$(HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$ACP_CONF" run_lib_state "$ATS" open_apply_count)"
 
 # 68. Locks remain transport-neutral: an ACP apply holds its declared lock.
 WL="$TMP/acp-lock-project"

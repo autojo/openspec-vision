@@ -343,8 +343,8 @@ The worktree lives outside the project tree at
 `$BOSS_STATE_DIR/worktrees/<sha1(project)>/<change>`, on branch
 `boss/<change>`, in its own Herdr workspace. The apply state stays keyed by the
 base project and change and records `worktree`, `branch`,
-`worktree_workspace`, `base_head`, `merge_state`, `merged`, `merge_test` and
-`kept`. `boss status <change> --project <base>` and `boss review` find the
+`worktree_workspace`, `base_head`, `merge_state`, `merged`, `merge_test`,
+`merge_test_at` and `merge_test_output` and `kept`. `boss status <change> --project <base>` and `boss review` find the
 apply from the base and read git, tasks, validation and tests from the
 worktree; the mission and plan stay in the base. A legacy state without these
 fields keeps the base-checkout behaviour.
@@ -362,7 +362,11 @@ A merge conflict aborts the merge, sets `merge_state=conflict`, keeps the
 worktree and state, and reports `merge_conflict` with the conflicting paths. A
 red integration test keeps the state with `merged=true` and
 `merge_state=test_failed`, reports `merge_test_failed`, and lets a later
-`boss finish` retry the test after the fix on the base. `--keep-worktree`
+`boss finish` retry the test after the fix on the base. A test that exceeds its
+budget keeps the state with `merge_state=test_timeout`, reports
+`merge_test_timeout`, and retries with a larger budget without merging again
+(see [Test gate](#test-gate)); the base-checkout finish path runs the same gate.
+`--keep-worktree`
 merges and tests but keeps the worktree, branch and state (`kept=true`,
 `merge_state=done`) for inspection; `--no-merge` closes the tab and keeps them
 for a manual merge without recording a finish. A later `boss finish` cleans up
@@ -373,10 +377,59 @@ reuses the same worktree and branch and starts a fresh agent there; `boss
 retrigger` continues in the same worktree, or starts a new agent there when the
 old one is gone. A missing worktree fails with `worktree_missing` instead of
 silently using the base checkout. `boss doctor` reports a missing worktree
-path, a `conflict`/`test_failed` state, an uncommitted change dir, orphaned
+path, a `conflict`/`test_failed`/`test_timeout` state, an uncommitted change dir, orphaned
 worktrees under the state root, a dirty base and an uncommitted plan.
 `boss doctor --fix` removes only merged worktrees that belong to a kept or
 finished state; unmerged worktrees are only reported.
+
+## Test gate
+
+`boss review` and `boss finish` run the project's test command with a persistent,
+per-project budget. Configure it in `boss.toml`; the key is the registered
+project name from `[projects]`:
+
+```toml
+[tests.shop]
+command = "nice -n 10 taskset -c 0-2 npx vitest run"
+timeout_s = 1800
+```
+
+`command` is optional: without it the detected command (`just test`,
+`npm test`, `pytest`, `make test`) runs with the configured budget. The legacy
+string form stays valid and means "this command, default budget":
+
+```toml
+[tests]
+shop = "npm test"
+```
+
+The budget is resolved as:
+
+1. `BOSS_REVIEW_TEST_TIMEOUT_S`, when it was explicitly set for this process;
+2. `[tests.<project>].timeout_s`;
+3. 300 seconds.
+
+A configured value must be a positive integer number of seconds; zero,
+negative and non-numeric values are rejected with `invalid_test_timeout`
+naming the project. The budget is a hang guard, not a liveness check: raise it
+for a suite that legitimately needs longer, and do not wrap the suite in an
+outer `timeout` shorter than the budget.
+
+A test that exceeds its budget is a `timeout`, not a red test. `boss review`
+reports `quality.tests.result` as `pass`, `fail`, `timeout` or `not_run`
+together with `timeout_s` and the log path. `boss finish` records
+`merge_state=test_timeout` and `merge_test=timeout`, keeps the worktree and
+state, and reports `merge_test_timeout` with the budget and log path. Raise the
+budget and run `boss finish` again: the merge is skipped, only the test reruns,
+and a green result finishes and cleans up as usual. A red test keeps
+`merge_state=test_failed` and `merge_test_failed`.
+
+Every review and finish test writes its output to a log under
+`$BOSS_STATE_DIR/logs/` (the path is reported). On a timeout or failure the
+apply state also keeps `merge_test_at` and `merge_test_output`
+(`{path, tail}` with the last 40 lines). A timed-out apply counts as unfinished
+for `[missions] max_parallel` and appears in `boss status` as
+`merge: test_timeout (... test: timeout)`.
 
 ## Parallel missions
 
@@ -394,8 +447,9 @@ BOSS_MAX_PARALLEL=2 boss mission next v1 --project shop
 ```
 
 The limit is global and counts running applies across projects. A parked,
-finished or merged/kept apply does not consume a slot; a `test_failed` or
-`conflict` state does, because the change is unfinished. A dispatch beyond the
+finished or merged/kept apply does not consume a slot; a `test_failed`,
+`test_timeout` or `conflict` state does, because the change is unfinished. A
+dispatch beyond the
 limit returns `parallel_limit` with `current`, `max` and `slots_free` and starts
 nothing. `BOSS_DISPATCH_MAX_APPLIES`, `BOSS_DISPATCH_MIN_FREE_MB` and
 `BOSS_DISPATCH_MAX_LOAD` remain advisory resource warnings; a user who raises
@@ -434,8 +488,8 @@ boss dispatch docs-fix --project shop --touches none
 
 `boss dispatch` and `boss mission next` check locks before creating a worktree
 or tab and return `lock_conflict` with the holding change. Holders are running
-applies, parked applies with a worktree, and `conflict`/`test_failed` states. A
-merged green kept worktree holds no locks. Releasing a lock means merging or
+applies, parked applies with a worktree, and `conflict`/`test_failed`/
+`test_timeout` states. A merged green kept worktree holds no locks. Releasing a lock means merging or
 finishing the holder; there is no manual release command.
 
 ### Filling slots
@@ -710,9 +764,10 @@ control, so the boundaries are worth stating once:
   `deny = [...]` in its `[runners.<name>]` table; `deny = []` turns it off.
   The check never blocks a dispatch - it makes a weak configuration visible.
 - **`boss review` runs the project's test command.** It executes what it
-  detects (`just test`, `npm test`, `pytest`, `make test`, or the `[tests]`
-  override). That is code from the target repository, run with the user's
-  rights, exactly as a developer would run it.
+  detects (`just test`, `npm test`, `pytest`, `make test`, the legacy `[tests]`
+  string or `[tests.<project>].command`) with the resolved budget. That is code
+  from the target repository, run with the user's rights, exactly as a developer
+  would run it.
 - **Worktrees isolate, they do not sandbox.** Parallel applies run in their own
   worktree and branch, which keeps two changes out of each other's index; it is
   not a security boundary either.

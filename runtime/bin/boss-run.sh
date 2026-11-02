@@ -410,6 +410,40 @@ cmd_retrigger() {
     '{change: $change, project: $project, agent: $agent, status: $status}')"
 }
 
+# finish_run_test <project> <change> <command> <timeout-seconds> -- run the
+# finish test gate on the base checkout and print compact JSON with the result,
+# log path, timestamp, budget and a bounded output tail.
+finish_run_test() {
+  local project="$1" change="$2" cmd="$3" secs="$4" log result at tail
+  log="$(test_log_file "$change" finish)"
+  [ -n "$log" ] || log="/dev/null"
+  result="$(test_gate_run "$project" "$cmd" "$secs" "$log")"
+  at="$(now_iso)"
+  tail="$(test_output_tail "$log" 40)"
+  jq -nc --arg result "$result" --arg log "$log" --arg at "$at" \
+    --argjson timeout_s "$secs" --arg tail "$tail" \
+    '{result: $result, log: $log, at: $at, timeout_s: $timeout_s, tail: $tail}'
+}
+
+# finish_record_test <state-file> <merge-state> <merge-test> <gate-json> --
+# record the test outcome, timestamp and captured output on the apply state.
+finish_record_test() {
+  local f="$1" ms="$2" mt="$3" gate="$4" tmp
+  tmp="$(mktemp)"
+  if jq --arg ms "$ms" --arg mt "$mt" \
+      --arg at "$(printf '%s' "$gate" | jq -r '.at')" \
+      --arg path "$(printf '%s' "$gate" | jq -r '.log')" \
+      --arg tail "$(printf '%s' "$gate" | jq -r '.tail')" \
+      '.merged = true | .merge_state = $ms | .merge_test = $mt
+       | .merge_test_at = $at | .merge_test_output = {path: $path, tail: $tail}
+       | .last_state_at = $at' "$f" >"$tmp" 2>/dev/null; then
+    mv "$tmp" "$f"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
 # tasks_file_for <project> <change> -- active or archived tasks.md, or empty
 finish_worktree() {
   local change="$1" project="$2" state_file="$3" worktree="$4" branch="$5"
@@ -496,7 +530,7 @@ finish_worktree() {
   fi
 
   # Integration test on the merged base. 'not_run' passes, as in review.
-  local test_cmd="" test_result="not_run"
+  local test_cmd="" test_result="not_run" test_timeout=300 test_gate="" test_log=""
   test_cmd="$(config_test_command "$project")"
   [ -n "$test_cmd" ] || test_cmd="$(detect_test_command "$project")"
   if [ -n "$test_cmd" ] && ! command -v "${test_cmd%% *}" >/dev/null 2>&1; then
@@ -504,25 +538,22 @@ finish_worktree() {
     test_cmd=""
   fi
   if [ -n "$test_cmd" ]; then
-    if (cd "$project" && run_with_deadline "$BOSS_REVIEW_TEST_TIMEOUT_S" bash -c "$test_cmd" >/dev/null 2>&1); then
-      test_result="pass"
-    else
-      test_result="fail"
-    fi
+    test_timeout="$(config_test_timeout "$project")"
+    test_gate="$(finish_run_test "$project" "$change" "$test_cmd" "$test_timeout")"
+    test_result="$(printf '%s' "$test_gate" | jq -r '.result')"
+    test_log="$(printf '%s' "$test_gate" | jq -r '.log')"
   fi
 
   local done_now tmp
   done_now="$(now_iso)"
+  if [ "$test_result" = "timeout" ]; then
+    finish_record_test "$state_file" "test_timeout" "timeout" "$test_gate" || true
+    die_json "merge_test_timeout" "the change merged into $project but '$test_cmd' did not finish within ${test_timeout}s on the merged base (log: $(printf '%s' "$test_gate" | jq -r '.log')); raise [tests.<project>].timeout_s or BOSS_REVIEW_TEST_TIMEOUT_S and run boss finish again" \
+      "$(printf '%s' "$test_gate" | jq -c --argjson timeout_s "$test_timeout" '{timeout_s: $timeout_s, log}')"
+  fi
   if [ "$test_result" = "fail" ]; then
-    tmp="$(mktemp)"
-    if jq --arg t "$done_now" \
-        '.merged = true | .merge_state = "test_failed" | .merge_test = "fail"
-         | .last_state_at = $t' "$state_file" >"$tmp" 2>/dev/null; then
-      mv "$tmp" "$state_file"
-    else
-      rm -f "$tmp"
-    fi
-    die_json "merge_test_failed" "the change merged into $project but '$test_cmd' failed on the merged base; the state was kept so a second finish can retry after the fix"
+    finish_record_test "$state_file" "test_failed" "fail" "$test_gate" >/dev/null 2>&1 || true
+    die_json "merge_test_failed" "the change merged into $project but '$test_cmd' failed on the merged base (log: $(printf '%s' "$test_gate" | jq -r '.log')); the state was kept so a second finish can retry after the fix"
   fi
   if [ -n "$test_cmd" ]; then
     merge_test="$test_result"
@@ -530,14 +561,19 @@ finish_worktree() {
     merge_test="not_run"
   fi
 
-  tmp="$(mktemp)"
-  if jq --arg t "$done_now" --arg ms "done" --arg mt "$merge_test" \
-      '.merged = true | .merge_state = $ms | .merge_test = $mt | .last_state_at = $t' \
-      "$state_file" >"$tmp" 2>/dev/null; then
-    mv "$tmp" "$state_file"
+  if [ -n "$test_gate" ]; then
+    finish_record_test "$state_file" "done" "$merge_test" "$test_gate" \
+      || die_json "state_write" "cannot update state file $state_file"
   else
-    rm -f "$tmp"
-    die_json "state_write" "cannot update state file $state_file"
+    tmp="$(mktemp)"
+    if jq --arg t "$done_now" --arg ms "done" --arg mt "$merge_test" \
+        '.merged = true | .merge_state = $ms | .merge_test = $mt | .last_state_at = $t' \
+        "$state_file" >"$tmp" 2>/dev/null; then
+      mv "$tmp" "$state_file"
+    else
+      rm -f "$tmp"
+      die_json "state_write" "cannot update state file $state_file"
+    fi
   fi
 
   # Snapshot the friction before the state file disappears.
@@ -594,9 +630,12 @@ finish_worktree() {
       --arg worktree "$worktree" --arg branch "$branch" --arg status "kept" \
       --argjson archived "$archived" --argjson lesson "$lesson_json" \
       --arg merge_state "$merge_state" --arg merge_test "$merge_test" \
+      --argjson test_timeout "$test_timeout" --arg test_log "$test_log" \
       '{change: $change, project: $project, status: $status, kept: true,
         worktree: $worktree, branch: $branch, merge_state: "done",
-        merged: true, merge_test: $merge_test, archived: $archived, lesson: $lesson}')"
+        merged: true, merge_test: $merge_test, test_timeout: $test_timeout,
+        test_log: (if $test_log == "" then null else $test_log end),
+        archived: $archived, lesson: $lesson}')"
     return 0
   fi
 
@@ -614,10 +653,13 @@ finish_worktree() {
   printf '%s\n' "$(jq -n --arg change "$change" --arg project "$project" \
     --arg worktree "$worktree" --arg branch "$branch" --arg status "finished" \
     --arg json_merge_state "done" --arg merge_test "$merge_test" \
+    --argjson test_timeout "$test_timeout" --arg test_log "$test_log" \
     --argjson archived "$archived" --argjson lesson "$lesson_json" \
     '{change: $change, project: $project, status: $status,
       worktree: $worktree, branch: $branch, removed: true,
       merge_state: $json_merge_state, merged: true, merge_test: $merge_test,
+      test_timeout: $test_timeout,
+      test_log: (if $test_log == "" then null else $test_log end),
       archived: $archived, lesson: $lesson,
       working_tree_warning: false, changed_files: []}')"
 }
@@ -703,6 +745,32 @@ cmd_finish() {
   fi
   kill_waiter "$waiter_pid"
 
+  # The base-checkout path has no merge step, but it runs the same test gate so
+  # a serial apply cannot be finished with a red or timed-out suite either.
+  local test_cmd="" test_result="not_run" test_timeout=300 test_gate="" test_log="" merge_test="not_run"
+  test_cmd="$(config_test_command "$project")"
+  [ -n "$test_cmd" ] || test_cmd="$(detect_test_command "$project")"
+  if [ -n "$test_cmd" ] && ! command -v "${test_cmd%% *}" >/dev/null 2>&1; then
+    log "test command '$test_cmd' not found in PATH; reporting not_run"
+    test_cmd=""
+  fi
+  if [ -n "$test_cmd" ]; then
+    test_timeout="$(config_test_timeout "$project")"
+    test_gate="$(finish_run_test "$project" "$change" "$test_cmd" "$test_timeout")"
+    test_result="$(printf '%s' "$test_gate" | jq -r '.result')"
+    test_log="$(printf '%s' "$test_gate" | jq -r '.log')"
+    merge_test="$test_result"
+  fi
+  if [ "$test_result" = "timeout" ]; then
+    finish_record_test "$state_file" "test_timeout" "timeout" "$test_gate" || true
+    die_json "merge_test_timeout" "the base checkout $project did not finish '$test_cmd' within ${test_timeout}s (log: $test_log); raise [tests.<project>].timeout_s or BOSS_REVIEW_TEST_TIMEOUT_S and run boss finish again" \
+      "$(printf '%s' "$test_gate" | jq -c --argjson timeout_s "$test_timeout" '{timeout_s: $timeout_s, log}')"
+  fi
+  if [ "$test_result" = "fail" ]; then
+    finish_record_test "$state_file" "test_failed" "fail" "$test_gate" >/dev/null 2>&1 || true
+    die_json "merge_test_failed" "the base checkout $project failed '$test_cmd' (log: $test_log); the state was kept so a second finish can retry after the fix"
+  fi
+
   # Snapshot the friction before the state file (and with it started_at/note)
   # disappears: append the raw finish event and one aggregated cycle record.
   local ev retriggers blocked_count waiter_lost duration_s tasks_open started_at tasks_file
@@ -766,9 +834,11 @@ cmd_finish() {
   printf '%s\n' "$(jq -n \
     --arg change "$change" --arg project "$project" --arg tab_id "$tab_id" --arg status "finished" \
     --argjson archived "$archived" --argjson lesson "$lesson_json" \
+    --arg merge_test "$merge_test" --argjson test_timeout "$test_timeout" --arg test_log "$test_log" \
     --arg commit_policy "$commit_policy" --argjson working_tree_warning "$working_tree_warning" \
     --argjson changed_files "$(printf '%s' "$changed_files" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     '{change: $change, project: $project, tab_id: $tab_id, archived: $archived, lesson: $lesson,
+      merge_test: $merge_test, test_timeout: $test_timeout, test_log: (if $test_log == "" then null else $test_log end),
       commit_policy: $commit_policy, working_tree_warning: $working_tree_warning,
       changed_files: $changed_files, status: $status}')"
 }
