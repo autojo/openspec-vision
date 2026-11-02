@@ -102,7 +102,7 @@ log path in its result.
 ### Requirement: Finish timeout
 
 When the merged-base test exceeds its budget, finish SHALL keep the worktree and
-state, record `merge_state = test_timeout`, `merge_test = test_timeout`,
+state, record `merge_state = test_timeout`, `merge_test = timeout`,
 `merge_test_at` and `merge_test_output`, and report `merge_test_timeout` with
 the budget and log path. A retry with a larger budget SHALL re-run only the test
 and SHALL not merge again.

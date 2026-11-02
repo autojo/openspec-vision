@@ -82,7 +82,7 @@ doctor_check_worktrees() {
         continue
       fi
       case "$wt_ms" in
-        conflict|test_failed) wt_warn="$wt_warn $wt_ch:merge_state=$wt_ms" ;;
+        conflict|test_failed|test_timeout) wt_warn="$wt_warn $wt_ch:merge_state=$wt_ms" ;;
       esac
       if [ -d "$wt_path/openspec/changes/$wt_ch" ]; then
         local wt_plan_dirty

@@ -70,21 +70,78 @@ is_project_registered() {
   return 1
 }
 
-# config_test_command <project> -- the [tests] override for the registered
-# project whose path resolves to <project>, or empty. The registry maps a name
-# to a path, so the override is keyed by that name.
-config_test_command() {
-  local project="$1" cfg name path
+# _config_test_entry <project> -- "<name>\t<json>" for the [tests] entry of the
+# registered project whose path resolves to <project>, or empty. The registry
+# maps a name to a path, so the override is keyed by that name. A string is the
+# legacy command form; a table is the structured form.
+_config_test_entry() {
+  local project="$1" cfg name path entry
   cfg="$(config_json)" || exit 1
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     path="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.projects[$n] // empty')"
     [ -n "$path" ] || continue
     if [ "$(canonical_path "$path")" = "$project" ]; then
-      printf '%s' "$(printf '%s' "$cfg" | jq -r --arg n "$name" '.tests[$n] // empty')"
+      entry="$(printf '%s' "$cfg" | jq -c --arg n "$name" '.tests[$n] // empty')"
+      [ "$entry" = "null" ] && entry=""
+      [ -n "$entry" ] || return 0
+      printf '%s\t%s\n' "$name" "$entry"
       return 0
     fi
   done < <(printf '%s' "$cfg" | jq -r '(.tests // {}) | keys[]')
+  return 0
+}
+
+# config_test_command <project> -- the command from the [tests] override for
+# the registered project whose path resolves to <project>, or empty. The
+# legacy string form defines the command; a table may define `command`, and a
+# table without it falls back to detection.
+config_test_command() {
+  local project="$1" line name entry
+  line="$(_config_test_entry "$project")"
+  [ -n "$line" ] || return 0
+  IFS=$'\t' read -r name entry <<<"$line"
+  printf '%s' "$entry" | jq -r '
+    if type == "string" then .
+    elif type == "object" then (.command // "")
+    else "" end'
+}
+
+# _validate_test_timeout <value> <source> <project> -- abort unless <value> is a
+# positive integer number of seconds. The error names the source and project.
+_validate_test_timeout() {
+  local value="$1" source="$2" project="$3"
+  case "$value" in
+    ''|*[!0-9]*) ;;
+    *) [ "$value" -gt 0 ] 2>/dev/null && return 0 ;;
+  esac
+  die_json "invalid_test_timeout" "$source must be a positive integer number of seconds, got '$value' (project: $project)"
+}
+
+# config_test_timeout <project> -- the test budget in seconds. Precedence:
+# explicit BOSS_REVIEW_TEST_TIMEOUT_S, then [tests.<project>].timeout_s, then
+# 300. The environment counts only when it was really set; the library default
+# would otherwise outrank the project table.
+config_test_timeout() {
+  local project="$1" line name entry configured="" source
+  if [ "$BOSS_REVIEW_TEST_TIMEOUT_S_EXPLICIT" = "true" ]; then
+    _validate_test_timeout "$BOSS_REVIEW_TEST_TIMEOUT_S" "BOSS_REVIEW_TEST_TIMEOUT_S" "$project"
+    printf '%s' "$BOSS_REVIEW_TEST_TIMEOUT_S"
+    return 0
+  fi
+  line="$(_config_test_entry "$project")"
+  if [ -n "$line" ]; then
+    IFS=$'\t' read -r name entry <<<"$line"
+    configured="$(printf '%s' "$entry" | jq -r '
+      if type == "object" and has("timeout_s") then (.timeout_s | tostring) else empty end')"
+  fi
+  if [ -n "$configured" ]; then
+    source="[tests.$name].timeout_s"
+    _validate_test_timeout "$configured" "$source" "$project"
+    printf '%s' "$configured"
+    return 0
+  fi
+  printf '300'
 }
 
 # detect_test_command <project> -- a recognizable standard test command, or empty
@@ -239,7 +296,7 @@ cmd_review() {
     fi
   fi
 
-  local test_cmd test_result="not_run"
+  local test_cmd test_result="not_run" test_timeout test_log=""
   test_cmd="$(config_test_command "$project")"
   [ -n "$test_cmd" ] || test_cmd="$(detect_test_command "$review_root")"
   # A command whose program is not installed did not run and must not read as
@@ -248,12 +305,11 @@ cmd_review() {
     log "test command '$test_cmd' not found in PATH; reporting not_run"
     test_cmd=""
   fi
+  test_timeout="$(config_test_timeout "$project")"
   if [ -n "$test_cmd" ]; then
-    if (cd "$review_root" && run_with_deadline "$BOSS_REVIEW_TEST_TIMEOUT_S" bash -c "$test_cmd" >/dev/null 2>&1); then
-      test_result="pass"
-    else
-      test_result="fail"
-    fi
+    test_log="$(test_log_file "$change" review)"
+    [ -n "$test_log" ] || test_log="/dev/null"
+    test_result="$(test_gate_run "$review_root" "$test_cmd" "$test_timeout" "$test_log")"
   fi
 
   local changed_files diff_stat
@@ -348,6 +404,7 @@ cmd_review() {
     --arg change "$change" --arg project "$project" \
     --argjson tasks "$tasks_json" --arg validate "$validate_result" \
     --arg test_result "$test_result" --arg test_cmd "$test_cmd" \
+    --argjson test_timeout "$test_timeout" --arg test_log "$test_log" \
     --argjson changed_files "$(printf '%s' "$changed_files" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     --argjson diff_stat "$(printf '%s' "$diff_stat" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     --arg base_head "$base_head" \
@@ -382,7 +439,8 @@ cmd_review() {
       inbox_pending: $inbox_pending,
       lessons: {global: $lessons_global, project: $lessons_project},
       quality: {tasks: $tasks, validate: $validate,
-        tests: {result: $test_result, command: (if $test_cmd == "" then null else $test_cmd end)},
+        tests: {result: $test_result, command: (if $test_cmd == "" then null else $test_cmd end),
+          timeout_s: $test_timeout, log: (if $test_log == "" then null else $test_log end)},
         git: {base_head: (if $base_head == "" then null else $base_head end),
           commits: $commits, diff_stat_range: $diff_stat_range,
           commit_policy: $commit_policy,
@@ -405,6 +463,9 @@ cmd_review() {
     printf 'branch: %s\n' "${branch:-unknown}"
   fi
   printf 'merge: %s (merged: %s, test: %s)\n' "$merge_state" "$merged" "$merge_test"
+  if [ "$test_result" = "fail" ] || [ "$test_result" = "timeout" ]; then
+    printf 'tests: %s (%ss) -- log: %s\n' "$test_result" "$test_timeout" "$test_log"
+  fi
   printf '%s' "$overlaps" | jq -r '.[] | "overlap: \(.file) (changes: \(.changes | join(", ")))"'
   if [ "$boss_state" = "name_stale" ]; then
     printf 'warning: workspace boss %s on pane %s lost its Herdr name; the waiter may not wake it (run boss claim there to heal it)\n' "${boss:-unknown}" "${boss_pane:-unknown}"

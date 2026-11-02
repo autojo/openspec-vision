@@ -248,7 +248,11 @@ detected test command on the merged base, then closes the tab, removes the
 worktree, deletes the branch and the state. On a conflict it aborts the merge,
 keeps worktree and state and returns `merge_conflict` with the paths. A red
 integration test keeps the state with `merge_state=test_failed` and
-`merge_test_failed`; fix on the base and run `boss finish` again. Under
+`merge_test_failed`; fix on the base and run `boss finish` again. A test that
+exceeds the project's budget keeps the state with `merge_state=test_timeout`
+and reports `merge_test_timeout` with the budget and log path; raise
+`[tests.<project>].timeout_s` (or `BOSS_REVIEW_TEST_TIMEOUT_S`) and run
+`boss finish` again - the merge is skipped and only the test reruns. Under
 `explorer` the worktree must be clean and the Explorer commits the reviewed
 change paths there first; under `agent` verify the commits. `--keep-worktree`
 merges and tests but keeps the worktree, branch and state (`kept=true`,
@@ -259,8 +263,9 @@ event. A later `finish` cleans up either path.
 a fresh agent in the same worktree; `boss retrigger` continues in place, or
 starts a new agent there when the old one is gone. A missing worktree fails with
 `worktree_missing`; never fall back to the base checkout. `boss doctor` reports
-missing worktree paths, conflicted or test-failed states, uncommitted change
-dirs, orphaned worktrees, a dirty base and an uncommitted plan.
+missing worktree paths, conflicted, test-failed or test-timeout states,
+uncommitted change dirs, orphaned worktrees, a dirty base and an uncommitted
+plan.
 
 ### Caller identity and wake targets
 
@@ -654,6 +659,7 @@ Follow this fixed table instead of asking (review outcome -> one action):
 | `tasks.open > 0` (unmarked), diff plausible | `retrigger` with the open tasks as note |
 | `validate: fail` | fix proposal/specs with the openspec instructions, then `retrigger` |
 | `tests.result: fail` | fix, then `retrigger` with the failing command |
+| `tests.result: timeout` | raise the project's test budget, then `retrigger` (or `finish` again); do not treat it as a red test |
 | diff not plausible | read the diff, then `retrigger` with a note |
 | green (open 0, validate pass, tests pass or not_run, diff plausible) | `finish` |
 | archive | archive only when no later change depends on the spec deltas |
