@@ -1,0 +1,41 @@
+2026-11-02T12:37:43+01:00
+pwd: /home/ps/.local/state/openspec-boss/worktrees/6f34b479a2b363e9ce7915181978bfe836f2321e/vision-skill-external-review
+
+=== bash -n ===
+bash -n runtime/bin/boss               OK
+bash -n runtime/bin/boss-acp           OK
+bash -n runtime/bin/boss-apply.sh      OK
+bash -n runtime/bin/boss-doctor.sh     OK
+bash -n runtime/bin/boss-lib.sh        OK
+bash -n runtime/bin/boss-mission.sh    OK
+bash -n runtime/bin/boss-review.sh     OK
+bash -n runtime/bin/boss-run.sh        OK
+bash -n runtime/bin/boss-status.sh     OK
+bash -n runtime/bin/boss-waiter        OK
+bash -n scripts/check-generated.sh     OK
+bash -n scripts/gen-commands.sh        OK
+bash -n scripts/runtime-manifest.sh    OK
+bash -n install.sh                     OK
+bash -n tests/run.sh                   OK
+bash_n_exit=0
+
+=== shellcheck -S warning ===
+shellcheck runtime/bin/boss               OK
+shellcheck runtime/bin/boss-acp           OK
+shellcheck runtime/bin/boss-apply.sh      OK
+shellcheck runtime/bin/boss-doctor.sh     OK
+shellcheck runtime/bin/boss-lib.sh        OK
+shellcheck runtime/bin/boss-mission.sh    OK
+shellcheck runtime/bin/boss-review.sh     OK
+shellcheck runtime/bin/boss-run.sh        OK
+shellcheck runtime/bin/boss-status.sh     OK
+shellcheck runtime/bin/boss-waiter        OK
+shellcheck scripts/check-generated.sh     OK
+shellcheck scripts/gen-commands.sh        OK
+shellcheck scripts/runtime-manifest.sh    OK
+shellcheck install.sh                     OK
+shellcheck tests/run.sh                   OK
+shellcheck_exit=0
+
+=== python3 -m py_compile runtime/lib/boss_acp.py ===
+py_compile_exit=0

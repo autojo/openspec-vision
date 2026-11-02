@@ -1,0 +1,12 @@
+2026-11-02T12:39:04+01:00
+=== ./scripts/check-generated.sh ===
+openspec instruction files are not current (openspec update --dry-run, rc=0):
+6 file(s) would change:
+  update  .opencode/skills/openspec-apply-change/SKILL.md  (opencode)
+  update  .opencode/skills/openspec-archive-change/SKILL.md  (opencode)
+  update  .opencode/skills/openspec-explore/SKILL.md  (opencode)
+  update  .opencode/skills/openspec-propose/SKILL.md  (opencode)
+  update  .opencode/skills/openspec-sync-specs/SKILL.md  (opencode)
+  update  .opencode/skills/openspec-update-change/SKILL.md  (opencode)
+Regenerate them with: openspec update
+check_generated_exit=1

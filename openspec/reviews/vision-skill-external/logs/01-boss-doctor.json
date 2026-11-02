@@ -1,0 +1,131 @@
+{
+  "project": "/home/ps/.local/state/openspec-boss/worktrees/6f34b479a2b363e9ce7915181978bfe836f2321e/vision-skill-external-review",
+  "status": "warn",
+  "checks": [
+    {
+      "id": "openspec_cli",
+      "status": "ok",
+      "hint": null
+    },
+    {
+      "id": "herdr_cli",
+      "status": "ok",
+      "hint": null
+    },
+    {
+      "id": "dependencies",
+      "status": "ok",
+      "hint": null
+    },
+    {
+      "id": "project_init",
+      "status": "warn",
+      "hint": "run 'openspec init --tools claude,opencode' in /home/ps/.local/state/openspec-boss/worktrees/6f34b479a2b363e9ce7915181978bfe836f2321e/vision-skill-external-review"
+    },
+    {
+      "id": "herdr_integration",
+      "status": "ok",
+      "hint": null
+    },
+    {
+      "id": "runner_path",
+      "status": "ok",
+      "hint": null
+    },
+    {
+      "id": "workspace",
+      "status": "ok",
+      "hint": null
+    },
+    {
+      "id": "test_command",
+      "status": "warn",
+      "hint": "no test command recognized; the review will report not_run"
+    },
+    {
+      "id": "worktree_support",
+      "status": "ok",
+      "hint": null
+    },
+    {
+      "id": "worktree_state",
+      "status": "ok",
+      "hint": null
+    },
+    {
+      "id": "worktree_orphans",
+      "status": "ok",
+      "hint": null
+    },
+    {
+      "id": "project_registry",
+      "status": "warn",
+      "hint": "add '/home/ps/.local/state/openspec-boss/worktrees/6f34b479a2b363e9ce7915181978bfe836f2321e/vision-skill-external-review' under [projects] in /home/ps/.config/openspec-boss/boss.toml"
+    },
+    {
+      "id": "boss_registry",
+      "status": "ok",
+      "hint": null
+    },
+    {
+      "id": "wake_target",
+      "status": "ok",
+      "hint": null
+    },
+    {
+      "id": "caller_identity",
+      "status": "warn",
+      "hint": "caller identity mismatch: environment pane wE:pA has cwd /home/ps/work/vision-skill but the calling process runs in /home/ps/.local/state/openspec-boss/worktrees/6f34b479a2b363e9ce7915181978bfe836f2321e/vision-skill-external-review; process ancestry matched no Herdr pane, so the caller identity is unverified. Pass --as <pane|agent> or run 'boss retarget <change>' from the right pane"
+    },
+    {
+      "id": "mission_human_dependencies",
+      "status": "ok",
+      "hint": null
+    },
+    {
+      "id": "mission_runners",
+      "status": "ok",
+      "hint": null
+    },
+    {
+      "id": "mission_parallel",
+      "status": "ok",
+      "hint": "max_parallel = 4; parallel mode uses worktrees only"
+    },
+    {
+      "id": "mission_parallel_locks",
+      "status": "ok",
+      "hint": null
+    },
+    {
+      "id": "write_access",
+      "status": "warn",
+      "hint": "run 'boss doctor --fix' to create the journal/lessons/missions directories"
+    },
+    {
+      "id": "boss_permission",
+      "status": "ok",
+      "hint": "the effective OpenCode V2 config has no broad deny for shell, edit, read or external directory; explicit deny rules still apply"
+    },
+    {
+      "id": "policy",
+      "status": "warn",
+      "hint": "runner 'opencode' denies no destructive command (missing: git push --force, git push -f, git push --mirror, git push --delete, git filter-branch, git filter-repo); add a deny rule for each missing pattern to the OpenCode config"
+    },
+    {
+      "id": "opencode_runner_args",
+      "status": "ok",
+      "hint": "the OpenCode V2 runner receives --auto"
+    },
+    {
+      "id": "acp_runner:goose",
+      "status": "ok",
+      "hint": "command goose, protocol 1, models deepseek-flash, deepseek-v4-pro, deepseek-reasoner"
+    },
+    {
+      "id": "acp_runner:goose-review",
+      "status": "ok",
+      "hint": "command goose, protocol 1, models deepseek-flash, deepseek-v4-pro, deepseek-reasoner"
+    }
+  ]
+}

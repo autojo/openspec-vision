@@ -1,0 +1,24 @@
+2026-11-02T12:40:04+01:00
+=== 3.2/3.3 report self-check (re-run after edits) ===
+referenced logs: 10; missing: none
+logs on disk not referenced: none
+  OK   logs/10-tests.log: '986 passed, 0 failed'
+  OK   logs/11-static-gates.log: 'bash_n_exit=0'
+  OK   logs/11-static-gates.log: 'shellcheck_exit=0'
+  OK   logs/11-static-gates.log: 'py_compile_exit=0'
+  OK   logs/12-repo-gates.log: 'runtime_manifest_verify_exit=0'
+  OK   logs/12-repo-gates.log: 'gen_commands_check_exit=0'
+  OK   logs/12-repo-gates.log: 'openspec_validate_exit=0'
+  OK   logs/12-repo-gates.log: '(11 files)'
+  OK   logs/13-generated.log: 'check_generated_exit=1'
+  OK   logs/13-generated.log: '6 file(s) would change'
+  OK   logs/14-osv-scanner.log: 'osv_scanner_exit=128'
+  OK   logs/14-osv-scanner.log: 'No package sources found'
+  OK   logs/15-worktree-after.log: '?? openspec/reviews/'
+  OK   logs/15-worktree-after.log: '!! runtime/lib/__pycache__/'
+  OK   logs/16-generated-drift-evidence.log: '3ade5035'
+
+all log claims hold: yes
+gate rows: green 8 yellow 2 red 0
+no gate claimed without a log: every table row has a logs/ path -> True
+source dirs untouched claim checked in 15-worktree-after.log (git diff empty)

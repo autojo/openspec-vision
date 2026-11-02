@@ -1,0 +1,7 @@
+2026-11-02T12:39:07+01:00
+=== osv-scanner scan source -r . ===
+Scanning dir .
+Starting filesystem walk for root: /
+End status: 55 dirs visited, 174 inodes visited, 0 Extract calls, 4.130794ms elapsed, 4.131387ms wall time
+No package sources found, --help for usage information.
+osv_scanner_exit=128

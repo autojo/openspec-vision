@@ -1,0 +1,14 @@
+2026-11-02T12:39:10+01:00
+=== git status --short ===
+?? openspec/reviews/
+--- exit=0 ---
+
+=== git status --short --ignored (untracked+ignored) ===
+?? openspec/reviews/
+!! runtime/lib/__pycache__/
+
+=== git diff --stat (tracked changes) ===
+(empty means no tracked file changed)
+
+=== git diff --cached --stat ===
+(empty means nothing staged)

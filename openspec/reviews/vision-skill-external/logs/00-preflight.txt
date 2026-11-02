@@ -1,0 +1,39 @@
+# Preflight (task 1.1 / 1.2)
+
+date: 2026-11-02T12:28:57+01:00
+branch: boss/vision-skill-external-review
+commit: 7cd8595cc73ee605eed9cf27714ce32d2823c6dc
+commit_subject: journal: ACP concurrent permission finding
+base_commit_referenced_in_design: 9daf7a4 (fix(boss): make runner start and ACP sockets work on macOS)
+worktree: /home/ps/.local/state/openspec-boss/worktrees/6f34b479a2b363e9ce7915181978bfe836f2321e/vision-skill-external-review
+
+## git status --short before any gate
+$ git status --short
+(no output)
+
+worktree_is_clean_before_gates: yes
+
+## Tool versions
+boss:      boss 1.2.0 (9daf7a4)
+goose:     1.57.0
+openspec:  1.16.0
+osv-scanner: 2.7.0 (osv-scalibr 0.5.3)
+shellcheck: 0.10.0
+python:    Python 3.15.2
+
+## boss doctor (task 1.2)
+command: boss doctor --json   (exit 0)  -> logs/01-boss-doctor.json
+overall status: warn
+acp_runner:goose: ok  (command goose, protocol 1, models deepseek-flash, deepseek-v4-pro, deepseek-reasoner)
+acp_runner:goose-review: ok
+
+warn checks (verbatim hints, unchanged pre-existing environment):
+- project_init: run 'openspec init --tools claude,opencode' in <worktree>
+- test_command: no test command recognized; the review will report not_run
+- project_registry: add '<worktree>' under [projects] in /home/ps/.config/openspec-boss/boss.toml
+- caller_identity: environment pane wE:pA has cwd /home/ps/work/vision-skill but the calling process runs in <worktree>; process ancestry matched no Herdr pane, so the caller identity is unverified.
+- write_access: run 'boss doctor --fix' to create the journal/lessons/missions directories
+- policy: runner 'opencode' denies no destructive command (missing: git push --force, git push -f, git push --mirror, git push --delete, git filter-branch, git filter-repo)
+
+Note: the 'test_command: not_run' warning is a doctor heuristic over .boss config; the
+suite is invoked directly as ./tests/run.sh in task 2.1, which is the authoritative gate.

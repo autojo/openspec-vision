@@ -1,0 +1,22 @@
+2026-11-02T12:39:00+01:00
+pwd: /home/ps/.local/state/openspec-boss/worktrees/6f34b479a2b363e9ce7915181978bfe836f2321e/vision-skill-external-review
+
+=== ./scripts/runtime-manifest.sh --verify ===
+runtime matches the manifest (11 files)
+runtime_manifest_verify_exit=0
+
+=== ./scripts/gen-commands.sh --check ===
+command wrappers are current
+gen_commands_check_exit=0
+
+=== openspec validate --all --strict ===
+✓ spec/acp-runner
+✓ spec/boss-skill
+✓ spec/boss-worktrees
+✓ spec/parallel-missions
+✓ change/test-timeout-budget
+✓ spec/vision-skill
+✓ change/vision-skill-external-review
+  ℹ [INFO] file: skip_specs is set in .openspec.yaml: change declares no spec-level behavior changes, zero deltas accepted
+Totals: 7 passed, 0 failed (7 items)
+openspec_validate_exit=0

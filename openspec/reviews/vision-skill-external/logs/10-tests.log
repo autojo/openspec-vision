@@ -1,0 +1,5 @@
+2026-11-02T12:29:17+01:00
+command: ./tests/run.sh
+pwd: /home/ps/.local/state/openspec-boss/worktrees/6f34b479a2b363e9ce7915181978bfe836f2321e/vision-skill-external-review
+
+986 passed, 0 failed

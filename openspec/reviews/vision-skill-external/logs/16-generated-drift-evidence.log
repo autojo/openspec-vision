@@ -1,0 +1,18 @@
+2026-11-02T12:39:14+01:00
+=== proof the generated drift pre-exists at HEAD ===
+$ git ls-files -m .opencode/skills   # modified files:
+(empty = none modified by this review)
+
+$ git log -1 --format='%H %ad %s' --date=iso -- .opencode/skills
+3ade5035c130d85ecb66f2a717888b2c28b51b25 2026-10-30 22:09:12 +0100 chore(openspec): update tool files to 1.15.0
+
+$ openspec --version
+1.16.0
+
+Six files listed by check-generated.sh, all tracked and unmodified: 
+  .opencode/skills/openspec-apply-change/SKILL.md
+  .opencode/skills/openspec-archive-change/SKILL.md
+  .opencode/skills/openspec-explore/SKILL.md
+  .opencode/skills/openspec-propose/SKILL.md
+  .opencode/skills/openspec-sync-specs/SKILL.md
+  .opencode/skills/openspec-update-change/SKILL.md
