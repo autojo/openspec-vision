@@ -246,3 +246,21 @@ apply was interrupted and restarted with the `goose-review` runner
   interrupt, and add a fake-ACP test with two concurrent requests.
 - Because the hung turn wrote no gate logs, the run in this report is the
   `goose-review` run; the report's gate evidence is unaffected.
+
+## Errata (2026-11-02, after the hardening changes)
+
+F3's first bullet is wrong. The `policy` warning in `boss doctor` is about the
+`opencode` runner, not the Goose ACP runner. The Goose ACP runner reports
+`enforced` with the default deny list (`git push --force`, `git push -f`,
+`git push --mirror`, `git push --delete`, `git filter-branch`,
+`git filter-repo`); the warning's `missing` list comes from the OpenCode
+configuration. The real follow-ups were the single pending permission slot, the
+global `allow_always` store and the incomplete status, addressed by
+`acp-permission-integrity`, `acp-runner-observability` and
+`acp-runner-polish`. The recommendation to add a Goose deny list is therefore
+superseded.
+
+The isolation note also needs a boundary: the per-apply profile isolates Goose's
+configuration, permission store and sessions, not the filesystem. The agent
+still runs with the user's OS permissions; only an OS sandbox or a separate user
+confines it.
