@@ -49,6 +49,27 @@ BOSS_WAITER_STALL_MS="${BOSS_WAITER_STALL_MS:-2700000}"
 # apply to become active, so a stale 'idle' is not reported as a completion.
 # 0 disables the gate.
 BOSS_WAITER_SETTLE_GRACE_MS="${BOSS_WAITER_SETTLE_GRACE_MS:-5000}"
+
+# --- ACP transport tunables ------------------------------------------------
+# An ACP apply is driven by a detached boss-acp supervisor instead of a
+# Herdr-native agent. Dispatch waits this long for the supervisor to finish the
+# handshake and write the session id (or an error) before it gives up. The
+# supervisor allows 60 s for initialize and 120 s for session/new, so the
+# default leaves headroom for a slow host (for example a loaded Pi) without a
+# dead process waiting the full budget: acp_wait_ready detects an exited
+# supervisor early.
+BOSS_ACP_START_TIMEOUT_MS="${BOSS_ACP_START_TIMEOUT_MS:-240000}"
+# A turn that does not answer within this time is recorded as 'turn_timeout'
+# instead of waking as if the turn had ended. 0 disables the timeout.
+BOSS_ACP_TURN_TIMEOUT_S="${BOSS_ACP_TURN_TIMEOUT_S:-0}"
+# How long 'boss interrupt' waits for the agent to confirm the cancellation
+# before it records 'cancel_unconfirmed'.
+BOSS_ACP_CANCEL_TIMEOUT_S="${BOSS_ACP_CANCEL_TIMEOUT_S:-15}"
+# The supervisor writes a heartbeat this often (seconds).
+BOSS_ACP_HEARTBEAT_S="${BOSS_ACP_HEARTBEAT_S:-5}"
+# Rotate the per-apply JSONL transcript at this size (bytes).
+BOSS_ACP_TRANSCRIPT_MAX_BYTES="${BOSS_ACP_TRANSCRIPT_MAX_BYTES:-8388608}"
+
 # Resource notice before 'boss dispatch': warn (never block) when the number of
 # open applies, the free memory or the 1-minute load reaches a threshold.
 # BOSS_DISPATCH_MAX_LOAD defaults to the number of CPUs.
@@ -88,7 +109,7 @@ BOSS_LOG_FILE="${BOSS_LOG_FILE:-}"
 # Version of the runtime. 'boss --version' prints it together with the commit
 # of the checkout it runs from (when there is one), so an installed copy can be
 # traced back to the source it was vendored from.
-BOSS_VERSION="1.1.1"
+BOSS_VERSION="1.2.0"
 
 # Locking: a lock is a directory created with mkdir, which is atomic on every
 # POSIX filesystem (NFS included) and needs no flock. A lock is broken when its
@@ -265,6 +286,19 @@ die_json() {
   if [ -n "${BOSS_DISPATCH_LOCK:-}" ]; then
     lock_release "$BOSS_DISPATCH_LOCK"
     BOSS_DISPATCH_LOCK=""
+  fi
+  # A dispatch that wrote its state before starting the runner must not leave a
+  # half-created apply behind when the start fails.
+  if [ -n "${BOSS_FAILED_ACP_PID:-}" ]; then
+    kill "$BOSS_FAILED_ACP_PID" 2>/dev/null || true
+    BOSS_FAILED_ACP_PID=""
+  fi
+  if [ -n "${BOSS_FAILED_STATE:-}" ]; then
+    local failed_socket
+    failed_socket="$(jq -r '.acp.control_socket // empty' "$BOSS_FAILED_STATE" 2>/dev/null || true)"
+    [ -n "$failed_socket" ] && rm -f "$failed_socket" 2>/dev/null || true
+    rm -f "$BOSS_FAILED_STATE" 2>/dev/null || true
+    BOSS_FAILED_STATE=""
   fi
   if [ -n "${BOSS_FAILED_TAB:-}" ]; then
     local tail
@@ -776,6 +810,15 @@ policy_check() {
       '{status: "enforced", kind: $k, mode: $m.permission_mode, denies: $d,
         missing: [], source: "agent args (--disallowedTools)",
         hint: "dispatch passes --disallowedTools for every deny pattern"}'
+    return 0
+  fi
+
+  if [ "$kind" = "acp" ]; then
+    jq -nc --arg k "$kind" --argjson m "$mode_json" \
+      --argjson d "$(printf '%s' "$denies" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+      '{status: "enforced", kind: $k, mode: $m.permission_mode, denies: $d,
+        missing: [], source: "acp permission policy",
+        hint: "the ACP supervisor rejects a matching permission request before the tool runs"}'
     return 0
   fi
 
@@ -1691,6 +1734,51 @@ events_file_for() {
   printf '%s/%s-%s.events.jsonl\n' "$BOSS_CYCLES_DIR" "$hash" "$(normalize_name "$change")"
 }
 
+# --- ACP transport paths --------------------------------------------------
+# One supervisor owns one apply, so all of its side files are keyed by the
+# state file path. The socket lives in its own directory and uses a SHA1, not
+# the change name: a Unix socket path is limited to roughly 100 characters.
+acp_socket_for() {
+  local hash path
+  hash="$(sha1_hex "acp:$1")"
+  path="$BOSS_STATE_DIR/acp/$hash.sock"
+  # BSD/macOS sun_path is about 104 bytes. A long state root (a CI TMPDIR)
+  # would exceed it; fall back to the short /tmp path. The socket is 0600.
+  if [ "${#path}" -gt 90 ]; then
+    path="/tmp/boss-acp-$hash.sock"
+  fi
+  printf '%s\n' "$path"
+}
+
+# acp_transcript_for <state-file> -- the JSONL transcript of the apply.
+acp_transcript_for() {
+  printf '%s/transcripts/%s.jsonl\n' "$BOSS_STATE_DIR" "$(sha1_hex "transcript:$1")"
+}
+
+# acp_heartbeat_for <state-file> -- the supervisor heartbeat file.
+acp_heartbeat_for() {
+  printf '%s/acp/%s.heartbeat\n' "$BOSS_STATE_DIR" "$(sha1_hex "heartbeat:$1")"
+}
+
+# runner_start_of <runner-json> -- the runner's transport: herdr (default) or
+# acp. Kept in the library because the waiter and doctor also read it.
+runner_start_of() {
+  printf '%s' "$1" | jq -r '.start // "herdr"' 2>/dev/null || printf 'herdr\n'
+}
+
+# boss_acp_py -- path of the ACP supervisor library. In a checkout it sits in
+# runtime/lib next to runtime/bin; the installer flattens it into the bin
+# directory next to boss-acp.
+boss_acp_py() {
+  local dir="${BIN_DIR:-}"
+  [ -n "$dir" ] || dir="$(dirname "$(resolve_path "${BASH_SOURCE[0]}")")"
+  if [ -f "$dir/boss_acp.py" ]; then
+    printf '%s\n' "$dir/boss_acp.py"
+  elif [ -f "$dir/../lib/boss_acp.py" ]; then
+    printf '%s\n' "$dir/../lib/boss_acp.py"
+  fi
+}
+
 # --- Inbox: durable wake items -------------------------------------------
 # One JSON file per wake under $BOSS_INBOX_DIR. The waiter writes an item
 # before it prompts, so a lost prompt can be recovered by draining the inbox
@@ -2204,7 +2292,7 @@ PY
 # state counts (fail-safe).
 # shellcheck disable=SC2120  # the optional argument skips one state file
 open_apply_count() {
-  local skip="${1:-}" f n=0 agents="" have_agents=0 ms parked pane
+  local skip="${1:-}" f n=0 agents="" have_agents=0 ms parked pane transport
   [ -d "$BOSS_APPLIES_DIR" ] || { printf '0\n'; return 0; }
   if agents="$(herdr_json agent list 2>/dev/null)"; then
     printf '%s' "$agents" | jq -e '.agents' >/dev/null 2>&1 && have_agents=1
@@ -2216,6 +2304,24 @@ open_apply_count() {
     [ "$parked" = "true" ] && continue
     ms="$(jq -r '.merge_state // "none"' "$f" 2>/dev/null || printf none)"
     [ "$ms" = "done" ] && continue
+    transport="$(jq -r '.transport // "herdr"' "$f" 2>/dev/null || printf herdr)"
+    if [ "$transport" = "acp" ]; then
+      # Liveness follows the supervisor process, not a Herdr agent. A dead
+      # supervisor no longer holds a slot; the dead path still counts when a
+      # merge conflict, failed merge test or timed-out merge test keeps the
+      # change unfinished.
+      case "$ms" in
+        test_failed|test_timeout|conflict) ;;
+        *)
+          if ! acp_supervisor_alive "$f"; then
+            acp_report_dead "$f"
+            continue
+          fi
+          ;;
+      esac
+      n=$((n + 1))
+      continue
+    fi
     case "$ms" in
       test_failed|test_timeout|conflict) ;;
       *)
@@ -2516,4 +2622,234 @@ detach_waiter() {
     "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1 &
     disown 2>/dev/null || true
   fi
+}
+
+# --- ACP supervisor helpers ----------------------------------------------
+# The ACP transport has no Herdr agent to ask about liveness. Its supervisor
+# process is the running apply; everything below is keyed on the state file so
+# the boss commands and the supervisor agree on socket, transcript and pid.
+
+# acp_pid_alive <pid> -- 0 when pid is a living boss-acp supervisor. The
+# wrapper execs python3, so the command line carries boss_acp.py, not boss-acp.
+acp_pid_alive() {
+  local pid="$1" args
+  [ -n "$pid" ] && [ "$pid" != "null" ] || return 1
+  if command -v ps >/dev/null 2>&1; then
+    args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    printf '%s' "$args" | grep -qE '(^|/)(boss-acp|boss_acp\.py)( |$)'
+    return $?
+  fi
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  args="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+  printf '%s' "$args" | grep -qE '(^|/)(boss-acp|boss_acp\.py)( |$)'
+}
+
+# acp_supervisor_pid <state-file> -- the recorded pid, or nothing.
+acp_supervisor_pid() {
+  jq -r '.acp.supervisor_pid // empty' "$1" 2>/dev/null || true
+}
+
+# acp_supervisor_alive <state-file> -- 0 when the apply's supervisor lives.
+acp_supervisor_alive() {
+  local pid
+  pid="$(acp_supervisor_pid "$1")"
+  acp_pid_alive "$pid"
+}
+
+# acp_is_acp <state-file> -- 0 for an ACP apply (old state files are native).
+acp_is_acp() {
+  [ "$(jq -r '.transport // "herdr"' "$1" 2>/dev/null || printf herdr)" = "acp" ]
+}
+
+# acp_control_send <socket> <json> [<timeout-seconds>] -- send one control
+# command and print the one-line JSON response. python3 is a hard prerequisite
+# of the runtime, so no socat/nc is needed. Returns 1 when the socket cannot be
+# reached; the response then carries connect_failed.
+acp_control_send() {
+  local socket="$1" payload="$2" timeout="${3:-30}"
+  python3 - "$socket" "$payload" "$timeout" <<'PY'
+import json, socket, sys
+path, payload, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(timeout)
+try:
+    s.connect(path)
+except OSError as exc:
+    print(json.dumps({"ok": False, "error": "connect_failed", "message": str(exc)}))
+    sys.exit(1)
+try:
+    s.sendall((payload + "\n").encode())
+except OSError as exc:
+    print(json.dumps({"ok": False, "error": "send_failed", "message": str(exc)}))
+    sys.exit(1)
+buf = b""
+while b"\n" not in buf:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    buf += chunk
+s.close()
+line = buf.split(b"\n", 1)[0].decode(errors="replace")
+try:
+    print(json.dumps(json.loads(line)))
+except Exception:
+    print(json.dumps({"ok": False, "error": "bad_response", "message": line}))
+PY
+}
+
+# acp_update_state <state-file> <jq-filter> -- atomic read-modify-write of the
+# state with the same directory lock the bash writers use. Used by the boss
+# commands to mark a dead supervisor or an interrupted ACP turn.
+acp_update_state() {
+  local f="$1" filter="$2" lock tmp acquired=0
+  shift 2
+  lock="$(state_lock "$f")"
+  if lock_acquire "$lock"; then acquired=1; else log "warning: state lock busy for $f; writing without it"; fi
+  tmp="$(mktemp)"
+  if jq "$@" "$filter" "$f" >"$tmp" 2>/dev/null; then
+    mv "$tmp" "$f"
+  else
+    rm -f "$tmp"
+  fi
+  [ "$acquired" -eq 1 ] && lock_release "$lock"
+  return 0
+}
+
+# acp_report_dead <state-file> -- free the slot of an ACP apply whose
+# supervisor is gone and wake the boss exactly once. A parked apply stays
+# quiet. Liveness other than this call is a pure read.
+acp_report_dead() {
+  local f="$1" reported change project pid
+  [ -f "$f" ] || return 0
+  acp_is_acp "$f" || return 0
+  reported="$(jq -r '.acp.dead_reported // false' "$f" 2>/dev/null || printf false)"
+  [ "$reported" = "true" ] && return 0
+  pid="$(acp_supervisor_pid "$f")"
+  acp_pid_alive "$pid" && return 0
+  [ "$(jq -r '.parked // false' "$f" 2>/dev/null || printf false)" = "true" ] && return 0
+  change="$(jq -r '.change // empty' "$f" 2>/dev/null || true)"
+  project="$(jq -r '.project // empty' "$f" 2>/dev/null || true)"
+  acp_update_state "$f" '.acp.dead_reported = true | .acp.phase = "failed"
+    | .acp.supervisor_pid = null | .last_state = "failed"
+    | .last_state_at = (now | strftime("%Y-%m-%dT%H:%M:%S%z"))'
+  append_event "$(events_file_for "$project" "$change")" acp_exit \
+    "$(jq -nc --arg c "$change" --arg p "$project" --arg r "supervisor_gone" \
+      '{change: $c, project: $p, reason: $r}')" \
+    || true
+  # The wake must not block a foreground status/dispatch command while the
+  # dispatcher is unreachable, so it runs detached like the native waiter.
+  detach_acp_event "$f" lost failed \
+    "Apply $change in $project: failed (the ACP supervisor exited). Next step: boss status $change"
+  return 0
+}
+
+# detach_acp_event <state-file> <event> <state> <text> -- run the wake path in
+# the background. Without a bin directory (a library-only invocation) the wake
+# is sent inline; the supervisor's own wakes always use acp-event directly.
+detach_acp_event() {
+  local f="$1" event="$2" st="$3" text="$4" bin="${BIN_DIR:-}"
+  if [ -z "$bin" ] || [ ! -x "$bin/boss" ]; then
+    local change project
+    change="$(jq -r '.change // empty' "$f" 2>/dev/null || true)"
+    project="$(jq -r '.project // empty' "$f" 2>/dev/null || true)"
+    append_event "$(events_file_for "$project" "$change")" "$event" \
+      "$(jq -nc --arg c "$change" --arg p "$project" --arg s "$st" --arg t "$text" \
+        '{change: $c, project: $p, transport: "acp", state: $s, text: $t}')" \
+      || true
+    boss_deliver "$f" "$text" "$st" || true
+    return 0
+  fi
+  if command -v nohup >/dev/null 2>&1; then
+    nohup "$bin/boss" acp-event "$f" "$event" "$st" "$text" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  else
+    "$bin/boss" acp-event "$f" "$event" "$st" "$text" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  fi
+  return 0
+}
+
+# acp_stop_supervisor <state-file> [<command>] -- ask the supervisor to close
+# its session and exit; fall back to a signal when the socket is unreachable.
+acp_stop_supervisor() {
+  local f="$1" command="${2:-finish}" socket pid out
+  [ -f "$f" ] || return 0
+  acp_is_acp "$f" || return 0
+  socket="$(jq -r '.acp.control_socket // empty' "$f" 2>/dev/null || true)"
+  pid="$(acp_supervisor_pid "$f")"
+  if [ -n "$socket" ] && [ -S "$socket" ]; then
+    out="$(acp_control_send "$socket" "$(jq -nc --arg c "$command" '{command: $c}')" 20 || true)"
+    if [ "$(printf '%s' "$out" | jq -r '.ok // false' 2>/dev/null || printf false)" = "true" ]; then
+      return 0
+    fi
+  fi
+  if acp_pid_alive "$pid"; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# boss_deliver <state-file> <text> <state> -- record the wake durably, then
+# prompt the responsible boss agent. Moved here from boss-waiter so the ACP
+# supervisor's acp-event command reuses exactly the same inbox, wake plan,
+# retry and notification path as a native apply.
+boss_deliver() {
+  local state_file="$1" text="$2" st="$3"
+  local change project events_file
+  local candidates candidate attempt backoff start now out rc code prompt_text plan
+  change="$(jq -r '.change // empty' "$state_file" 2>/dev/null || true)"
+  project="$(jq -r '.project // empty' "$state_file" 2>/dev/null || true)"
+  events_file="$(events_file_for "$project" "$change")"
+  inbox_write "$state_file" "$st" >/dev/null 2>&1 \
+    || log "warning: could not write an inbox item for $change"
+  printf -v prompt_text '%s\nPending wakeups: run '\''boss inbox'\''.' "$text"
+  plan="$(boss_wake_plan "$state_file")"
+  candidates="$(printf '%s' "$plan" | jq -r '.candidates[].target' 2>/dev/null || true)"
+  if [ -z "$candidates" ]; then
+    log "no safe boss agent reachable (dispatcher/workspace/global); showing a notification instead"
+    boss_record_wake_failed_event "$events_file" "$change" "$project" "$st" "no_candidate" "$plan" \
+      || log "warning: could not record the failed wake"
+    herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st" >/dev/null 2>&1 || true
+    return 1
+  fi
+  start="$(date +%s)"
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    attempt=1
+    backoff=15
+    while true; do
+      out="$(herdr agent prompt "$candidate" "$prompt_text" --wait --until working --until blocked --timeout "$BOSS_AGENT_PROMPT_TIMEOUT_MS" 2>&1)"
+      rc=$?
+      if [ "$rc" -eq 0 ]; then
+        log "prompt delivered to agent '$candidate' (state=$st, attempt=$attempt)"
+        boss_record_wake_event "$events_file" "$change" "$project" "$candidate" "$st" \
+          || log "warning: could not record the wake"
+        return 0
+      fi
+      code="$(printf '%s' "$out" | jq -r '.error.code // "unknown"' 2>/dev/null || true)"
+      if [ "$code" = "agent_not_found" ]; then
+        log "candidate '$candidate' not found; trying the next candidate"
+        break
+      fi
+      now="$(date +%s)"
+      if [ $(( now - start + backoff )) -gt "$BOSS_WAITER_MAX_S" ]; then
+        log "delivery retry budget exceeded (${BOSS_WAITER_MAX_S}s); giving up"
+        boss_record_wake_failed_event "$events_file" "$change" "$project" "$st" \
+          "delivery_failed:$code" "$plan" \
+          || log "warning: could not record the failed wake"
+        herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st (delivery failed)" >/dev/null 2>&1 || true
+        return 1
+      fi
+      log "delivery to '$candidate' failed ($code); retrying in ${backoff}s"
+      sleep "$backoff"
+      attempt=$((attempt + 1))
+      backoff=$((backoff * 2))
+    done
+  done <<<"$candidates"
+  log "no boss candidate reachable (dispatcher/workspace/global); showing a notification instead"
+  boss_record_wake_failed_event "$events_file" "$change" "$project" "$st" "not_delivered" "$plan" \
+    || log "warning: could not record the failed wake"
+  herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st" >/dev/null 2>&1 || true
+  return 1
 }

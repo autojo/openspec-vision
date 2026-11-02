@@ -424,6 +424,26 @@ If an apply starts but Herdr cannot report its state, run
 `herdr integration status` and require `opencode: current`; the installer needs
 opencode integration v13 or newer. Re-run `./install.sh` after updating Herdr.
 
+### ACP runners
+
+A runner with `start = "acp"` (for example Goose) is driven by the bundled
+`boss-acp` supervisor instead of a Herdr-native agent. Dispatch starts the
+supervisor detached and creates the tab only as a transcript view; never send
+keystrokes to it, never read its pane for state, and do not call
+`herdr agent wait` for that apply. `boss status` reports the ACP phase
+(`working`, `blocked`, `idle`), model, mode and last stop reason.
+
+Permissions follow the runner policy. `policy = "ask"` leaves an unmatched
+request pending and wakes you with `blocked`; answer it with
+`boss answer <change> <option>` (the option ids are shown by `boss status`),
+or cancel it with `boss interrupt <change>`. An applied `deny` rule rejects a
+request before the tool runs. `boss interrupt` uses `session/cancel`, never
+keys. `boss finish` closes the ACP session; `boss resume` calls
+`session/load` when the agent advertises it, and an `unresumable` result
+means use `boss retrigger` for an explicit new session. The apply prompt is
+the OpenSpec CLI workflow
+(`openspec instructions apply --change <change> --json`), not a slash command.
+
 ### The mission loop
 
 1. **Reconcile before each dispatch.** After a change finished or was parked

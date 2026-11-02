@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.2.0
+
+### Added
+
+- The ACP runner transport (`start = "acp"`): `boss dispatch` starts the
+  detached `boss-acp` supervisor, which owns a `<command> acp` child and drives
+  the session (`initialize`, `session/new`, `session/prompt`, `session/cancel`,
+  `session/load`, `session/close`). It applies the configured model and mode,
+  enforces the deny/ask permission policy, records a pending permission and a
+  `blocked` state, streams `session/update` into a JSONL transcript, treats the
+  prompt response as the turn boundary, and wakes the boss through the same
+  inbox/event path as the native waiter.
+- `boss answer` selects an offered ACP permission option, `boss interrupt`
+  sends `session/cancel` (with a bounded `cancel_unconfirmed` result), and
+  `boss resume` reloads a crashed session when the agent advertises
+  `session/load`.
+- `boss doctor` validates a configured ACP runner with a real handshake and
+  names the offered models and modes.
+- The ACP apply prompt is CLI-based (`openspec instructions apply --change
+  <change> --json`) and never assumes a slash command.
+- A fake ACP agent in the regression suite covers dispatch, permissions,
+  cancel, resume, slots, locks, doctor and the end-to-end workflow without a
+  model or network.
+
+### Changed
+
+- Apply state gains a `transport` field (`herdr` for old and native applies)
+  and an `acp` object; old state files stay readable.
+- The runner start path is shared by dispatch, retrigger and session.
+
 ## 1.1.1
 
 ### Fixed

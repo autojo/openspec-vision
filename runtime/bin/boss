@@ -46,6 +46,7 @@ Usage:
   boss wait --all [--project <name|path> | --all-projects]
   boss inbox [--project <name|path>] [--json] [--ack <id>]
   boss journal [--project <name|path>] [--change <change>] [--tag <tag>] <text>
+  boss acp-event <state-file> <event> <state> <text>
   boss doctor [--project <name|path>] [--json] [--fix]
   boss retrigger <change> [--project <name|path>] [--note <text>] [--as <pane|agent>]
   boss retarget <change> [--project <name|path>] [--to <pane|agent>]
@@ -182,8 +183,9 @@ ensure_config() {
   log "generated config at $BOSS_CONFIG (default runner: $default_runner)"
 }
 
-# resolve_runner [<name>] -- print runner JSON {name, kind, args, apply};
-# uses the default runner when no name is given.
+# resolve_runner [<name>] -- print runner JSON {name, kind, args, apply, ...};
+# uses the default runner when no name is given. An ACP runner carries
+# start = "acp" and must name the command that is started as '<command> acp'.
 resolve_runner() {
   local name="${1:-}" cfg
   cfg="$(config_json)" || exit 1
@@ -191,7 +193,7 @@ resolve_runner() {
     name="$(printf '%s' "$cfg" | jq -r '.default // empty')"
     [ -n "$name" ] || die_json "no_default_runner" "no default runner configured in $BOSS_CONFIG"
   fi
-  local runner configured commit
+  local runner configured commit start command policy mode model
   runner="$(printf '%s' "$cfg" | jq -c --arg n "$name" '.runners[$n]')"
   if [ "$runner" = "null" ]; then
     configured="$(printf '%s' "$cfg" | jq -r '(.runners // {}) | keys | join(", ") | if . == "" then "(none)" else . end')"
@@ -202,7 +204,30 @@ resolve_runner() {
     explorer|agent) ;;
     *) die_json "invalid_runner_commit" "runner '$name' has invalid commit policy '$commit'; use 'explorer' or 'agent'" ;;
   esac
-  printf '%s\n' "$runner" | jq -c --arg n "$name" --arg c "$commit" '. + {name: $n, commit: $c}'
+  start="$(printf '%s' "$runner" | jq -r '.start // "herdr"')"
+  case "$start" in
+    herdr|acp) ;;
+    *) die_json "invalid_runner_start" "runner '$name' has invalid start value '$start'; use 'herdr' (default) or 'acp'" ;;
+  esac
+  if [ "$start" = "acp" ]; then
+    command="$(printf '%s' "$runner" | jq -r '.command // empty')"
+    [ -n "$command" ] \
+      || die_json "acp_command_missing" "runner '$name' uses start = \"acp\" but has no command; set command = \"goose\" (boss starts '<command> acp')"
+    policy="$(printf '%s' "$runner" | jq -r '.policy // "allow"')"
+    case "$policy" in
+      allow|ask) ;;
+      *) die_json "invalid_runner_policy" "runner '$name' has invalid policy '$policy'; use 'allow' or 'ask'" ;;
+    esac
+    mode="$(printf '%s' "$runner" | jq -r '.mode // empty')"
+    [ -z "$mode" ] || printf '%s' "$mode" | grep -qE '^[A-Za-z0-9_.-]+$' \
+      || die_json "invalid_runner_mode" "runner '$name' has invalid mode '$mode'; use the agent's mode id (for example auto, approve, smart_approve, chat)"
+    model="$(printf '%s' "$runner" | jq -r '.model // empty')"
+    [ -z "$model" ] || printf '%s' "$model" | grep -q '[^[:space:]]' \
+      || die_json "invalid_runner_model" "runner '$name' has an empty model"
+  fi
+  printf '%s\n' "$runner" | jq -c --arg n "$name" --arg c "$commit" --arg s "$start" \
+    '. + {name: $n, commit: $c, start: $s}
+     | (if $s == "acp" and ((.kind // "") == "") then .kind = "acp" else . end)'
 }
 
 # runner_yield_of <runner-json> -- the yield instruction sent to the apply
@@ -363,6 +388,7 @@ main() {
     wait) shift; cmd_wait "$@" ;;
     inbox) shift; cmd_inbox "$@" ;;
     journal) shift; cmd_journal "$@" ;;
+    acp-event) shift; cmd_acp_event "$@" ;;
     doctor) shift; cmd_doctor "$@" ;;
     retrigger) shift; cmd_retrigger "$@" ;;
     retarget) shift; cmd_retarget "$@" ;;

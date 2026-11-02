@@ -341,8 +341,9 @@ cmd_session() {
     esac
   done
 
-  local runner project workspace_id agent_name kind
+  local runner project workspace_id agent_name kind start
   runner="$(resolve_runner "$runner_name")" || exit 1
+  start="$(runner_start_of "$runner")"
   project="$(resolve_project "$project_name")" || exit 1
   workspace_id="$(ensure_workspace "$project" "$(basename "$project")")"
   agent_name="$(boss_name_for "$workspace_id")"
@@ -353,7 +354,7 @@ cmd_session() {
     die_json "boss_exists" "workspace $workspace_id already has a boss on pane $existing_boss; no second boss tab was created"
   fi
 
-  kind="$(printf '%s' "$runner" | jq -r '.kind')"
+  kind="$(printf '%s' "$runner" | jq -r '.kind // "acp"')"
   local mode_json
   mode_json="$(runner_mode_of "$runner")"
   local -a agent_args=()
@@ -376,32 +377,13 @@ cmd_session() {
   BOSS_FAILED_TAB="$tab_id"
   BOSS_FAILED_PANE="$pane_id"
 
-  # Start the agent, retrying while the fresh shell pane is still busy.
-  local started=0 deadline out rc code=""
-  deadline=$(( $(now_ms) + BOSS_AGENT_BUSY_RETRY_MS ))
-  while :; do
-    if [ "${#agent_args[@]}" -gt 0 ]; then
-      out="$(herdr agent start "$agent_name" --kind "$kind" --pane "$pane_id" --timeout "$BOSS_AGENT_START_TIMEOUT_MS" -- "${agent_args[@]}" 2>&1)"
-    else
-      out="$(herdr agent start "$agent_name" --kind "$kind" --pane "$pane_id" --timeout "$BOSS_AGENT_START_TIMEOUT_MS" 2>&1)"
-    fi
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
-      started=1
-      break
-    fi
-    code="$(printf '%s' "$out" | jq -r '.error.code // ""' 2>/dev/null || true)"
-    [ "$code" = "agent_pane_busy" ] || break
-    [ "$(now_ms)" -lt "$deadline" ] || break
-    log "agent start for $agent_name hit a busy pane; retrying"
-    sleep 1
-  done
-  if [ "$started" -ne 1 ]; then
-    local msg="agent '$agent_name' did not become ready within the start timeout"
-    if [ -n "$code" ] && [ "$code" != "agent_pane_busy" ]; then
-      msg="agent '$agent_name' failed to start: $code"
-    fi
-    die_json "agent_not_ready" "$msg (pane $pane_id, tab $tab_id closed)"
+  # The boss session must be a Herdr-native agent; start_runner rejects an ACP
+  # runner here with acp_session_unsupported. bash 3.2 rejects an empty array
+  # expansion under 'set -u', so pass the optional arguments only when present.
+  if [ "${#agent_args[@]}" -gt 0 ]; then
+    start_runner "$start" "$agent_name" "$pane_id" "$kind" - "${agent_args[@]}"
+  else
+    start_runner "$start" "$agent_name" "$pane_id" "$kind" -
   fi
 
   # Same readiness rule as dispatch, so a first-run dialog cannot wedge the tab.
@@ -634,6 +616,145 @@ external_verify_prompt_block() {
     "$(printf '%s' "$tasks" | jq -r '[.external_tasks[]? | .text] | join("; ")')"
 }
 
+# compose_acp_apply_prompt <project> <change> <note> <lessons> <external>
+# <commit> <yield> [<runner-extra>] -- the prompt for an ACP apply. The
+# workflow reference is the OpenSpec CLI, never a slash command: an ACP agent
+# does not implement the editor-specific '/opsx-apply' recipe. The existing
+# note/lessons/external/commit/yield blocks follow unchanged. A runner `apply`
+# value that starts with a slash command is ignored for the same reason.
+compose_acp_apply_prompt() {
+  local project="$1" change="$2" note="$3" lessons="$4" external="$5" commit="$6" yield="$7" extra="${8:-}"
+  local instr files instruction head out
+  instr="$(cd "$project" && openspec instructions apply --change "$change" --json 2>/dev/null || true)"
+  files=""
+  instruction=""
+  if [ -n "$instr" ] && printf '%s' "$instr" | jq -e . >/dev/null 2>&1; then
+    files="$(printf '%s' "$instr" | jq -r '[.contextFiles[]?[]?] | .[0:8] | join(", ")' 2>/dev/null || true)"
+    instruction="$(printf '%s' "$instr" | jq -r '.instruction // empty' 2>/dev/null || true)"
+  fi
+  head="Follow the OpenSpec apply workflow for change \"$change\"."
+  head="$head Run 'openspec instructions apply --change \"$change\" --json' in the project and follow the returned instruction and task list."
+  [ -n "$instruction" ] && head="$head $instruction"
+  [ -n "$files" ] && head="$head Context files: $files."
+  out="$head"
+  [ -n "$note" ] && out="$out $note"
+  [ -n "$lessons" ] && out="$out $lessons"
+  [ -n "$external" ] && out="$out $external"
+  [ -n "$commit" ] && out="$out $commit"
+  case "$extra" in
+    /*) log "warning: ignoring the runner apply template '$extra' for the ACP transport; it looks like a slash command" ;;
+    *) [ -n "$extra" ] && out="$out $extra" ;;
+  esac
+  [ -n "$yield" ] && out="$out $yield"
+  printf '%s' "$out"
+}
+
+# start_herdr_agent <agent> <pane> <kind> [<args>...] -- start a Herdr-native
+# apply agent and retry while a freshly created shell pane is still busy. This
+# is the unchanged native start path, shared by dispatch and session.
+start_herdr_agent() {
+  local agent_name="$1" pane_id="$2" kind="$3"
+  shift 3
+  local -a agent_args=("$@")
+  local started=0 deadline out rc code="" msg
+  deadline=$(( $(now_ms) + BOSS_AGENT_BUSY_RETRY_MS ))
+  # Always try at least once, then keep retrying busy panes until the deadline.
+  while :; do
+    if [ "${#agent_args[@]}" -gt 0 ]; then
+      out="$(herdr agent start "$agent_name" --kind "$kind" --pane "$pane_id" --timeout "$BOSS_AGENT_START_TIMEOUT_MS" -- "${agent_args[@]}" 2>&1)"
+    else
+      out="$(herdr agent start "$agent_name" --kind "$kind" --pane "$pane_id" --timeout "$BOSS_AGENT_START_TIMEOUT_MS" 2>&1)"
+    fi
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      started=1
+      break
+    fi
+    code="$(printf '%s' "$out" | jq -r '.error.code // ""' 2>/dev/null || true)"
+    [ "$code" = "agent_pane_busy" ] || break
+    [ "$(now_ms)" -lt "$deadline" ] || break
+    log "agent start for $agent_name hit a busy pane; retrying"
+    sleep 1
+  done
+  if [ "$started" -ne 1 ]; then
+    msg="agent '$agent_name' did not become ready within the start timeout"
+    if [ -n "$code" ] && [ "$code" != "agent_pane_busy" ]; then
+      msg="agent '$agent_name' failed to start: $code"
+    fi
+    die_json "agent_not_ready" "$msg (pane $pane_id, tab ${BOSS_FAILED_TAB:-} closed)"
+  fi
+  return 0
+}
+
+# start_acp_supervisor <state-file> -- launch the detached ACP supervisor for
+# an apply whose state is already on disk. The supervisor owns the child and
+# the turn; it writes its pid, session and readiness itself.
+start_acp_supervisor() {
+  local state_file="$1" bin="${BIN_DIR:-}" change logfile socket
+  [ -n "$bin" ] || bin="$(dirname "$(resolve_path "${BASH_SOURCE[0]}")")"
+  change="$(jq -r '.change // "acp"' "$state_file" 2>/dev/null || printf acp)"
+  logfile="$BOSS_LOGS_DIR/$change-acp.log"
+  mkdir -p "$BOSS_LOGS_DIR" "${BOSS_STATE_DIR}/acp" "${BOSS_STATE_DIR}/transcripts" 2>/dev/null || true
+  socket="$(jq -r '.acp.control_socket // empty' "$state_file" 2>/dev/null || true)"
+  [ -n "$socket" ] && rm -f "$socket" 2>/dev/null || true
+  if command -v nohup >/dev/null 2>&1; then
+    BOSS_LOG_FILE="$logfile" nohup "$bin/boss-acp" "$state_file" >/dev/null 2>&1 &
+  else
+    BOSS_LOG_FILE="$logfile" "$bin/boss-acp" "$state_file" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  fi
+  local pid=$!
+  BOSS_FAILED_ACP_PID="$pid"
+  acp_update_state "$state_file" '.acp.supervisor_pid = $pid' --argjson pid "$pid"
+  printf '%s\n' "$pid"
+}
+
+# acp_wait_ready <state-file> [<timeout-ms>] -- wait until the supervisor has
+# completed the ACP handshake and applied the session configuration, or has
+# written an error. Dispatch uses this so a bad command/model/mode fails the
+# dispatch instead of leaving a half-created apply behind.
+acp_wait_ready() {
+  local state_file="$1" timeout="${2:-$BOSS_ACP_START_TIMEOUT_MS}" deadline error ready pid change
+  change="$(jq -r '.change // "acp"' "$state_file" 2>/dev/null || printf acp)"
+  deadline=$(( $(now_ms) + timeout ))
+  while :; do
+    error="$(jq -r '.acp.error // empty' "$state_file" 2>/dev/null || true)"
+    if [ -n "$error" ]; then
+      die_json "acp_start_failed" "ACP supervisor failed for the apply: $error"
+    fi
+    ready="$(jq -r '.acp.ready // false' "$state_file" 2>/dev/null || printf false)"
+    [ "$ready" = "true" ] && return 0
+    pid="$(jq -r '.acp.supervisor_pid // empty' "$state_file" 2>/dev/null || true)"
+    [ -n "$pid" ] || pid="${BOSS_FAILED_ACP_PID:-}"
+    if [ -n "$pid" ] && ! acp_pid_alive "$pid"; then
+      die_json "acp_start_failed" "the ACP supervisor exited before the session was ready; see $BOSS_LOGS_DIR/$change-acp.log"
+    fi
+    [ "$(now_ms)" -lt "$deadline" ] \
+      || die_json "acp_start_timeout" "the ACP supervisor did not become ready within ${timeout}ms; see $BOSS_LOGS_DIR for its log"
+    sleep 0.1
+  done
+}
+
+# start_runner <transport> <agent> <pane> <kind> <state-file|-> [<args>...] --
+# the one start path used by dispatch, retrigger and session. The native path
+# is the unchanged Herdr agent start; the ACP path starts the supervisor.
+start_runner() {
+  local transport="$1" agent_name="$2" pane_id="$3" kind="$4" state_file="$5"
+  shift 5
+  case "$transport" in
+    acp)
+      [ -n "$state_file" ] && [ "$state_file" != "-" ] \
+        || die_json "acp_session_unsupported" "an ACP runner cannot host the boss session; use a Herdr-native runner for 'boss session'"
+      start_acp_supervisor "$state_file" >/dev/null
+      acp_wait_ready "$state_file"
+      ;;
+    *)
+      start_herdr_agent "$agent_name" "$pane_id" "$kind" "$@"
+      ;;
+  esac
+}
+
+
 # ---------------------------------------------------------------- dispatch ---
 
 # parse_touches_value <raw> -- lock array JSON for a manual --touches value.
@@ -786,12 +907,13 @@ dispatch_change() {
       --arg runner "$(printf '%s' "$runner" | jq -r '.name')" \
       --arg agent "$agent_name" --arg pane_id "$pane_id" --arg tab_id "$tab_id" \
       --arg workspace_id "$workspace_id" --arg status "already_running" \
+      --arg transport "$(runner_start_of "$runner")" \
       --arg worktree "$existing_worktree" --arg branch "$existing_branch" \
       --argjson touches "$touches_json" --argjson declared "$declared" \
       --argjson wake_target "$wake_target" --argjson warnings "$warnings_json" \
       --argjson project_registered "$project_registered" --arg hint "$hint" --arg resource_warning "$resource_warn" \
       --argjson mode "$mode_json" --argjson policy "$policy_json" \
-      '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), touches: $touches, declared: $declared, status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode, policy: $policy}')"
+      '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, transport: (if $transport == "" then "herdr" else $transport end), worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), touches: $touches, declared: $declared, status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode, policy: $policy}')"
     lock_release "$BOSS_DISPATCH_LOCK"
     BOSS_DISPATCH_LOCK=""
     return 0
@@ -873,11 +995,23 @@ dispatch_change() {
     apply_root="$worktree"
   fi
 
-  local kind apply_template apply_cmd
-  kind="$(printf '%s' "$runner" | jq -r '.kind')"
-  apply_template="$(printf '%s' "$runner" | jq -r '.apply')"
+  local kind start apply_template apply_cmd
+  kind="$(printf '%s' "$runner" | jq -r '.kind // "acp"')"
+  start="$(runner_start_of "$runner")"
+  apply_template="$(printf '%s' "$runner" | jq -r '.apply // empty')"
   local -a agent_args=()
   while IFS= read -r a; do agent_args+=("$a"); done < <(runner_args_of "$runner")
+
+  # An ACP command must be executable before anything is created. The
+  # handshake and the offered model/mode are checked by the supervisor below,
+  # which is what lets the dispatch fail without leaving an apply behind.
+  if [ "$start" = "acp" ]; then
+    local acp_command acp_bin
+    acp_command="$(printf '%s' "$runner" | jq -r '.command // empty')"
+    acp_bin="${acp_command%% *}"
+    command -v "$acp_bin" >/dev/null 2>&1 \
+      || die_json "acp_command_missing" "the ACP command '$acp_bin' for runner '$(printf '%s' "$runner" | jq -r '.name')' is not executable or not on PATH"
+  fi
 
   if [ "$want_worktree" = "1" ]; then
     workspace_id="$worktree_workspace"
@@ -903,38 +1037,6 @@ dispatch_change() {
   BOSS_FAILED_TAB="$tab_id"
   BOSS_FAILED_PANE="$pane_id"
 
-  # Start the agent, retrying while the fresh shell pane is still busy.
-  local started=0 deadline out rc code=""
-  deadline=$(( $(now_ms) + BOSS_AGENT_BUSY_RETRY_MS ))
-  # Always try at least once, then keep retrying busy panes until the deadline.
-  while :; do
-    if [ "${#agent_args[@]}" -gt 0 ]; then
-      out="$(herdr agent start "$agent_name" --kind "$kind" --pane "$pane_id" --timeout "$BOSS_AGENT_START_TIMEOUT_MS" -- "${agent_args[@]}" 2>&1)"
-    else
-      out="$(herdr agent start "$agent_name" --kind "$kind" --pane "$pane_id" --timeout "$BOSS_AGENT_START_TIMEOUT_MS" 2>&1)"
-    fi
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
-      started=1
-      break
-    fi
-    code="$(printf '%s' "$out" | jq -r '.error.code // ""' 2>/dev/null || true)"
-    [ "$code" = "agent_pane_busy" ] || break
-    [ "$(now_ms)" -lt "$deadline" ] || break
-    log "agent start for $agent_name hit a busy pane; retrying"
-    sleep 1
-  done
-  if [ "$started" -ne 1 ]; then
-    msg="agent '$agent_name' did not become ready within the start timeout"
-    if [ -n "$code" ] && [ "$code" != "agent_pane_busy" ]; then
-      msg="agent '$agent_name' failed to start: $code"
-    fi
-    die_json "agent_not_ready" "$msg (pane $pane_id, tab $tab_id closed)"
-  fi
-
-  # Wait until the agent TUI can take input before prompting.
-  await_runner_ready "$agent_name" "$pane_id" "$runner"
-
   apply_cmd="${apply_template/\{change\}/$change}"
   local runner_yield
   runner_yield="$(runner_yield_of "$runner")"
@@ -946,10 +1048,24 @@ dispatch_change() {
   if [ -n "$gfile" ] && [ -n "$pfile" ]; then
     lessons_block="$(lessons_prompt_block "$gfile" "$pfile")" || lessons_block=""
   fi
-  send_prompt "$agent_name" "$(compose_apply_prompt "$apply_cmd" "$note" "$lessons_block" "$external_block" "$commit_block" "$runner_yield")"
 
-  herdr_raw "pane.report_metadata" "$(jq -nc --arg p "$pane_id" --arg c "$change" \
-    '{pane_id: $p, source: "openspec", tokens: {os_change: $c, os_phase: "apply"}}')" >/dev/null || exit 1
+  local acp_prompt="" acp_command="" acp_model="" acp_mode="" acp_policy="" acp_transcript=""
+  local acp_socket="" acp_deny="[]" acp_events="" acp_boss_bin="" acp_heartbeat=""
+  if [ "$start" = "acp" ]; then
+    acp_prompt="$(compose_acp_apply_prompt "$apply_root" "$change" "$note" "$lessons_block" \
+      "$external_block" "$commit_block" "$runner_yield" "$apply_cmd")"
+    acp_command="$(printf '%s' "$runner" | jq -r '.command // empty')"
+    acp_model="$(printf '%s' "$runner" | jq -r '.model // empty')"
+    acp_mode="$(printf '%s' "$runner" | jq -r '.mode // "smart_approve"')"
+    acp_policy="$(printf '%s' "$runner" | jq -r '.policy // "allow"')"
+    acp_transcript="$(acp_transcript_for "$state_file")"
+    acp_socket="$(acp_socket_for "$state_file")"
+    acp_heartbeat="$(acp_heartbeat_for "$state_file")"
+    acp_deny="$(policy_denies "$runner" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+    acp_events="$(events_file_for "$project" "$change")"
+    acp_boss_bin="${BIN_DIR:-$(dirname "$(resolve_path "${BASH_SOURCE[0]}")")}/boss"
+    mkdir -p "$(dirname "$acp_transcript")" "$(dirname "$acp_socket")" 2>/dev/null || true
+  fi
 
   local now runner_name_out base_head dispatcher_cross="false" dispatcher_cross_project="false"
   now="$(now_iso)"
@@ -980,7 +1096,7 @@ dispatch_change() {
   mkdir -p "$BOSS_APPLIES_DIR" || die_json "state_write" "cannot create state dir $BOSS_APPLIES_DIR"
   jq -n \
     --arg change "$change" --arg project "$project" --arg runner "$runner_name_out" \
-    --arg kind "$kind" --arg apply_cmd "$apply_cmd" --arg note "$note" --arg lessons "$lessons_block" --arg external_block "$external_block" --arg commit_block "$commit_block" --arg commit_policy "$(printf '%s' "$runner" | jq -r '.commit // "explorer"')" --arg yield "$runner_yield" --arg agent "$agent_name" \
+    --arg kind "$kind" --arg start "$start" --arg apply_cmd "$apply_cmd" --arg note "$note" --arg lessons "$lessons_block" --arg external_block "$external_block" --arg commit_block "$commit_block" --arg commit_policy "$(printf '%s' "$runner" | jq -r '.commit // "explorer"')" --arg yield "$runner_yield" --arg agent "$agent_name" \
     --arg pane_id "$pane_id" --arg tab_id "$tab_id" --arg workspace_id "$workspace_id" --arg boss "$dispatcher_boss" \
     --arg boss_pane "$dispatcher_pane" --arg boss_workspace "$dispatcher_workspace" \
     --arg boss_cwd "$dispatcher_cwd" --argjson boss_cross "$dispatcher_cross" \
@@ -989,12 +1105,53 @@ dispatch_change() {
     --arg worktree "$worktree" --arg branch "$branch" \
     --arg worktree_workspace "$worktree_workspace" \
     --argjson touches "$touches_json" --argjson declared "$declared" \
-    --arg started_at "$now" --arg last_state "working" --arg last_state_at "$now" \
+    --arg started_at "$now" --arg last_state "$( [ "$start" = "acp" ] && printf starting || printf working )" --arg last_state_at "$now" \
+    --arg acp_command "$acp_command" --arg acp_prompt "$acp_prompt" --arg acp_model "$acp_model" \
+    --arg acp_mode "$acp_mode" --arg acp_policy "$acp_policy" --arg acp_transcript "$acp_transcript" \
+    --arg acp_socket "$acp_socket" --arg acp_events "$acp_events" --arg acp_boss_bin "$acp_boss_bin" \
+    --arg acp_heartbeat "$acp_heartbeat" --arg acp_root "$apply_root" --argjson acp_deny "${acp_deny:-[]}" \
     --argjson mode "$mode_json" \
-    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, lessons: $lessons, external_block: $external_block, commit_block: $commit_block, commit_policy: $commit_policy, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), touches: $touches, declared: $declared, merge_state: "none", merged: false, merge_test: "not_run", kept: false, boss: $boss, boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_workspace: (if $boss_workspace == "" then null else $boss_workspace end), boss_cwd: (if $boss_cwd == "" then null else $boss_cwd end), boss_cross_workspace: $boss_cross, boss_cross_project: $boss_cross_project, base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at, opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode}' \
+    '{change: $change, project: $project, runner: $runner, kind: $kind, transport: $start, apply_cmd: $apply_cmd, note: $note, lessons: $lessons, external_block: $external_block, commit_block: $commit_block, commit_policy: $commit_policy, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), touches: $touches, declared: $declared, merge_state: "none", merged: false, merge_test: "not_run", kept: false, boss: $boss, boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_workspace: (if $boss_workspace == "" then null else $boss_workspace end), boss_cwd: (if $boss_cwd == "" then null else $boss_cwd end), boss_cross_workspace: $boss_cross, boss_cross_project: $boss_cross_project, base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at, opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode,
+     acp: (if $start == "acp" then {
+       command: $acp_command, apply_root: $acp_root, prompt: $acp_prompt,
+       model: (if $acp_model == "" then null else $acp_model end),
+       mode: $acp_mode, policy: $acp_policy, deny: $acp_deny,
+       session_id: null, supervisor_pid: null, control_socket: $acp_socket,
+       transcript: $acp_transcript, events_file: $acp_events,
+       boss_bin: $acp_boss_bin, heartbeat_file: $acp_heartbeat,
+       ready: false, phase: "starting", last_stop_reason: null,
+       pending_permission: null, usage: null, last_update: null,
+       error: null, dead_reported: false, load_session: null, resume: false
+     } else null end)}' \
     >"$state_file" || die_json "state_write" "cannot write state file $state_file"
+  BOSS_FAILED_STATE="$state_file"
 
-  detach_waiter "$state_file"
+  # bash 3.2 rejects an empty array expansion under 'set -u'.
+  if [ "${#agent_args[@]}" -gt 0 ]; then
+    start_runner "$start" "$agent_name" "$pane_id" "$kind" "$state_file" "${agent_args[@]}"
+  else
+    start_runner "$start" "$agent_name" "$pane_id" "$kind" "$state_file"
+  fi
+
+  if [ "$start" = "acp" ]; then
+    # The apply tab is a live view only: it tails the transcript and is never
+    # read for state, never prompted with keystrokes and hosts no agent.
+    if [ -n "$acp_transcript" ]; then
+      # The pane hosts a shell, not an agent: use the pane surface. 'agent
+      # send-keys' would be rejected because there is no Herdr agent here.
+      herdr pane run "$pane_id" "tail -n +1 -f '$acp_transcript'" >/dev/null 2>&1 \
+        || log "warning: could not start the transcript tail in pane $pane_id"
+    fi
+  else
+    # Wait until the agent TUI can take input before prompting.
+    await_runner_ready "$agent_name" "$pane_id" "$runner"
+    send_prompt "$agent_name" "$(compose_apply_prompt "$apply_cmd" "$note" "$lessons_block" "$external_block" "$commit_block" "$runner_yield")"
+    herdr_raw "pane.report_metadata" "$(jq -nc --arg p "$pane_id" --arg c "$change" \
+      '{pane_id: $p, source: "openspec", tokens: {os_change: $c, os_phase: "apply"}}')" >/dev/null || exit 1
+    detach_waiter "$state_file"
+  fi
+  BOSS_FAILED_STATE=""
+  BOSS_FAILED_ACP_PID=""
   BOSS_FAILED_TAB=""
   BOSS_FAILED_WORKTREE=""
   BOSS_FAILED_WORKTREE_WS=""
@@ -1009,12 +1166,13 @@ dispatch_change() {
     --arg change "$change" --arg project "$project" --arg runner "$runner_name_out" \
     --arg agent "$agent_name" --arg pane_id "$pane_id" --arg tab_id "$tab_id" \
     --arg workspace_id "$workspace_id" --arg status "started" \
+    --arg transport "$start" \
     --arg worktree "$worktree" --arg branch "$branch" \
     --argjson touches "$touches_json" --argjson declared "$declared" \
     --argjson wake_target "$wake_target" --argjson warnings "$warnings_json" \
     --argjson project_registered "$project_registered" --arg hint "$hint" --arg resource_warning "$resource_warn" \
     --argjson mode "$mode_json" --argjson policy "$policy_json" \
-    '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), touches: $touches, declared: $declared, status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode, policy: $policy}')"
+    '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, transport: $transport, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), touches: $touches, declared: $declared, status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode, policy: $policy}')"
   lock_release "$BOSS_DISPATCH_LOCK"
   BOSS_DISPATCH_LOCK=""
 }

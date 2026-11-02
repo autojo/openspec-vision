@@ -1,6 +1,6 @@
 # Vendored runtime
 
-The files in `bin/` are the boss runtime this repository ships.
+The files in `bin/` and `lib/` are the boss runtime this repository ships.
 
 - Source: `openspec-boss` (the standalone boss runtime)
 - Snapshot commit: `279ca8e58915e0e96f727b918f16e5cbec9e27ea` (2026-10-14)
@@ -31,6 +31,10 @@ added or changed here and has no upstream counterpart:
   macOS instead of being skipped for the missing `timeout(1)`
 - `boss_cwd_related` compares physical paths, so a project opened through a
   symlink (macOS `/tmp`, `/var`) is not reported as a caller identity mismatch
+- the ACP transport (`bin/boss-acp` plus `lib/boss_acp.py`): a detached
+  supervisor owns a `<command> acp` child, drives the session and turn,
+  bridges permissions, cancels, resumes with `session/load`, writes the JSONL
+  transcript and exposes a per-apply Unix control socket
 
 ## Updating
 

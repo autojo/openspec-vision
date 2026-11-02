@@ -5,6 +5,7 @@ src="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 skill_src="$src/vision"
 boss_skill_src="$src/boss"
 runtime_src="$src/runtime/bin"
+runtime_lib_src="$src/runtime/lib"
 opencode_src="$src/commands/opencode"
 claude_src="$src/commands/claude/boss"
 
@@ -22,7 +23,9 @@ boss_skill_dirs=(
 )
 boss_skill_marker=".vision-managed"
 runtime_files=(boss boss-lib.sh boss-waiter
-  boss-apply.sh boss-status.sh boss-review.sh boss-run.sh boss-doctor.sh boss-mission.sh)
+  boss-apply.sh boss-status.sh boss-review.sh boss-run.sh boss-doctor.sh boss-mission.sh
+  boss-acp)
+runtime_lib_files=(boss_acp.py)
 opencode_commands_dir="$opencode_dir/commands"
 claude_commands_dir="$claude_dir/commands/boss"
 config_dir="$HOME/.config/openspec-boss"
@@ -197,6 +200,12 @@ install_runtime() {
     [ -f "$runtime_src/$name" ] || { fail "missing $runtime_src/$name"; return 1; }
     copy_file "$runtime_src/$name" "$bin_dir/$name" 0755
   done
+  # The ACP supervisor is a Python library; the installed boss-acp wrapper
+  # finds it next to itself.
+  for name in "${runtime_lib_files[@]}"; do
+    [ -f "$runtime_lib_src/$name" ] || { fail "missing $runtime_lib_src/$name"; return 1; }
+    copy_file "$runtime_lib_src/$name" "$bin_dir/$name" 0755
+  done
   # Stamp the commit the copy came from, so 'boss --version' of an installed
   # runtime names its source (a checkout may have none).
   commit="$(git -C "$src" rev-parse --short HEAD 2>/dev/null || true)"
@@ -245,6 +254,13 @@ verify_install() {
     target="$bin_dir/$name"
     if [ ! -f "$target" ] || [ -L "$target" ] || { [ "$name" = boss ] && [ ! -x "$target" ]; }; then
       fail "verification failed: $target is not a regular executable file"
+      bad=1
+    fi
+  done
+  for name in "${runtime_lib_files[@]}"; do
+    target="$bin_dir/$name"
+    if [ ! -f "$target" ] || [ -L "$target" ]; then
+      fail "verification failed: $target is not a regular file"
       bad=1
     fi
   done
@@ -329,6 +345,9 @@ uninstall_all() {
     fi
   done
   for name in "${runtime_files[@]}"; do
+    rm -f -- "$bin_dir/$name"
+  done
+  for name in "${runtime_lib_files[@]}"; do
     rm -f -- "$bin_dir/$name"
   done
   rm -f -- "$bin_dir/.boss-runtime-commit" "$bin_dir/.boss-runtime-origin"
