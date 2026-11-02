@@ -190,6 +190,12 @@ case "${1:-} ${2:-}" in
     fi
     printf '%s\n' '{"result":{}}'
     ;;
+  "pane run")
+    if [ -n "${HERDR_PANE_RUN_LOG:-}" ]; then
+      printf '%s\n' "$*" >>"$HERDR_PANE_RUN_LOG"
+    fi
+    printf '%s\n' '{"result":{}}'
+    ;;
   "agent get")
     id="${3:-}"
     case " ${HERDR_LIVE_PANES:-} " in
@@ -304,6 +310,179 @@ case "${1:-} ${2:-}" in
 esac
 EOF
 
+cat >"$BIN/fake_acp_agent.py" <<'PYEOF'
+#!/usr/bin/env python3
+"""Fake ACP agent for the boss regression suite."""
+import json
+import os
+import sys
+
+MODE = os.environ.get("FAKE_ACP_MODE", "allow")
+SESSION = "sess-fake"
+MODELS = ["model-a", "model-b"]
+MODES = ["auto", "approve", "smart_approve", "chat"]
+
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def note(kind, update):
+    out({"jsonrpc": "2.0", "method": "session/update",
+         "params": {"sessionId": SESSION, "update": dict(update, sessionUpdate=kind)}})
+
+
+def result(req_id, value):
+    out({"jsonrpc": "2.0", "id": req_id, "result": value})
+
+
+def error(req_id, message):
+    out({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": message}})
+
+
+def config_options(model="model-a"):
+    return [
+        {"id": "model", "name": "Model", "type": "select", "currentValue": model,
+         "options": [{"value": m, "name": m} for m in MODELS]},
+        {"id": "provider", "name": "Provider", "type": "select", "currentValue": "fake",
+         "options": [{"value": "fake", "name": "fake"}]},
+    ]
+
+
+def modes():
+    return {"availableModes": [{"id": m, "name": m} for m in MODES], "currentModeId": "auto"}
+
+
+def emit_updates():
+    note("agent_message_chunk", {"messageId": "m1",
+                                 "content": {"type": "text", "text": "Hello from fake"}})
+    note("tool_call", {"toolCallId": "tc1", "title": "shell", "kind": "other",
+                       "status": "pending", "rawInput": {"command": "ls"}})
+    note("usage_update", {"usage": {"inputTokens": 3, "outputTokens": 5}})
+
+
+def ask_permission(command, title):
+    out({"jsonrpc": "2.0", "id": 9000, "method": "session/request_permission",
+         "params": {"sessionId": SESSION,
+                    "toolCall": {"toolCallId": "tc1", "title": title, "kind": "other",
+                                 "rawInput": {"command": command}},
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+                        {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
+                    ]}})
+
+
+def main():
+    prompt = None
+    prompt_kind = None
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        method = msg.get("method")
+        req_id = msg.get("id")
+        params = msg.get("params") or {}
+
+        if req_id is not None and ("result" in msg or "error" in msg):
+            if req_id != 9000 or prompt is None:
+                continue
+            kind = prompt_kind
+            prompt_kind = None
+            if kind == "deny":
+                note("agent_message_chunk", {"messageId": "m2",
+                                              "content": {"type": "text", "text": "denied"}})
+                result(prompt, {"stopReason": "end_turn", "usage": {"inputTokens": 1}})
+                prompt = None
+            elif kind == "cancel_tool":
+                note("tool_call_update", {"toolCallId": "tc1", "status": "in_progress"})
+            else:
+                note("agent_message_chunk", {"messageId": "m3",
+                                              "content": {"type": "text", "text": "answered"}})
+                result(prompt, {"stopReason": "end_turn", "usage": {"inputTokens": 2}})
+                prompt = None
+            continue
+
+        if method == "initialize":
+            if MODE == "no_handshake":
+                error(req_id, "fake handshake failure")
+                continue
+            init_log = os.environ.get("FAKE_ACP_INIT_LOG")
+            if init_log:
+                with open(init_log, "w", encoding="utf-8") as handle:
+                    json.dump(params, handle)
+            result(req_id, {"protocolVersion": 1,
+                            "agentCapabilities": {"loadSession": MODE != "no_load"},
+                            "agentInfo": {"name": "fake-acp", "version": "1"}})
+        elif method == "session/new":
+            if MODE == "bad_session":
+                error(req_id, "fake session/new failure")
+                continue
+            new = {"sessionId": SESSION}
+            if MODE != "no_modes":
+                new["modes"] = modes()
+            if MODE != "no_config":
+                new["configOptions"] = config_options()
+            result(req_id, new)
+        elif method == "session/set_config_option":
+            value = params.get("value")
+            if params.get("configId") == "model" and value not in MODELS:
+                error(req_id, "unknown model %s" % value)
+                continue
+            result(req_id, {"configOptions": config_options(value or "model-a")})
+        elif method == "session/set_mode":
+            if params.get("modeId") not in MODES:
+                error(req_id, "unknown mode %s" % params.get("modeId"))
+                continue
+            result(req_id, {})
+        elif method == "session/load":
+            note("agent_message_chunk", {"messageId": "m1",
+                                          "content": {"type": "text", "text": "Hello from fake"}})
+            note("tool_call", {"toolCallId": "tc1", "title": "shell", "kind": "other",
+                               "status": "completed", "rawInput": {"command": "ls"}})
+            note("agent_message_chunk", {"messageId": "m9",
+                                          "content": {"type": "text", "text": "after reload"}})
+            result(req_id, {"modes": modes(), "configOptions": config_options()})
+        elif method == "session/close":
+            result(req_id, {})
+            return 0
+        elif method == "session/prompt":
+            prompt = req_id
+            prompt_kind = MODE
+            emit_updates()
+            if MODE in ("cancel", "cancel_unconfirmed", "slow"):
+                pass
+            elif MODE == "ask":
+                ask_permission("deploy production", "deploy")
+            elif MODE == "deny":
+                ask_permission("git push --force origin main", "shell")
+            elif MODE == "cancel_tool":
+                ask_permission("sleep 60", "shell")
+            else:
+                ask_permission("ls -la", "shell")
+        elif method == "session/cancel":
+            if prompt is not None and MODE in ("cancel", "cancel_tool"):
+                note("agent_message_chunk", {"messageId": "m4",
+                                              "content": {"type": "text", "text": "cancelled"}})
+                result(prompt, {"stopReason": "cancelled"})
+                prompt = None
+        elif method is not None and req_id is not None:
+            result(req_id, {})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+
+cat >"$BIN/fake-goose" <<'EOF'
+#!/usr/bin/env bash
+exec python3 "$(dirname "$0")/fake_acp_agent.py" "$@"
+EOF
+
 cat >"$BIN/setsid" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -319,7 +498,8 @@ cat >"$BIN/deadline" <<EOF
 run_with_deadline "\$@"
 EOF
 
-chmod +x "$BIN/openspec" "$BIN/herdr" "$BIN/opencode" "$BIN/setsid" "$BIN/deadline"
+chmod +x "$BIN/openspec" "$BIN/herdr" "$BIN/opencode" "$BIN/setsid" "$BIN/deadline" \
+  "$BIN/fake-goose" "$BIN/fake_acp_agent.py"
 
 # A tiny Herdr socket server for the pane.report_metadata call.
 python3 - "$SOCKET" <<'PY' &
@@ -494,6 +674,15 @@ run_lib_state() {
     bash -c '. "$1/runtime/bin/boss-lib.sh"; shift; "$@"' _ "$ROOT" "$@"
 }
 
+# run_apply_lib <function...> -- same as run_lib, but also sources
+# boss-apply.sh so prompt/start helpers can be called directly.
+run_apply_lib() {
+  env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="${BOSS_CONFIG:-$CONFIG}" BOSS_STATE_DIR="$STATE" \
+  BOSS_LOG_FILE="$TMP/boss.log" \
+    bash -c '. "$1/runtime/bin/boss-lib.sh"; . "$1/runtime/bin/boss-apply.sh"; shift; "$@"' \
+    _ "$ROOT" "$@"
+}
+
 make_project() {
   local dir="$1"; shift
   mkdir -p "$dir/openspec/changes/archive" "$dir/openspec/missions"
@@ -563,6 +752,102 @@ make_git_project() {
 # plan_commit <project> <change> -- convenience wrapper around the CLI.
 plan_commit() {
   run_boss plan commit "$2" --project "$1"
+}
+
+# ------------------------------------------------------------ ACP helpers ---
+
+# acp_config <file> <project> [<policy>] [<extra>] -- a boss config with one
+# full ACP runner and a minimal native one. <extra> is appended verbatim, so a
+# test can add a second runner.
+acp_config() {
+  local file="$1" project="$2" policy="${3:-allow}" extra="${4:-}"
+  cat >"$file" <<EOF
+default = "goose"
+
+[projects]
+acp-test = "$project"
+
+[runners.goose]
+start = "acp"
+command = "fake-goose"
+model = "model-a"
+mode = "smart_approve"
+policy = "$policy"
+apply = "Follow the returned tasks."
+
+[runners.opencode]
+kind = "opencode"
+args = []
+apply = "/opsx-apply {change}"
+
+[missions]
+$extra
+EOF
+}
+
+# acp_state <state-root> <project> <change> -- path of the apply state file.
+acp_state() {
+  printf '%s/applies/%s-%s.json\n' "$1" "$(run_lib sha1_hex "$2")" \
+    "$(printf '%s' "$3" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9_-]/-/g')"
+}
+
+# acp_events_file <state-root> <project> <change> -- the apply event log.
+acp_events_file() {
+  printf '%s/cycles/%s-%s.events.jsonl\n' "$1" "$(run_lib sha1_hex "$2")" \
+    "$(printf '%s' "$3" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9_-]/-/g')"
+}
+
+# acp_count <file> <event> -- number of events of that name.
+acp_count() {
+  jq -Rrc --arg e "$2" 'select(length > 0) | (fromjson? | select(type == "object")) | select(.event == $e)' \
+    "$1" 2>/dev/null | wc -l | tr -d ' '
+}
+
+# acp_wait_event <file> <event> [<tries>] -- wait until the log carries it.
+acp_wait_event() {
+  local file="$1" event="$2" tries="${3:-100}" i=0
+  while [ "$i" -lt "$tries" ]; do
+    [ "$(acp_count "$file" "$event")" -gt 0 ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# acp_wait_phase <state-file> <phase> [<tries>] -- wait for an ACP phase.
+acp_wait_phase() {
+  local sf="$1" want="$2" tries="${3:-150}" i=0
+  while [ "$i" -lt "$tries" ]; do
+    if [ "$(jq -r '.acp.phase // empty' "$sf" 2>/dev/null || true)" = "$want" ]; then
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# acp_wait_stop <state-file> [<tries>] -- wait for a recorded stop reason.
+acp_wait_stop() {
+  local sf="$1" tries="${2:-150}" i=0
+  while [ "$i" -lt "$tries" ]; do
+    if [ -n "$(jq -r '.acp.last_stop_reason // empty' "$sf" 2>/dev/null || true)" ]; then
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# acp_live_agents -- one reachable dispatcher for the wake path.
+ACP_AGENTS='[{"name":"boss-ws-1","pane_id":"p-boss","workspace_id":"ws-1"}]'
+
+# kill_acp_supervisor <state-file> -- stop a test supervisor without the boss.
+kill_acp_supervisor() {
+  local pid
+  pid="$(jq -r '.acp.supervisor_pid // empty' "$1" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
 }
 
 # =============================================================== tests ====
@@ -3259,6 +3544,410 @@ if [ ! -e "$IP/.local/bin/.boss-runtime-commit" ] && [ ! -e "$IP/.local/bin/.bos
 else
   bad "installer previous runtime: uninstall left the runtime markers"
 fi
+
+# ------------------------------------------------------------- ACP runner ---
+# The ACP transport is exercised against the fake agent above; no model or
+# network is involved. Each scenario uses its own state root so a forgotten
+# supervisor cannot consume another scenario's slot.
+
+AP="$TMP/acp-project"
+make_project "$AP"
+ACP_CONF="$TMP/acp-boss.toml"
+acp_config "$ACP_CONF" "$AP"
+cat >>"$ACP_CONF" <<'EOF'
+
+[runners.goose-ask]
+start = "acp"
+command = "fake-goose"
+model = "model-a"
+mode = "smart_approve"
+policy = "ask"
+EOF
+ACP_AGENTS='[{"name":"boss-ws-1","pane_id":"p-boss","workspace_id":"ws-1"}]'
+
+acp_boss() {
+  local st="$1"; shift
+  HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$ACP_CONF" run_boss_state "$st" "$@"
+}
+
+acp_boss_fail() {
+  local st="$1"; shift
+  HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$ACP_CONF" run_boss_fail_state "$st" "$@"
+}
+
+# 60. ACP dispatch: session, model/mode, prompt, transcript, native start not used.
+make_change "$AP" acp-allow '- [ ] 1.1 Do the work.'
+AS1="$TMP/acp-state-1"; mkdir -p "$AS1"
+S1="$(acp_state "$AS1" "$AP" acp-allow)"
+START_LOG="$TMP/acp-agent-start.log"; : >"$START_LOG"
+KEYS_LOG="$TMP/acp-keys.log"; : >"$KEYS_LOG"
+PANE_RUN_LOG="$TMP/acp-pane-run.log"; : >"$PANE_RUN_LOG"
+ACP_INIT_LOG="$TMP/acp-init.log"; : >"$ACP_INIT_LOG"
+out="$(FAKE_ACP_MODE=allow FAKE_ACP_INIT_LOG="$ACP_INIT_LOG" \
+  HERDR_AGENT_START_LOG="$START_LOG" HERDR_SEND_KEYS_LOG="$KEYS_LOG" HERDR_PANE_RUN_LOG="$PANE_RUN_LOG" \
+  acp_boss "$AS1" dispatch acp-allow --project acp-test --runner goose)"
+check_eq "acp dispatch: status" "started" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp dispatch: result transport" "acp" "$(printf '%s' "$out" | jq -r '.transport')"
+check_eq "acp dispatch: state transport" "acp" "$(jq -r '.transport' "$S1")"
+check_eq "acp dispatch: no herdr agent start" "" "$(cat "$START_LOG")"
+acp_wait_stop "$S1" || bad "acp dispatch: no stop reason recorded"
+check_eq "acp dispatch: session" "sess-fake" "$(jq -r '.acp.session_id' "$S1")"
+check_eq "acp dispatch: model" "model-a" "$(jq -r '.acp.model' "$S1")"
+check_eq "acp dispatch: mode" "smart_approve" "$(jq -r '.acp.mode' "$S1")"
+check_eq "acp dispatch: stop reason" "end_turn" "$(jq -r '.acp.last_stop_reason' "$S1")"
+check_eq "acp dispatch: usage recorded" "2" "$(jq -r '.acp.usage.inputTokens' "$S1")"
+check_eq "acp dispatch: heartbeat" "true" "$(jq -r '.acp.heartbeat != null' "$S1")"
+check_eq "acp dispatch: heartbeat file" "true" \
+  "$([ -f "$(jq -r '.acp.heartbeat_file' "$S1")" ] && echo true || echo false)"
+acp_prompt="$(jq -r '.acp.prompt' "$S1")"
+check_contains "acp prompt: change name" "acp-allow" "$acp_prompt"
+check_contains "acp prompt: CLI workflow" "openspec instructions apply" "$acp_prompt"
+check_not_contains "acp prompt: no slash command" "/opsx" "$acp_prompt"
+check_contains "acp prompt: commit policy" "do not commit" "$acp_prompt"
+TR1="$(jq -r '.acp.transcript' "$S1")"
+check_contains "acp transcript: message update" "Hello from fake" "$(cat "$TR1")"
+check_contains "acp transcript: tool update" '"type":"tool_call"' "$(cat "$TR1")"
+check_contains "acp transcript: usage update" '"type":"usage"' "$(cat "$TR1")"
+check_contains "acp transcript: stop reason" '"stop_reason":"end_turn"' "$(cat "$TR1")"
+EV1="$(acp_events_file "$AS1" "$AP" acp-allow)"
+acp_wait_event "$EV1" wake || bad "acp dispatch: no wake event"
+check_eq "acp dispatch: acp_started event" "1" "$(acp_count "$EV1" acp_started)"
+check_eq "acp dispatch: exactly one wake" "1" "$(acp_count "$EV1" wake)"
+check_eq "acp permission: allowed" "1" \
+  "$(jq -Rrc 'select(length > 0) | (fromjson? | select(type=="object")) | select(.event=="acp_permission" and .decision=="allow")' "$EV1" | wc -l | tr -d ' ')"
+check_contains "acp tab: transcript tail" "tail -n +1 -f" "$(cat "$PANE_RUN_LOG")"
+check_eq "acp init: no fs capability" "none" "$(jq -r '.clientCapabilities.fs // "none"' "$ACP_INIT_LOG")"
+check_eq "acp init: no terminal capability" "none" "$(jq -r '.clientCapabilities.terminal // "none"' "$ACP_INIT_LOG")"
+acp_boss "$AS1" finish acp-allow --project acp-test >/dev/null 2>&1
+if [ -f "$S1" ]; then bad "acp finish: state file left behind"; else ok; fi
+
+# 60b. A retrigger sends a second prompt through the control socket.
+make_change "$AP" acp-retrigger '- [ ] 1.1 Do the work.'
+ASR="$TMP/acp-state-retrigger"; mkdir -p "$ASR"
+SR="$(acp_state "$ASR" "$AP" acp-retrigger)"
+EVR="$(acp_events_file "$ASR" "$AP" acp-retrigger)"
+FAKE_ACP_MODE=allow acp_boss "$ASR" dispatch acp-retrigger --project acp-test --runner goose >/dev/null
+acp_wait_stop "$SR" || bad "acp retrigger: first turn did not finish"
+out="$(acp_boss "$ASR" retrigger acp-retrigger --project acp-test --note "Do another pass.")"
+check_eq "acp retrigger: status" "retriggered" "$(printf '%s' "$out" | jq -r '.status')"
+i=0
+while [ "$i" -lt 100 ]; do
+  [ "$(acp_count "$EVR" acp_prompt)" -ge 2 ] && [ "$(acp_count "$EVR" acp_stop)" -ge 2 ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
+check_eq "acp retrigger: second prompt" "2" "$(acp_count "$EVR" acp_prompt)"
+check_eq "acp retrigger: second stop" "2" "$(acp_count "$EVR" acp_stop)"
+acp_boss "$ASR" finish acp-retrigger --project acp-test >/dev/null 2>&1
+
+# 61. Config validation and a failed handshake leave no apply behind.
+cat >>"$ACP_CONF" <<'EOF'
+
+[runners.badmodel]
+start = "acp"
+command = "fake-goose"
+model = "model-x"
+mode = "smart_approve"
+
+[runners.missingcommand]
+start = "acp"
+command = "definitely-not-an-agent"
+
+[runners.badstart]
+start = "bogus"
+kind = "opencode"
+
+[runners.badmode]
+start = "acp"
+command = "fake-goose"
+mode = "nonsense"
+
+[runners.noconfig]
+start = "acp"
+command = "fake-goose"
+model = "model-a"
+
+[runners.nomodes]
+start = "acp"
+command = "fake-goose"
+mode = "smart_approve"
+EOF
+AS2="$TMP/acp-state-2"; mkdir -p "$AS2"
+make_change "$AP" acp-badmodel '- [ ] 1.1 Do the work.'
+err="$(acp_boss_fail "$AS2" dispatch acp-badmodel --project acp-test --runner badmodel)"
+check_contains "acp bad model: rejected" "acp_start_failed" "$err"
+check_contains "acp bad model: names offered" "model-a, model-b" "$err"
+if [ -f "$(acp_state "$AS2" "$AP" acp-badmodel)" ]; then bad "acp bad model: state left behind"; else ok; fi
+err="$(acp_boss_fail "$AS2" dispatch acp-badmodel --project acp-test --runner missingcommand)"
+check_contains "acp missing command: rejected" "acp_command_missing" "$err"
+if [ -f "$(acp_state "$AS2" "$AP" acp-badmodel)" ]; then bad "acp missing command: state left behind"; else ok; fi
+err="$(acp_boss_fail "$AS2" dispatch acp-badmodel --project acp-test --runner badstart)"
+check_contains "acp unknown start: rejected" "invalid_runner_start" "$err"
+err="$(acp_boss_fail "$AS2" dispatch acp-badmodel --project acp-test --runner badmode)"
+check_contains "acp bad mode: rejected" "acp_start_failed" "$err"
+check_contains "acp bad mode: names offered" "auto, approve, smart_approve, chat" "$err"
+err="$(FAKE_ACP_MODE=no_config acp_boss_fail "$AS2" dispatch acp-badmodel --project acp-test --runner noconfig)"
+check_contains "acp no config option: rejected" "does not advertise a model config option" "$err"
+err="$(FAKE_ACP_MODE=no_modes acp_boss_fail "$AS2" dispatch acp-badmodel --project acp-test --runner nomodes)"
+check_contains "acp no modes: rejected" "does not advertise session modes" "$err"
+if [ -f "$(acp_state "$AS2" "$AP" acp-badmodel)" ]; then bad "acp option failures: state left behind"; else ok; fi
+
+# 62. Old state files stay readable; the transport defaults to herdr.
+LGS="$TMP/acp-legacy"; mkdir -p "$LGS/applies"
+LSF="$(acp_state "$LGS" "$AP" legacy)"
+jq -n --arg c legacy --arg p "$AP" \
+  '{change:$c, project:$p, agent:"apply-legacy", pane_id:"p-legacy", tab_id:"tab-legacy",
+    workspace_id:"ws-1", boss:"boss-ws-1", boss_pane:"p-boss", waiter_pid:null}' >"$LSF"
+out="$(acp_boss "$LGS" status legacy --project acp-test --json 2>/dev/null)"
+check_eq "acp legacy state: transport" "herdr" "$(printf '%s' "$out" | jq -r '.transport')"
+check_eq "acp legacy state: no acp object" "null" "$(printf '%s' "$out" | jq -r '.acp')"
+LGS_LIB="$LGS"
+run_lib_state "$LGS_LIB" write_state_field "$LSF" note "round-trip" >/dev/null 2>&1
+check_eq "acp legacy state: round-trip write" "round-trip" "$(jq -r '.note' "$LSF")"
+
+# 63. A native runner keeps the Herdr start and writes transport=herdr.
+PN="$TMP/acp-native"; make_project "$PN"; make_change "$PN" native-one '- [ ] 1.1 Code.'
+NCONF="$TMP/acp-native.toml"; base_config "$NCONF" "$PN"
+NS="$TMP/acp-native-state"; mkdir -p "$NS"
+NSTART="$TMP/acp-native-start.log"; : >"$NSTART"
+out="$(HERDR_AGENT_START_LOG="$NSTART" BOSS_CONFIG="$NCONF" run_boss_state "$NS" dispatch native-one --project "$PN")"
+NSF="$(acp_state "$NS" "$PN" native-one)"
+check_eq "acp native: transport" "herdr" "$(printf '%s' "$out" | jq -r '.transport')"
+check_eq "acp native: state transport" "herdr" "$(jq -r '.transport' "$NSF")"
+check_eq "acp native: no acp object" "null" "$(jq -r '.acp' "$NSF")"
+check_contains "acp native: herdr agent start" "agent start" "$(cat "$NSTART")"
+
+# 64. Permission policy: deny, ask with an answer, and an interrupt of a
+# pending request.
+make_change "$AP" acp-deny '- [ ] 1.1 Do the work.'
+AS3="$TMP/acp-state-3"; mkdir -p "$AS3"
+S3="$(acp_state "$AS3" "$AP" acp-deny)"
+FAKE_ACP_MODE=deny acp_boss "$AS3" dispatch acp-deny --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S3" || bad "acp deny: no stop reason"
+EV3="$(acp_events_file "$AS3" "$AP" acp-deny)"
+check_eq "acp deny: stop reason" "end_turn" "$(jq -r '.acp.last_stop_reason' "$S3")"
+check_eq "acp deny: decision reject" "1" \
+  "$(jq -Rrc 'select(length > 0) | (fromjson? | select(type=="object")) | select(.event=="acp_permission" and .decision=="reject")' "$EV3" | wc -l | tr -d ' ')"
+check_contains "acp deny: command did not run" "denied" "$(cat "$(jq -r '.acp.transcript' "$S3")")"
+acp_boss "$AS3" finish acp-deny --project acp-test >/dev/null 2>&1
+
+make_change "$AP" acp-ask '- [ ] 1.1 Do the work.'
+AS4="$TMP/acp-state-4"; mkdir -p "$AS4"
+S4="$(acp_state "$AS4" "$AP" acp-ask)"
+FAKE_ACP_MODE=ask acp_boss "$AS4" dispatch acp-ask --project acp-test --runner goose-ask >/dev/null
+if acp_wait_phase "$S4" blocked; then ok; else bad "acp ask: never blocked"; fi
+out="$(acp_boss "$AS4" status acp-ask --project acp-test --json 2>/dev/null)"
+check_eq "acp ask: status blocked" "blocked" "$(printf '%s' "$out" | jq -r '.agent_state')"
+check_eq "acp ask: pending title" "deploy" "$(printf '%s' "$out" | jq -r '.pending_permission.title')"
+check_contains "acp ask: offered options" "allow_once" "$(printf '%s' "$out" | jq -r '.pending_permission.options | map(.optionId) | join(",")')"
+check_contains "acp ask: status dialog" "deploy production" "$(printf '%s' "$out" | jq -r '.blocked_dialog')"
+err="$(acp_boss_fail "$AS4" answer acp-ask reject_nope --project acp-test)"
+check_contains "acp ask: unknown option" "answer_failed" "$err"
+check_contains "acp ask: unknown option names offered" "allow_once" "$err"
+out="$(acp_boss "$AS4" answer acp-ask allow_once --project acp-test)"
+check_eq "acp ask: answer accepted" "answered" "$(printf '%s' "$out" | jq -r '.status')"
+acp_wait_phase "$S4" idle || bad "acp ask: did not return to idle"
+check_eq "acp ask: stop reason" "end_turn" "$(jq -r '.acp.last_stop_reason' "$S4")"
+check_eq "acp ask: answered event" "1" "$(acp_count "$(acp_events_file "$AS4" "$AP" acp-ask)" acp_permission_answered)"
+acp_boss "$AS4" finish acp-ask --project acp-test >/dev/null 2>&1
+
+make_change "$AP" acp-blocked-interrupt '- [ ] 1.1 Do the work.'
+AS5="$TMP/acp-state-5"; mkdir -p "$AS5"
+S5="$(acp_state "$AS5" "$AP" acp-blocked-interrupt)"
+FAKE_ACP_MODE=ask acp_boss "$AS5" dispatch acp-blocked-interrupt --project acp-test --runner goose-ask >/dev/null
+if acp_wait_phase "$S5" blocked; then ok; else bad "acp blocked interrupt: never blocked"; fi
+out="$(acp_boss "$AS5" interrupt acp-blocked-interrupt --project acp-test)"
+check_eq "acp blocked interrupt: status" "cancelled" "$(printf '%s' "$out" | jq -r '.status')"
+EV5="$(acp_events_file "$AS5" "$AP" acp-blocked-interrupt)"
+check_eq "acp blocked interrupt: answered cancelled" "1" \
+  "$(jq -Rrc 'select(length > 0) | (fromjson? | select(type=="object")) | select(.event=="acp_permission_answered" and .decision=="cancelled")' "$EV5" | wc -l | tr -d ' ')"
+acp_wait_phase "$S5" idle || true
+acp_boss "$AS5" finish acp-blocked-interrupt --project acp-test >/dev/null 2>&1
+
+# 65. Cancel during generation, during a tool call, and a timeout.
+make_change "$AP" acp-cancel '- [ ] 1.1 Do the work.'
+AS6="$TMP/acp-state-6"; mkdir -p "$AS6"
+S6="$(acp_state "$AS6" "$AP" acp-cancel)"
+FAKE_ACP_MODE=cancel acp_boss "$AS6" dispatch acp-cancel --project acp-test --runner goose >/dev/null
+sleep 0.3
+out="$(acp_boss "$AS6" interrupt acp-cancel --project acp-test)"
+check_eq "acp cancel: generation status" "cancelled" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp cancel: stop reason" "cancelled" "$(jq -r '.acp.last_stop_reason' "$S6")"
+acp_boss "$AS6" finish acp-cancel --project acp-test >/dev/null 2>&1
+
+make_change "$AP" acp-cancel-tool '- [ ] 1.1 Do the work.'
+AS7="$TMP/acp-state-7"; mkdir -p "$AS7"
+S7="$(acp_state "$AS7" "$AP" acp-cancel-tool)"
+FAKE_ACP_MODE=cancel_tool acp_boss "$AS7" dispatch acp-cancel-tool --project acp-test --runner goose >/dev/null
+sleep 0.6
+out="$(acp_boss "$AS7" interrupt acp-cancel-tool --project acp-test)"
+check_eq "acp cancel tool: status" "cancelled" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp cancel tool: stop reason" "cancelled" "$(jq -r '.acp.last_stop_reason' "$S7")"
+acp_boss "$AS7" finish acp-cancel-tool --project acp-test >/dev/null 2>&1
+
+make_change "$AP" acp-cancel-unconfirmed '- [ ] 1.1 Do the work.'
+AS8="$TMP/acp-state-8"; mkdir -p "$AS8"
+S8="$(acp_state "$AS8" "$AP" acp-cancel-unconfirmed)"
+FAKE_ACP_MODE=slow BOSS_ACP_CANCEL_TIMEOUT_S=1 acp_boss "$AS8" dispatch acp-cancel-unconfirmed --project acp-test --runner goose >/dev/null
+sleep 0.3
+out="$(BOSS_ACP_CANCEL_TIMEOUT_S=1 acp_boss "$AS8" interrupt acp-cancel-unconfirmed --project acp-test)"
+check_eq "acp cancel unconfirmed: status" "cancel_unconfirmed" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp cancel unconfirmed: state" "cancel_unconfirmed" "$(jq -r '.acp.last_stop_reason' "$S8")"
+BOSS_ACP_CANCEL_TIMEOUT_S=1 acp_boss "$AS8" finish acp-cancel-unconfirmed --project acp-test --force >/dev/null 2>&1
+
+# 66. Resume loads the session and deduplicates the replay.
+make_change "$AP" acp-resume '- [ ] 1.1 Do the work.'
+AS9="$TMP/acp-state-9"; mkdir -p "$AS9"
+S9="$(acp_state "$AS9" "$AP" acp-resume)"
+FAKE_ACP_MODE=allow acp_boss "$AS9" dispatch acp-resume --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S9" || bad "acp resume: first turn did not finish"
+kill_acp_supervisor "$S9"
+sleep 0.3
+out="$(FAKE_ACP_MODE=load acp_boss "$AS9" resume acp-resume --project acp-test)"
+check_eq "acp resume: status" "resumed" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp resume: load event" "1" "$(acp_count "$(acp_events_file "$AS9" "$AP" acp-resume)" acp_load)"
+TR9="$(jq -r '.acp.transcript' "$S9")"
+check_contains "acp resume: boundary" '"reason":"session_load"' "$(cat "$TR9")"
+check_contains "acp resume: replayed message" "after reload" "$(cat "$TR9")"
+check_eq "acp resume: replay deduplicated" "1" "$(grep -c '"message_id":"m1"' "$TR9" || true)"
+acp_boss "$AS9" finish acp-resume --project acp-test >/dev/null 2>&1
+
+make_change "$AP" acp-no-load '- [ ] 1.1 Do the work.'
+AS10="$TMP/acp-state-10"; mkdir -p "$AS10"
+S10="$(acp_state "$AS10" "$AP" acp-no-load)"
+FAKE_ACP_MODE=no_load acp_boss "$AS10" dispatch acp-no-load --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S10" || true
+kill_acp_supervisor "$S10"
+sleep 0.2
+err="$(FAKE_ACP_MODE=load acp_boss_fail "$AS10" resume acp-no-load --project acp-test)"
+check_contains "acp no load: unresumable" "unresumable" "$err"
+check_contains "acp no load: offers retrigger" "boss retrigger" "$err"
+rm -f "$S10"
+
+# 67. Slots follow the supervisor: a live one consumes a slot, a dead one frees
+# it and wakes the boss exactly once.
+make_change "$AP" acp-slot-a '- [ ] 1.1 Do the work.'
+make_change "$AP" acp-slot-b '- [ ] 1.1 Do the work.'
+AS11="$TMP/acp-state-11"; mkdir -p "$AS11"
+S11A="$(acp_state "$AS11" "$AP" acp-slot-a)"
+FAKE_ACP_MODE=allow acp_boss "$AS11" dispatch acp-slot-a --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S11A" || bad "acp slots: first apply did not start"
+check_eq "acp slots: live supervisor counts" "1" \
+  "$(HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$ACP_CONF" run_lib_state "$AS11" open_apply_count)"
+err="$(acp_boss_fail "$AS11" dispatch acp-slot-b --project acp-test --runner goose)"
+check_contains "acp slots: limit refuses" "parallel_limit" "$err"
+check_contains "acp slots: current and max" '"current":1' "$err"
+kill_acp_supervisor "$S11A"
+sleep 0.2
+check_eq "acp slots: dead supervisor frees the slot" "0" \
+  "$(HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$ACP_CONF" run_lib_state "$AS11" open_apply_count)"
+acp_wait_event "$(acp_events_file "$AS11" "$AP" acp-slot-a)" lost \
+  || bad "acp slots: no crash wake"
+# The dead apply still holds its (exclusive) lock until it is finished; the
+# crash wake is what tells the Explorer to do that.
+acp_boss "$AS11" finish acp-slot-a --project acp-test --force >/dev/null 2>&1 || true
+out="$(acp_boss "$AS11" dispatch acp-slot-b --project acp-test --runner goose)"
+check_eq "acp slots: dispatch after the crash" "started" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp slots: crash wake" "1" "$(acp_count "$(acp_events_file "$AS11" "$AP" acp-slot-a)" lost)"
+S11B="$(acp_state "$AS11" "$AP" acp-slot-b)"
+if [ -f "$S11B" ]; then ok; else bad "acp slots: second apply state missing"; fi
+acp_boss "$AS11" finish acp-slot-b --project acp-test >/dev/null 2>&1
+
+# 68. Locks remain transport-neutral: an ACP apply holds its declared lock.
+WL="$TMP/acp-lock-project"
+make_git_project "$WL"
+make_change "$WL" lock-a '- [ ] 1.1 Code.'
+make_change "$WL" lock-b '- [ ] 1.1 Code.'
+plan_commit "$WL" lock-a >/dev/null 2>&1
+plan_commit "$WL" lock-b >/dev/null 2>&1
+LCONF="$TMP/acp-lock.toml"
+acp_config "$LCONF" "$WL" allow "max_parallel = 2"
+LS="$TMP/acp-lock-state"; mkdir -p "$LS"
+FAKE_ACP_MODE=allow HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$LCONF" \
+  run_boss_state "$LS" dispatch lock-a --project acp-test --runner goose --worktree --touches src/a >/dev/null
+LSFA="$(acp_state "$LS" "$WL" lock-a)"
+acp_wait_stop "$LSFA" || true
+err="$(FAKE_ACP_MODE=allow HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$LCONF" \
+  run_boss_fail_state "$LS" dispatch lock-b --project acp-test --runner goose --worktree --touches src/a)"
+check_contains "acp locks: conflict refused" "lock_conflict" "$err"
+check_contains "acp locks: names the holder" "lock-a" "$err"
+HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$LCONF" run_boss_state "$LS" finish lock-a --project acp-test >/dev/null 2>&1 || true
+
+# 69. Doctor validates an ACP runner only when configured.
+doc_acp() {
+  local conf="$1" state="$2"
+  HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$conf" run_boss_state "$state" doctor --project acp-test --json 2>/dev/null
+}
+DAS="$TMP/acp-doctor-state"; mkdir -p "$DAS"
+out="$(doc_acp "$ACP_CONF" "$DAS")"
+check_eq "acp doctor: healthy runner" "ok" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:goose") | .status')"
+DCONF="$TMP/acp-doctor-missing.toml"
+acp_config "$DCONF" "$AP"
+printf '\n[runners.missing]\nstart = "acp"\ncommand = "definitely-not-an-agent"\n' >>"$DCONF"
+out="$(doc_acp "$DCONF" "$DAS")"
+check_eq "acp doctor: missing command fails" "fail" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:missing") | .status')"
+check_contains "acp doctor: names the binary" "definitely-not-an-agent" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:missing") | .hint')"
+out="$(FAKE_ACP_MODE=no_handshake doc_acp "$ACP_CONF" "$DAS")"
+check_eq "acp doctor: handshake failure" "fail" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:goose") | .status')"
+check_contains "acp doctor: handshake message" "fake handshake failure" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:goose") | .hint')"
+MCONF="$TMP/acp-doctor-model.toml"
+acp_config "$MCONF" "$AP"
+printf '\n[runners.wrongmodel]\nstart = "acp"\ncommand = "fake-goose"\nmodel = "model-x"\n' >>"$MCONF"
+out="$(doc_acp "$MCONF" "$DAS")"
+check_eq "acp doctor: unknown model fails" "fail" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:wrongmodel") | .status')"
+check_contains "acp doctor: names offered models" "model-a, model-b" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:wrongmodel") | .hint')"
+
+# 70. boss acp-event writes one wake; a parked apply records but stays quiet.
+make_change "$AP" event-change '- [ ] 1.1 Code.'
+EVS="$TMP/acp-event-state"; mkdir -p "$EVS/applies"
+ESF="$EVS/applies/$(run_lib sha1_hex "$AP")-event-change.json"
+jq -n --arg c event-change --arg p "$AP" \
+  '{change:$c, project:$p, agent:"apply-event-change", pane_id:"p-ev", tab_id:"tab-ev",
+    workspace_id:"ws-1", boss:"boss-ws-1", boss_pane:"p-boss", boss_workspace:"ws-1",
+    boss_cwd:$p, waiter_pid:null}' >"$ESF"
+out="$(acp_boss "$EVS" acp-event "$ESF" blocked blocked 'Apply event-change: blocked.')"
+check_eq "acp-event: wake sent" "true" "$(printf '%s' "$out" | jq -r '.wake')"
+EEV="$(acp_events_file "$EVS" "$AP" event-change)"
+check_eq "acp-event: blocked event" "1" "$(acp_count "$EEV" blocked)"
+check_eq "acp-event: one wake" "1" "$(acp_count "$EEV" wake)"
+jq '.parked = true' "$ESF" >"$ESF.tmp" && mv "$ESF.tmp" "$ESF"
+out="$(acp_boss "$EVS" acp-event "$ESF" settled idle 'Apply event-change: idle.')"
+check_eq "acp-event: parked quiet" "true" "$(printf '%s' "$out" | jq -r '.parked')"
+check_eq "acp-event: parked no wake" "false" "$(printf '%s' "$out" | jq -r '.wake')"
+check_eq "acp-event: still one wake" "1" "$(acp_count "$EEV" wake)"
+check_eq "acp-event: settled recorded" "1" "$(acp_count "$EEV" settled)"
+rm -f "$ESF"
+
+# 71. The ACP prompt is CLI-based and never assumes a slash command.
+pprompt="$(run_apply_lib compose_acp_apply_prompt "$AP" prompt-change "" "" "" \
+  "Commit policy: do not commit." "End your turn." "")"
+check_contains "acp prompt unit: change" "prompt-change" "$pprompt"
+check_contains "acp prompt unit: CLI apply" "openspec instructions apply" "$pprompt"
+check_not_contains "acp prompt unit: no slash" "/opsx" "$pprompt"
+pprompt="$(run_apply_lib compose_acp_apply_prompt "$AP" prompt-change "" "" "" "" "" "/opsx-apply prompt-change")"
+check_not_contains "acp prompt unit: slash template ignored" "/opsx" "$pprompt"
+
+# 72. End-to-end: dispatch -> blocked -> answer -> end_turn -> status -> finish.
+make_change "$AP" acp-e2e '- [ ] 1.1 Do the work.'
+AS12="$TMP/acp-state-12"; mkdir -p "$AS12"
+S12="$(acp_state "$AS12" "$AP" acp-e2e)"
+FAKE_ACP_MODE=ask HERDR_SEND_KEYS_LOG="$KEYS_LOG" acp_boss "$AS12" dispatch acp-e2e --project acp-test --runner goose-ask >/dev/null
+if acp_wait_phase "$S12" blocked; then ok; else bad "acp e2e: never blocked"; fi
+acp_boss "$AS12" answer acp-e2e allow_once --project acp-test >/dev/null
+acp_wait_phase "$S12" idle || bad "acp e2e: did not finish the turn"
+out="$(acp_boss "$AS12" status acp-e2e --project acp-test --json 2>/dev/null)"
+check_eq "acp e2e: status idle" "idle" "$(printf '%s' "$out" | jq -r '.agent_state')"
+check_eq "acp e2e: stop reason" "end_turn" "$(printf '%s' "$out" | jq -r '.last_stop_reason')"
+check_eq "acp e2e: usage" "2" "$(printf '%s' "$out" | jq -r '.acp_usage.inputTokens')"
+check_eq "acp e2e: transcript path" "$(jq -r '.acp.transcript' "$S12")" "$(printf '%s' "$out" | jq -r '.acp_transcript')"
+E2E_SOCKET="$(jq -r '.acp.control_socket // empty' "$S12")"
+out="$(acp_boss "$AS12" finish acp-e2e --project acp-test)"
+check_eq "acp e2e: finished" "finished" "$(printf '%s' "$out" | jq -r '.status')"
+if [ -f "$S12" ]; then bad "acp e2e: state after finish"; else ok; fi
+if [ -n "$E2E_SOCKET" ] && [ -S "$E2E_SOCKET" ]; then bad "acp e2e: socket after finish"; else ok; fi
+# No ACP interrupt may send keystrokes: only the display tail is ever typed.
+check_not_contains "acp e2e: no interrupt keystrokes" "esc" "$(cat "$KEYS_LOG")"
+
 
 # ------------------------------------------------------- runtime hygiene ---
 # The version is part of the contract: an installed copy must name its source.

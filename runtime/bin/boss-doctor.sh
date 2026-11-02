@@ -162,6 +162,50 @@ doctor_check_worktrees() {
 
 }
 
+# doctor_check_acp_runners <project> <config-json> -- validate every configured
+# ACP runner: the command must exist, the ACP handshake must succeed, and the
+# configured model and mode must be offered. No check is added when no ACP
+# runner is configured. The probe is the same boss_acp.py that the supervisor
+# uses, so a passing doctor run exercises the real handshake.
+doctor_check_acp_runners() {
+  local project="$1" cfg="$2" name command binary model mode script out rc status hint
+  script="$(boss_acp_py)"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    command="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.runners[$n].command // empty')"
+    model="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.runners[$n].model // empty')"
+    mode="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.runners[$n].mode // "smart_approve"')"
+    if [ -z "$command" ]; then
+      doctor_add "acp_runner:$name" fail "runner '$name' uses start = \"acp\" but has no command; set command = \"goose\""
+      continue
+    fi
+    binary="${command%% *}"
+    if ! command -v "$binary" >/dev/null 2>&1; then
+      doctor_add "acp_runner:$name" fail "the ACP command '$binary' for runner '$name' is not on PATH"
+      continue
+    fi
+    if [ -z "$script" ]; then
+      doctor_add "acp_runner:$name" fail "the ACP supervisor library boss_acp.py is missing; reinstall the runtime"
+      continue
+    fi
+    out="$(cd "$project" && run_with_deadline 300 python3 "$script" --probe "$command" --cwd "$project" \
+      --timeout 120 ${model:+--model "$model"} ${mode:+--mode "$mode"} 2>&1)"
+    rc=$?
+    if ! printf '%s' "$out" | jq -e '.status' >/dev/null 2>&1; then
+      hint="$(printf '%s' "$out" | tail -n 1 | cut -c1-400)"
+      doctor_add "acp_runner:$name" fail "the ACP handshake for runner '$name' failed (exit $rc): ${hint:-no output}"
+      continue
+    fi
+    status="$(printf '%s' "$out" | jq -r '.status')"
+    hint="$(printf '%s' "$out" | jq -r '.message // empty')"
+    if [ "$status" = "ok" ]; then
+      doctor_add "acp_runner:$name" ok "$(printf '%s' "$out" | jq -r '"command \(.command), protocol \(.protocol // "?"), models \(.models | join(", "))"')"
+    else
+      doctor_add "acp_runner:$name" fail "runner '$name': ${hint:-ACP probe failed}"
+    fi
+  done < <(printf '%s' "$cfg" | jq -r '(.runners // {}) | to_entries[] | select((.value.start // "herdr") == "acp") | .key' 2>/dev/null || true)
+}
+
 # cmd_doctor [--project <name|path>] [--json] [--fix] -- preflight the
 # permissions and prerequisites of a run. Read-only by default; --fix performs
 # only safe, reversible repairs. Never blocks: it reports, and exits 0.
@@ -218,7 +262,7 @@ cmd_doctor() {
   fi
 
   cfg="$(config_json 2>/dev/null || true)"
-  kinds="$(printf '%s' "$cfg" | jq -r '(.runners // {}) | to_entries[] | .value.kind // empty' 2>/dev/null | sort -u || true)"
+  kinds="$(printf '%s' "$cfg" | jq -r '(.runners // {}) | to_entries[] | select((.value.start // "herdr") != "acp") | .value.kind // empty' 2>/dev/null | sort -u || true)"
   default_runner="$(printf '%s' "$cfg" | jq -r '.default // empty' 2>/dev/null || true)"
   local have_opencode=0 opencode_version=""
   # kinds is newline-separated (one kind per line from sort -u), so match the
@@ -515,6 +559,10 @@ cmd_doctor() {
       doctor_add opencode_runner_args warn "explicit args without --auto on runner(s):$runner_warn; add '--auto' or remove the explicit args so boss adds it"
     fi
   fi
+
+  # ACP runners are validated only when configured. The probe starts the real
+  # command for the handshake; a bad model/mode names the offered values.
+  doctor_check_acp_runners "$project" "$cfg"
 
   local checks overall json
   checks="$(jq -s '.' "$DOCTOR_TMP")"

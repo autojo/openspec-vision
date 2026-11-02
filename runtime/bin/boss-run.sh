@@ -4,6 +4,16 @@
 
 ensure_waiter() {
   local state_file="$1" pid
+  if acp_is_acp "$state_file"; then
+    pid="$(acp_supervisor_pid "$state_file")"
+    if acp_pid_alive "$pid"; then
+      printf '%s running\n' "$pid"
+    else
+      printf '%s dead\n' "${pid:-unknown}"
+      return 1
+    fi
+    return 0
+  fi
   pid="$(jq -r '.waiter_pid // empty' "$state_file")"
   if waiter_alive "$pid"; then
     printf '%s running\n' "$pid"
@@ -62,6 +72,23 @@ cmd_wait() {
       '{change: $change, agent: $agent, waiter_pid: null, status: "parked"}')"
     return 0
   fi
+  if acp_is_acp "$state_file"; then
+    local transport_pid status
+    transport_pid="$(acp_supervisor_pid "$state_file")"
+    if acp_pid_alive "$transport_pid"; then
+      status="running"
+    else
+      status="dead"
+      acp_report_dead "$state_file"
+    fi
+    log "wait: change=$change transport=acp supervisor=${transport_pid:-none} status=$status"
+    printf '%s\n' "$(jq -n --arg change "$change" --arg agent "$agent" \
+      --arg pid "$transport_pid" --arg status "$status" \
+      '{change: $change, agent: $agent, transport: "acp",
+        supervisor_pid: (if $pid == "" then null else ($pid | tonumber? // $pid) end),
+        waiter_pid: null, status: $status}')"
+    return 0
+  fi
   herdr agent get "$pane_id" >/dev/null 2>&1 || die_json "agent_gone" "agent '$agent' no longer exists; start a new apply with 'boss dispatch $change'"
   res="$(ensure_waiter "$state_file")"
   log "wait: change=$change agent=$agent waiter=$res"
@@ -102,6 +129,14 @@ cmd_wait_all() {
     if [ "$(jq -r '.parked // false' "$state_file" 2>/dev/null || printf false)" = "true" ]; then
       status="parked"
       pid=""
+    elif acp_is_acp "$state_file"; then
+      pid="$(acp_supervisor_pid "$state_file")"
+      if acp_pid_alive "$pid"; then
+        status="running"
+      else
+        status="dead"
+        acp_report_dead "$state_file"
+      fi
     elif waiter_alive "$pid"; then
       status="running"
     elif [ -n "$pane_id" ] && herdr agent get "$pane_id" >/dev/null 2>&1; then
@@ -304,6 +339,45 @@ cmd_retrigger() {
     local base_head
     base_head="$(git -C "$project" rev-parse HEAD 2>/dev/null || true)"
     [ -n "$base_head" ] && write_state_field "$state_file" base_head "$base_head"
+  fi
+
+  if acp_is_acp "$state_file"; then
+    local acp_root acp_prompt acp_pid resp resp_ok retrigger_worktree retrigger_runner
+    retrigger_worktree="$(jq -r '.worktree // empty' "$state_file" 2>/dev/null || true)"
+    acp_root="${retrigger_worktree:-$project}"
+    acp_pid="$(acp_supervisor_pid "$state_file")"
+    if acp_pid_alive "$acp_pid"; then
+      acp_prompt="$(compose_acp_apply_prompt "$acp_root" "$change" "$note" "$lessons_block" \
+        "$external_block" "$commit_block" "$runner_yield" "$apply_cmd")"
+      resp="$(acp_control_send "$(jq -r '.acp.control_socket // empty' "$state_file")" \
+        "$(jq -nc --arg t "$acp_prompt" '{command: "prompt", text: $t}')" 30 || true)"
+      resp_ok="$(printf '%s' "$resp" | jq -r '.ok // false' 2>/dev/null || printf false)"
+      if [ "$resp_ok" != "true" ]; then
+        local resp_error
+        resp_error="$(printf '%s' "$resp" | jq -r '.error // "control_failed"' 2>/dev/null || printf control_failed)"
+        die_json "acp_control_failed" "cannot send a new prompt to the ACP supervisor: $resp_error"
+      fi
+      append_event "$(events_file_for "$project" "$change")" retrigger \
+        "$(jq -nc --arg c "$change" --arg p "$project" '{change: $c, project: $p}')" \
+        || log "warning: could not record retrigger event"
+      log "retrigger: change=$change transport=acp supervisor=$acp_pid"
+      printf '%s\n' "$(jq -n \
+        --arg change "$change" --arg project "$project" \
+        --arg agent "$agent" --arg status "retriggered" \
+        '{change: $change, project: $project, agent: $agent, transport: "acp", status: $status}')"
+      return 0
+    fi
+    # No supervisor: an explicit retrigger starts a new session (never a silent
+    # fallback). A recorded worktree is reused so the work stays isolated.
+    retrigger_runner="$(jq -r '.runner // empty' "$state_file")"
+    retrigger_runner="$(resolve_runner "$retrigger_runner")" || exit 1
+    log "retrigger: ACP supervisor for $change is gone; starting a new session"
+    if [ -n "$retrigger_worktree" ]; then
+      dispatch_change "$change" "$project" "$retrigger_runner" "$note" 1
+    else
+      dispatch_change "$change" "$project" "$retrigger_runner" "$note" 0
+    fi
+    return 0
   fi
 
   if [ -z "$pane_id" ] || [ "$pane_id" = "null" ] || ! herdr agent get "$pane_id" >/dev/null 2>&1; then
@@ -596,9 +670,18 @@ cmd_finish() {
 
   # Finishing only ends the apply session; archiving stays a separate step.
   # The one thing worth guarding is an agent that is still working.
-  agent_state="$(agent_state_of "$pane_id")"
-  if [ "$force" -ne 1 ] && [ "$agent_state" = "working" ]; then
-    die_json "agent_working" "apply agent for '$change' is still working; wait for it (boss wait $change) or use --force"
+  if acp_is_acp "$state_file"; then
+    local acp_phase
+    acp_phase="$(jq -r '.acp.phase // "unknown"' "$state_file" 2>/dev/null || printf unknown)"
+    if [ "$force" -ne 1 ] && [ "$acp_phase" = "working" ]; then
+      die_json "agent_working" "ACP apply for '$change' is still working; wait for it (boss wait $change) or use --force"
+    fi
+    acp_stop_supervisor "$state_file" finish
+  else
+    agent_state="$(agent_state_of "$pane_id")"
+    if [ "$force" -ne 1 ] && [ "$agent_state" = "working" ]; then
+      die_json "agent_working" "apply agent for '$change' is still working; wait for it (boss wait $change) or use --force"
+    fi
   fi
 
   local finish_worktree_path finish_branch
@@ -735,11 +818,21 @@ cmd_park() {
   now="$(now_iso)"
   if [ -n "$state_file" ] && [ -f "$state_file" ]; then
     local park_pane park_agent_state
-    park_pane="$(jq -r '.pane_id // empty' "$state_file")"
-    if [ -n "$park_pane" ] && herdr agent get "$park_pane" >/dev/null 2>&1; then
-      park_agent_state="$(agent_state_of "$park_pane")"
+    if acp_is_acp "$state_file"; then
+      park_agent_state="$(jq -r '.acp.phase // "unknown"' "$state_file" 2>/dev/null || printf unknown)"
       if [ "$park_agent_state" = "working" ]; then
-        die_json "agent_working" "apply agent for '$change' is still working; wait for it (boss wait $change) before parking"
+        die_json "agent_working" "ACP apply for '$change' is still working; wait for it (boss wait $change) before parking"
+      fi
+      # Stop the supervisor first: a parked apply must not keep a session or a
+      # slot alive behind a closed tab.
+      acp_stop_supervisor "$state_file" finish
+    else
+      park_pane="$(jq -r '.pane_id // empty' "$state_file")"
+      if [ -n "$park_pane" ] && herdr agent get "$park_pane" >/dev/null 2>&1; then
+        park_agent_state="$(agent_state_of "$park_pane")"
+        if [ "$park_agent_state" = "working" ]; then
+          die_json "agent_working" "apply agent for '$change' is still working; wait for it (boss wait $change) before parking"
+        fi
       fi
     fi
     tab_id="$(jq -r '.tab_id // empty' "$state_file")"
@@ -755,7 +848,8 @@ cmd_park() {
     if lock_acquire "$park_lock"; then acquired=1; else log "warning: park: state lock busy; updating without it"; fi
     tmp="$(mktemp)"
     if jq --arg t "$now" --arg n "$note" \
-        '.parked = true | .parked_at = $t | .parked_note = (if $n == "" then null else $n end) | .waiter_pid = null' \
+        '.parked = true | .parked_at = $t | .parked_note = (if $n == "" then null else $n end) | .waiter_pid = null
+         | (if .transport == "acp" then .acp.supervisor_pid = null | .acp.phase = "closed" else . end)' \
         "$state_file" >"$tmp" 2>/dev/null; then
       mv "$tmp" "$state_file"
     else
@@ -848,6 +942,51 @@ cmd_resume() {
       || log "warning: could not write the resume journal entry"
   fi
 
+  if [ -n "$state_file" ] && acp_is_acp "$state_file"; then
+    local acp_pid acp_session acp_load
+    acp_pid="$(acp_supervisor_pid "$state_file")"
+    if acp_pid_alive "$acp_pid"; then
+      acp_update_state "$state_file" \
+        'del(.parked, .parked_at, .parked_note) | .acp.dead_reported = false'
+      printf '%s\n' "$(jq -n --arg change "$change" --arg project "$project" \
+        '{change: $change, project: $project, transport: "acp", status: "resumed", started: false}')"
+      return 0
+    fi
+    acp_session="$(jq -r '.acp.session_id // empty' "$state_file" 2>/dev/null || true)"
+    acp_load="$(jq -r '.acp.load_session // false' "$state_file" 2>/dev/null || printf false)"
+    if [ -z "$acp_session" ]; then
+      # The supervisor died before session/new: there is nothing to load, so
+      # resume is the same explicit fresh start as a resume without an apply.
+      local runner want_worktree=0
+      [ -n "$resume_worktree" ] && want_worktree=1
+      runner="$(resolve_runner "$state_runner")" || exit 1
+      dispatch_change "$change" "$project" "$runner" "$note" "$want_worktree"
+      return 0
+    fi
+    if [ "$acp_load" != "true" ]; then
+      die_json "unresumable" "the ACP agent does not support session/load, so '$change' cannot be resumed in place; use 'boss retrigger $change' for an explicit new session"
+    fi
+    # Resume in place: the supervisor calls session/load, replays the updates
+    # into the transcript and re-applies model and mode. It never silently
+    # starts a second session on the same worktree.
+    acp_update_state "$state_file" \
+      'del(.parked, .parked_at, .parked_note)
+       | .acp.resume = true | .acp.ready = false | .acp.error = null
+       | .acp.phase = "starting" | .acp.pending_permission = null
+       | .acp.dead_reported = false | .last_state = "starting"'
+    # Unlike a fresh dispatch, a failed resume must keep the state: it carries
+    # the session id and worktree the Explorer needs to inspect or retrigger.
+    start_acp_supervisor "$state_file" >/dev/null
+    acp_wait_ready "$state_file"
+    # shellcheck disable=SC2034  # read by die_json in boss-lib.sh
+    BOSS_FAILED_ACP_PID=""
+    printf '%s\n' "$(jq -n --arg change "$change" --arg project "$project" \
+      --arg session "$acp_session" \
+      '{change: $change, project: $project, transport: "acp", status: "resumed",
+        started: true, session_id: $session}')"
+    return 0
+  fi
+
   if [ -n "$pane_id" ] && herdr agent get "$pane_id" >/dev/null 2>&1; then
     local tmp
     tmp="$(mktemp)"
@@ -898,6 +1037,40 @@ cmd_interrupt() {
   pane_id="$(jq -r '.pane_id // empty' "$state_file")"
   runner_name="$(jq -r '.runner // empty' "$state_file")"
   kind="$(jq -r '.kind // empty' "$state_file")"
+
+  if acp_is_acp "$state_file"; then
+    local acp_socket acp_resp acp_ok acp_status acp_phase
+    acp_socket="$(jq -r '.acp.control_socket // empty' "$state_file" 2>/dev/null || true)"
+    if ! acp_supervisor_alive "$state_file"; then
+      acp_report_dead "$state_file"
+      die_json "acp_not_running" "the ACP supervisor for '$change' is not running; use 'boss status $change' and then 'boss retrigger $change'"
+    fi
+    acp_resp="$(acp_control_send "$acp_socket" '{"command":"cancel"}' \
+      "$(( BOSS_ACP_CANCEL_TIMEOUT_S + 5 ))" || true)"
+    acp_ok="$(printf '%s' "$acp_resp" | jq -r '.ok // false' 2>/dev/null || printf false)"
+    if [ "$acp_ok" != "true" ]; then
+      die_json "acp_control_failed" "cannot cancel the ACP turn: $(printf '%s' "$acp_resp" | jq -r '.error // "control_failed"' 2>/dev/null || printf control_failed)"
+    fi
+    acp_status="$(printf '%s' "$acp_resp" | jq -r '.status // "cancel_requested"' 2>/dev/null || printf cancel_requested)"
+    acp_phase="$(jq -r '.acp.phase // "unknown"' "$state_file" 2>/dev/null || printf unknown)"
+    acp_update_state "$state_file" '.interrupted = true
+      | .interrupted_at = (now | strftime("%Y-%m-%dT%H:%M:%S%z"))
+      | .interrupt_keys = [] | .acp.last_stop_reason = $s' --arg s "$acp_status"
+    append_event "$(events_file_for "$project" "$change")" interrupt \
+      "$(jq -nc --arg c "$change" --arg p "$project" --arg s "$acp_status" \
+        '{change: $c, project: $p, transport: "acp", status: $s}')" \
+      || log "warning: could not record interrupt event"
+    local ajfile
+    ajfile="$(journal_project_path "$project" 2>/dev/null || true)"
+    [ -n "$ajfile" ] && journal_append "$ajfile" "interrupted $change (ACP session/cancel: $acp_status)" "interrupt" \
+      || true
+    printf '%s\n' "$(jq -n --arg change "$change" --arg project "$project" \
+      --arg status "$acp_status" --arg phase "$acp_phase" \
+      '{change: $change, project: $project, transport: "acp",
+        status: $status, phase: $phase, cancelled: ($status == "cancelled")}')"
+    return 0
+  fi
+
   if [ -n "$runner_name" ]; then
     runner_json="$(resolve_runner "$runner_name")" || exit 1
   else
@@ -969,6 +1142,33 @@ cmd_answer() {
   project="$(jq -r '.project' "$state_file")"
   keys_json="$(printf '%s\n' "${keys[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
 
+  if acp_is_acp "$state_file"; then
+    local acp_socket option acp_resp acp_ok acp_error
+    acp_socket="$(jq -r '.acp.control_socket // empty' "$state_file" 2>/dev/null || true)"
+    option="${keys[0]}"
+    if [ "$(jq -r '.acp.pending_permission != null' "$state_file" 2>/dev/null || printf false)" != "true" ]; then
+      die_json "no_pending_permission" "the ACP apply for '$change' has no pending permission request; run 'boss status $change'"
+    fi
+    acp_resp="$(acp_control_send "$acp_socket" \
+      "$(jq -nc --arg o "$option" '{command: "answer", option: $o}')" 30 || true)"
+    acp_ok="$(printf '%s' "$acp_resp" | jq -r '.ok // false' 2>/dev/null || printf false)"
+    if [ "$acp_ok" != "true" ]; then
+      acp_error="$(printf '%s' "$acp_resp" | jq -r '.error // "control_failed"' 2>/dev/null || printf control_failed)"
+      local offered
+      offered="$(jq -r '[.acp.pending_permission.options[]?.optionId] | join(", ")' "$state_file" 2>/dev/null || true)"
+      [ -n "$offered" ] && acp_error="$acp_error; offered options: $offered"
+      die_json "answer_failed" "cannot answer the ACP permission request: $acp_error"
+    fi
+    append_event "$(events_file_for "$project" "$change")" answer \
+      "$(jq -nc --arg c "$change" --arg p "$project" --arg o "$option" \
+        '{change: $c, project: $p, transport: "acp", option: $o}')" \
+      || log "warning: could not record answer event"
+    printf '%s\n' "$(jq -n --arg change "$change" --arg agent "$agent" \
+      --arg option "$option" --arg status "answered" \
+      '{change: $change, agent: $agent, transport: "acp", option: $option, status: $status}')"
+    return 0
+  fi
+
   ensure_waiter "$state_file" >/dev/null
   if ! out="$(herdr agent send-keys "$pane_id" "${keys[@]}" 2>&1)"; then
     code="$(printf '%s' "$out" | jq -r '.error.code // "unknown"' 2>/dev/null || true)"
@@ -983,6 +1183,42 @@ cmd_answer() {
     --arg change "$change" --arg agent "$agent" --arg status "sent" \
     --argjson keys "$keys_json" \
     '{change: $change, agent: $agent, keys: $keys, status: $status}')"
+}
+
+# ----------------------------------------------------------------- acp-event ---
+
+# cmd_acp_event <state-file> <event> <state> <text> -- hidden command used by
+# the ACP supervisor. It appends the event and then uses the same durable
+# wake path (inbox, wake plan, retry, notification) as boss-waiter, so an ACP
+# turn end is indistinguishable from a native settle in the inbox and event
+# log. A parked apply stays quiet: the event is recorded, but nobody is woken.
+cmd_acp_event() {
+  local state_file="${1:-}" event="${2:-}" st="${3:-}" text="${4:-}"
+  [ -n "$state_file" ] && [ -f "$state_file" ] \
+    || die_json "acp_event" "usage: boss acp-event <state-file> <event> <state> <text>"
+  [ -n "$event" ] && [ -n "$st" ] || die_json "acp_event" "usage: boss acp-event <state-file> <event> <state> <text>"
+  local change project events_file parked=false wake=false
+  change="$(jq -r '.change // empty' "$state_file" 2>/dev/null || true)"
+  project="$(jq -r '.project // empty' "$state_file" 2>/dev/null || true)"
+  events_file="$(events_file_for "$project" "$change")"
+  append_event "$events_file" "$event" \
+    "$(jq -nc --arg c "$change" --arg p "$project" --arg s "$st" --arg t "$text" \
+      '{change: $c, project: $p, transport: "acp", state: $s, text: $t}')" \
+    || log "warning: could not record acp event $event"
+  if [ "$(jq -r '.parked // false' "$state_file" 2>/dev/null || printf false)" = "true" ] \
+     || mission_is_parked "$project" "$change"; then
+    parked=true
+  fi
+  if [ "$parked" = false ]; then
+    if boss_deliver "$state_file" "$text" "$st"; then
+      wake=true
+    fi
+  else
+    log "acp-event: $change is parked; recorded $event without a wake"
+  fi
+  printf '%s\n' "$(jq -n --arg change "$change" --arg event "$event" \
+    --arg state "$st" --argjson parked "$parked" --argjson wake "$wake" \
+    '{change: $change, event: $event, state: $state, parked: $parked, wake: $wake}')"
 }
 
 # ------------------------------------------------------------------ skills ---

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# boss-acp -- wrapper for the ACP supervisor of one boss apply.
+#
+# The supervisor is a Python module (runtime/lib/boss_acp.py in a checkout,
+# boss_acp.py next to this wrapper after installation). This wrapper only
+# locates it and execs python3, so the pid boss records is the interpreter.
+set -u
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
+LIB="$HERE/../lib/boss_acp.py"
+[ -f "$LIB" ] || LIB="$HERE/boss_acp.py"
+if [ ! -f "$LIB" ]; then
+  printf 'boss-acp: cannot find boss_acp.py next to %s\n' "$HERE" >&2
+  exit 2
+fi
+
+exec python3 "$LIB" "$@"

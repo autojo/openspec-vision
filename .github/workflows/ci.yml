@@ -27,6 +27,9 @@ jobs:
             bash -n "$f"
           done
 
+      - name: Python syntax
+        run: python3 -m py_compile runtime/lib/boss_acp.py
+
       - name: shellcheck
         run: shellcheck -S warning runtime/bin/* scripts/*.sh install.sh tests/run.sh
 

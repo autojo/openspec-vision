@@ -228,6 +228,29 @@ about unknown mission runners. `boss resume` keeps the runner recorded by the
 original dispatch; `boss retrigger` continues the same agent and apply command.
 
 Runner names must exist under `[runners]` in `~/.config/openspec-boss/boss.toml`.
+The fields of a runner entry:
+
+| Field | Meaning |
+| --- | --- |
+| `kind` | Herdr agent kind for the default `start = "herdr"` |
+| `start` | transport: `herdr` (default) or `acp` |
+| `command` | ACP only: the agent command; boss starts `<command> acp` |
+| `model` | ACP only: session model, applied before the first prompt |
+| `mode` | ACP only: session mode; default `smart_approve` |
+| `policy` | ACP only: `allow` (default) or `ask` for an unmatched permission |
+| `deny` | command/path/title globs an apply never needs (default: force-push, mirror-push, `git push --delete`, `git filter-branch`, `git filter-repo`) |
+| `apply` | native: the prompt template with `{change}`; ACP: optional extra instructions (a slash-command template is ignored) |
+| `args`, `env` | native: extra agent start arguments and environment entries |
+| `commit` | `explorer` (default) or `agent` |
+| `interrupt_keys` | native: keys for `boss interrupt` |
+| `ready`, `ready_regex`, `ready_timeout_ms` | native: readiness marker and timeout |
+| `dialog_match`, `dialog_keys` | native: a first-run dialog to answer |
+| `yield` | custom turn-end instruction (an empty string disables it) |
+
+An unknown `start` value is rejected with `invalid_runner_start`; an ACP
+runner without `command` is rejected with `acp_command_missing`. Both fail
+before a tab, worktree or state file is created.
+
 The assignment rule used by the vision skill:
 
 | Change content | Runner |
@@ -603,6 +626,65 @@ private server per apply instead, add `--standalone` to that runner's explicit
 `args`; this is an explicit isolation option, not a default, because it starts
 and manages a separate server process.
 
+## ACP runner (Goose and other ACP agents)
+
+Goose is not a Herdr-native agent kind, but it exposes an ACP server
+(`goose acp`). A runner with `start = "acp"` is driven by the bundled
+`boss-acp` supervisor over stdio: session lifecycle, model and mode selection,
+permissions, cancellation, resume and a JSONL transcript. The apply tab still
+exists for a human view, but it only tails the transcript and hosts no agent;
+no behavior reads the pane.
+
+```toml
+[runners.goose]
+start = "acp"
+command = "goose"
+model = "claude-sonnet"        # optional; must be offered by the agent
+mode = "smart_approve"         # default; auto, approve, smart_approve, chat
+policy = "allow"               # allow (default) or ask for unmatched requests
+deny = ["git push --force*"]   # optional; defaults to the boss deny list
+apply = "Follow the returned tasks."  # optional extra instructions
+```
+
+`boss dispatch <change> --runner goose ...` starts the supervisor detached. It
+sends the apply prompt over ACP; the prompt runs
+`openspec instructions apply --change <change> --json` and never depends on a
+slash command. `session/update` notifications are appended to a JSONL
+transcript and shown in the apply tab. `boss status` reads the state file and
+the transcript tail (last update, model, mode, usage, pending permission), not
+the pane.
+
+Permissions are a policy, not a prompt: a command matching `deny` is rejected
+before it runs, a read-only tool or an allowed request proceeds, and with
+`policy = "ask"` an unmatched request stays pending. The apply then reports
+`blocked` and names the pending tool call and its offered options:
+
+```bash
+boss status <change>                # blocked; shows the request and options
+boss answer <change> allow_once     # select one offered option
+boss interrupt <change>             # answer it as cancelled, then session/cancel
+```
+
+`boss interrupt` sends `session/cancel` and never keystrokes; it records the
+`cancelled` stop reason. If the agent does not confirm within
+`BOSS_ACP_CANCEL_TIMEOUT_S`, the state records `cancel_unconfirmed` and the boss
+is woken. `boss finish` closes the session (`session/close`) and stops the
+supervisor.
+
+The supervisor persists the session id, model, mode and last stop reason.
+After a crash, `boss resume` calls `session/load` when the agent advertises it,
+replays the updates into the transcript (duplicates are skipped by message and
+tool-call id) and re-applies model and mode. Without `loadSession` the apply is
+reported as `unresumable` and `boss retrigger` starts an explicit new session
+instead of silently editing the same worktree twice. A dead supervisor frees
+its concurrency slot and wakes the boss; the declared resource locks remain
+until the apply is finished.
+
+`boss doctor` validates every configured ACP runner: the command is on `PATH`,
+the handshake succeeds (`initialize` + `session/new`), and the configured model
+and mode are offered (a mismatch names the available values). An ACP runner is
+skipped by the Herdr integration and `kind` checks.
+
 ## Trust model and limits
 
 The apply agents are the only place where the runtime deliberately hands over
@@ -652,6 +734,8 @@ pass on such a station).
 | `runtime/bin/boss-doctor.sh` | `doctor` |
 | `runtime/bin/boss-mission.sh` | missions and `reconcile` |
 | `runtime/bin/boss-waiter` | detached watcher for one apply |
+| `runtime/bin/boss-acp` | wrapper that starts the ACP supervisor |
+| `runtime/lib/boss_acp.py` | ACP session, permission, transcript and control supervisor |
 | `scripts/gen-commands.sh` | generates the 34 command wrappers from `commands/commands.tsv` |
 | `scripts/runtime-manifest.sh` | records/verifies the vendored runtime hashes |
 | `scripts/check-generated.sh` | fails when the OpenSpec instruction files are stale |

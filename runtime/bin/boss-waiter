@@ -221,73 +221,12 @@ wait_for() {
   done
 }
 
-# deliver <text> <state> -- record the wake durably, then prompt the
-# responsible boss agent. The candidate list (dispatcher, workspace, global) is
-# tried in order: an 'agent_not_found' moves on to the next candidate, while a
-# blocked or transient failure retries the same candidate with growing backoff
-# until the overall budget is spent. Only when no candidate could be reached is
-# a Herdr notification shown.
+# deliver <text> <state> -- record the wake durably and prompt the responsible
+# boss agent. The implementation is shared with the ACP supervisor's
+# acp-event command (boss_deliver in boss-lib.sh), so both transports write
+# the same inbox items, wake events, retries and fallback notification.
 deliver() {
-  local text="$1" st="$2"
-  local candidates candidate attempt backoff start now out rc code prompt_text plan
-  # Durability first: an inbox item survives a lost prompt and is recovered
-  # when the boss drains the inbox on a later wake. Best effort, never fatal.
-  inbox_write "$state_file" "$st" >/dev/null 2>&1 \
-    || log "warning: could not write an inbox item for $change"
-  # Tell the boss to drain the inbox on every wake.
-  printf -v prompt_text '%s\nPending wakeups: run '\''boss inbox'\''.' "$text"
-  plan="$(boss_wake_plan "$state_file")"
-  candidates="$(printf '%s' "$plan" | jq -r '.candidates[].target' 2>/dev/null || true)"
-  if [ -z "$candidates" ]; then
-    log "no safe boss agent reachable (dispatcher/workspace/global); showing a notification instead"
-    boss_record_wake_failed_event "$events_file" "$change" "$project" "$st" "no_candidate" "$plan" \
-      || log "warning: could not record the failed wake"
-    herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st" >/dev/null 2>&1 || true
-    return 1
-  fi
-  start="$(date +%s)"
-  while IFS= read -r candidate; do
-    [ -n "$candidate" ] || continue
-    attempt=1
-    backoff=15
-    while true; do
-      # Verify the submission took effect: herdr observes a working/blocked
-      # state and reports agent_prompt_stalled when the input did not lead to
-      # it. A boss that is already working matches immediately (the prompt is
-      # queued), so a retry only happens when the prompt visibly did nothing.
-      out="$(herdr agent prompt "$candidate" "$prompt_text" --wait --until working --until blocked --timeout "$BOSS_AGENT_PROMPT_TIMEOUT_MS" 2>&1)"
-      rc=$?
-      if [ "$rc" -eq 0 ]; then
-        log "prompt delivered to agent '$candidate' (state=$st, attempt=$attempt)"
-        boss_record_wake_event "$events_file" "$change" "$project" "$candidate" "$st" \
-          || log "warning: could not record the wake"
-        return 0
-      fi
-      code="$(printf '%s' "$out" | jq -r '.error.code // "unknown"' 2>/dev/null || true)"
-      if [ "$code" = "agent_not_found" ]; then
-        log "candidate '$candidate' not found; trying the next candidate"
-        break
-      fi
-      now="$(date +%s)"
-      if [ $(( now - start + backoff )) -gt "$BOSS_WAITER_MAX_S" ]; then
-        log "delivery retry budget exceeded (${BOSS_WAITER_MAX_S}s); giving up"
-        boss_record_wake_failed_event "$events_file" "$change" "$project" "$st" \
-          "delivery_failed:$code" "$plan" \
-          || log "warning: could not record the failed wake"
-        herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st (delivery failed)" >/dev/null 2>&1 || true
-        return 1
-      fi
-      log "delivery to '$candidate' failed ($code); retrying in ${backoff}s"
-      sleep "$backoff"
-      attempt=$((attempt + 1))
-      backoff=$((backoff * 2))
-    done
-  done <<<"$candidates"
-  log "no boss candidate reachable (dispatcher/workspace/global); showing a notification instead"
-  boss_record_wake_failed_event "$events_file" "$change" "$project" "$st" "not_delivered" "$plan" \
-    || log "warning: could not record the failed wake"
-  herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st" >/dev/null 2>&1 || true
-  return 1
+  boss_deliver "$state_file" "$1" "$2"
 }
 
 # settle_gate -- the first settle is only trusted once the apply showed activity

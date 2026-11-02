@@ -14,6 +14,7 @@ set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 BIN="$ROOT/runtime/bin"
+LIB="$ROOT/runtime/lib"
 MANIFEST="$ROOT/runtime/MANIFEST.sha256"
 mode="${1:-verify}"
 
@@ -33,14 +34,21 @@ sha256_file() {
   fi
 }
 
-# entries -- "hash  runtime/bin/<name>" for every runtime file, stable order.
+# entries -- "hash  <relative path>" for every runtime file, stable order.
 entries() {
   local file name
-  for file in "$BIN"/boss "$BIN"/boss-lib.sh "$BIN"/boss-waiter "$BIN"/boss-*.sh; do
-    [ -f "$file" ] || continue
-    name="$(basename "$file")"
-    printf '%s  runtime/bin/%s\n' "$(sha256_file "$file")" "$name"
-  done | sort -k2 -u
+  {
+    for file in "$BIN"/boss "$BIN"/boss-waiter "$BIN"/boss-acp "$BIN"/boss-*.sh; do
+      [ -f "$file" ] || continue
+      name="$(basename "$file")"
+      printf '%s  runtime/bin/%s\n' "$(sha256_file "$file")" "$name"
+    done
+    for file in "$LIB"/*.py; do
+      [ -f "$file" ] || continue
+      name="$(basename "$file")"
+      printf '%s  runtime/lib/%s\n' "$(sha256_file "$file")" "$name"
+    done
+  } | sort -k2 -u
 }
 
 case "$mode" in
