@@ -49,7 +49,7 @@ status_one() {
   local change="$1" project_name="$2" json_only="$3"
   local state_file project agent pane_id tab_id workspace_id last_state last_state_at waiter_pid waiter_alive_flag
   local opencode_version permission_mode waiter_state
-  local transport acp_json acp_phase pending_permission last_stop_reason acp_usage acp_transcript acp_last_update
+  local transport acp_json acp_phase pending_permission pending_permissions last_stop_reason acp_usage acp_transcript acp_last_update
   local worktree branch worktree_workspace merge_state merged merge_test kept review_root touches declared
   state_file="$(find_state_file "$change" "$project_name")" || exit 1
   project="$(jq -r '.project' "$state_file")"
@@ -57,6 +57,7 @@ status_one() {
   acp_json="$(jq -c '.acp // null' "$state_file" 2>/dev/null || printf null)"
   acp_phase="$(jq -r '.acp.phase // "unknown"' "$state_file" 2>/dev/null || printf unknown)"
   pending_permission="$(jq -c '.acp.pending_permission // null' "$state_file" 2>/dev/null || printf null)"
+  pending_permissions="$(jq -c '.acp.pending_permissions // (if .acp.pending_permission != null then [.acp.pending_permission] else [] end)' "$state_file" 2>/dev/null || printf '[]')"
   last_stop_reason="$(jq -r '.acp.last_stop_reason // empty' "$state_file" 2>/dev/null || true)"
   acp_usage="$(jq -c '.acp.usage // null' "$state_file" 2>/dev/null || printf null)"
   acp_transcript="$(jq -r '.acp.transcript // empty' "$state_file" 2>/dev/null || true)"
@@ -156,12 +157,13 @@ status_one() {
   local dialog=""
   if [ "$agent_state" = "blocked" ]; then
     if [ "$transport" = "acp" ]; then
-      dialog="$(printf '%s' "$pending_permission" | jq -r '
-        if . == null then "pending permission"
-        else (.title // "permission request")
+      dialog="$(printf '%s' "$pending_permissions" | jq -r '
+        if length == 0 then "pending permission"
+        else .[] |
+          ((.tool_call_id // "?") + ": " + (.title // "permission request")
           + (if (.raw_input.command // .raw_input.path // "") != "" then
                " -- " + (.raw_input.command // .raw_input.path) else "" end)
-          + " (options: " + ([.options[]?.optionId] | join(", ")) + ")"
+          + " (options: " + ([.options[]?.optionId] | join(", ")) + ")")
         end' 2>/dev/null || printf 'pending permission')"
     else
       dialog="$(herdr agent read "$pane_id" --source visible 2>/dev/null || true)"
@@ -221,12 +223,12 @@ status_one() {
     --argjson external_tasks "$mission_external" \
     --arg opencode_version "$opencode_version" --arg permission_mode "$permission_mode" \
     --arg transport "$transport" --argjson acp "$acp_json" --arg acp_phase "$acp_phase" \
-    --argjson pending_permission "$pending_permission" --arg last_stop_reason "$last_stop_reason" \
+    --argjson pending_permission "$pending_permission" --argjson pending_permissions "$pending_permissions" --arg last_stop_reason "$last_stop_reason" \
     --argjson acp_usage "$acp_usage" --arg acp_transcript "$acp_transcript" --arg acp_last_update "$acp_last_update" \
     --arg worktree "$worktree" --arg branch "$branch" --arg worktree_workspace "$worktree_workspace" \
     --arg merge_state "$merge_state" --argjson merged "$merged" --arg merge_test "$merge_test" \
     --argjson kept "$kept" --argjson touches "$touches" --argjson declared "$declared" \
-    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, transport: $transport, acp: (if $transport == "acp" then $acp else null end), acp_phase: (if $transport == "acp" then $acp_phase else null end), pending_permission: (if $transport == "acp" then $pending_permission else null end), last_stop_reason: (if $last_stop_reason == "" then null else $last_stop_reason end), acp_usage: (if $transport == "acp" then $acp_usage else null end), acp_transcript: (if $acp_transcript == "" then null else $acp_transcript end), acp_last_update: (if $acp_last_update == "" then null else $acp_last_update end), worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), merge_state: $merge_state, merged: $merged, merge_test: $merge_test, kept: $kept, touches: $touches, declared: $declared, pane: $pane, herdr_agent: $herdr_agent, waiter_pid: (if $waiter_pid == "" then null else ($waiter_pid | tonumber? // $waiter_pid) end), waiter_alive: $waiter_alive, waiter: $waiter, inbox_pending: $inbox_pending, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, state: $state, human_tasks: $human_tasks, external_tasks: $external_tasks, opencode_version: (if $opencode_version == "" then null else ($opencode_version | tonumber? // null) end), permission_mode: (if $permission_mode == "" then null else $permission_mode end), lessons: {global: $lessons_global, project: $lessons_project}, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end), boss: (if $boss == "" then null else $boss end), boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok, wake_plan: $wake_plan, wake_target: $wake_target, last_wake: $last_wake}')"
+    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, transport: $transport, acp: (if $transport == "acp" then $acp else null end), acp_phase: (if $transport == "acp" then $acp_phase else null end), pending_permission: (if $transport == "acp" then $pending_permission else null end), pending_permissions: (if $transport == "acp" then $pending_permissions else [] end), last_stop_reason: (if $last_stop_reason == "" then null else $last_stop_reason end), acp_usage: (if $transport == "acp" then $acp_usage else null end), acp_transcript: (if $acp_transcript == "" then null else $acp_transcript end), acp_last_update: (if $acp_last_update == "" then null else $acp_last_update end), worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), merge_state: $merge_state, merged: $merged, merge_test: $merge_test, kept: $kept, touches: $touches, declared: $declared, pane: $pane, herdr_agent: $herdr_agent, waiter_pid: (if $waiter_pid == "" then null else ($waiter_pid | tonumber? // $waiter_pid) end), waiter_alive: $waiter_alive, waiter: $waiter, inbox_pending: $inbox_pending, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, state: $state, human_tasks: $human_tasks, external_tasks: $external_tasks, opencode_version: (if $opencode_version == "" then null else ($opencode_version | tonumber? // null) end), permission_mode: (if $permission_mode == "" then null else $permission_mode end), lessons: {global: $lessons_global, project: $lessons_project}, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end), boss: (if $boss == "" then null else $boss end), boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok, wake_plan: $wake_plan, wake_target: $wake_target, last_wake: $last_wake}')"
 
   if [ "$json_only" -eq 1 ]; then
     printf '%s\n' "$json"
@@ -258,7 +260,12 @@ status_one() {
       "$(jq -r '.acp.mode // "-"' "$state_file")"
     printf 'acp phase: %s\n' "$acp_phase"
     if [ "$pending_permission" != "null" ]; then
-      printf 'pending permission: %s\n' "$dialog"
+      if [ "$(printf '%s' "$pending_permissions" | jq 'length')" -gt 1 ]; then
+        printf 'pending permissions:\n'
+        printf '%s' "$pending_permissions" | jq -r '.[] | "- \(.tool_call_id // "?") -- \(.title // "permission request")\(if (.raw_input.command // .raw_input.path // "") != "" then " -- " + (.raw_input.command // .raw_input.path) else "" end) (options: \([.options[]?.optionId] | join(", ")))"'
+      else
+        printf 'pending permission: %s\n' "$dialog"
+      fi
     fi
     if [ -n "$last_stop_reason" ]; then
       printf 'last stop: %s' "$last_stop_reason"

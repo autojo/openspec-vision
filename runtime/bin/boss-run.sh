@@ -646,6 +646,7 @@ finish_worktree() {
   git -C "$project" branch -D "$branch" >/dev/null 2>&1 || true
   rm -rf "$worktree" 2>/dev/null || true
   rmdir "$(dirname "$worktree")" 2>/dev/null || true
+  acp_remove_profile "$state_file"
   rm -f "$state_file"
   inbox_remove "$project" "$change"
 
@@ -805,6 +806,7 @@ cmd_finish() {
     || log "warning: could not record cycle event"
 
   rm -f "$state_file"
+  acp_remove_profile "$state_file"
   # The apply is gone: drop its pending wake items with it.
   inbox_remove "$project" "$change"
 
@@ -1043,6 +1045,7 @@ cmd_resume() {
       'del(.parked, .parked_at, .parked_note)
        | .acp.resume = true | .acp.ready = false | .acp.error = null
        | .acp.phase = "starting" | .acp.pending_permission = null
+       | .acp.pending_permissions = []
        | .acp.dead_reported = false | .last_state = "starting"'
     # Unlike a fresh dispatch, a failed resume must keep the state: it carries
     # the session id and worktree the Explorer needs to inspect or retrigger.
@@ -1187,20 +1190,25 @@ cmd_interrupt() {
 # ------------------------------------------------------------------ answer ---
 
 cmd_answer() {
-  local change="" project_name="" as_target="" arg
+  local change="" project_name="" as_target="" arg tool_call=""
   local -a keys=()
   while [ $# -gt 0 ]; do
     arg="$1"; shift
     case "$arg" in
       --project) project_name="${1:-}"; shift ;;
       --as) as_target="${1:-}"; shift ;;
+      --tool-call) tool_call="${1:-}"; shift ;;
       -h|--help) usage ;;
       --*) usage_error "unknown option: $arg" ;;
       *) if [ -z "$change" ]; then change="$arg"; else keys+=("$arg"); fi ;;
     esac
   done
-  [ -n "$change" ] || usage_error "usage: boss answer <change> <key>... [--project <name|path>] [--as <pane|agent>]"
-  [ "${#keys[@]}" -gt 0 ] || usage_error "usage: boss answer <change> <key>... [--project <name|path>] [--as <pane|agent>]"
+  [ -n "$change" ] || usage_error "usage: boss answer <change> <key>... [--tool-call <id>] [--project <name|path>] [--as <pane|agent>]"
+  [ "${#keys[@]}" -gt 0 ] || usage_error "usage: boss answer <change> <key>... [--tool-call <id>] [--project <name|path>] [--as <pane|agent>]"
+  # The tool-call id may also be given as the second positional argument.
+  if [ -z "$tool_call" ] && [ "${#keys[@]}" -ge 2 ]; then
+    tool_call="${keys[1]}"
+  fi
   boss_use_caller "$as_target"
   ensure_boss_claim answer
   ensure_config
@@ -1213,29 +1221,46 @@ cmd_answer() {
   keys_json="$(printf '%s\n' "${keys[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
 
   if acp_is_acp "$state_file"; then
-    local acp_socket option acp_resp acp_ok acp_error
+    local acp_socket option acp_resp acp_ok acp_error pending_json pending_count
+    local -a pending_ids=()
     acp_socket="$(jq -r '.acp.control_socket // empty' "$state_file" 2>/dev/null || true)"
     option="${keys[0]}"
-    if [ "$(jq -r '.acp.pending_permission != null' "$state_file" 2>/dev/null || printf false)" != "true" ]; then
+    pending_json="$(jq -c '.acp.pending_permissions // (if .acp.pending_permission != null then [.acp.pending_permission] else [] end)' "$state_file" 2>/dev/null || printf '[]')"
+    pending_count="$(printf '%s' "$pending_json" | jq 'length' 2>/dev/null || printf 0)"
+    if [ "$pending_count" -eq 0 ]; then
       die_json "no_pending_permission" "the ACP apply for '$change' has no pending permission request; run 'boss status $change'"
     fi
+    while IFS= read -r id; do
+      [ -n "$id" ] && pending_ids+=("$id")
+    done < <(printf '%s' "$pending_json" | jq -r '.[].tool_call_id // empty' 2>/dev/null || true)
     acp_resp="$(acp_control_send "$acp_socket" \
-      "$(jq -nc --arg o "$option" '{command: "answer", option: $o}')" 30 || true)"
+      "$(jq -nc --arg o "$option" --arg t "$tool_call" \
+        '{command: "answer", option: $o} + (if $t == "" then {} else {tool_call_id: $t} end)')" 30 || true)"
     acp_ok="$(printf '%s' "$acp_resp" | jq -r '.ok // false' 2>/dev/null || printf false)"
     if [ "$acp_ok" != "true" ]; then
       acp_error="$(printf '%s' "$acp_resp" | jq -r '.error // "control_failed"' 2>/dev/null || printf control_failed)"
       local offered
-      offered="$(jq -r '[.acp.pending_permission.options[]?.optionId] | join(", ")' "$state_file" 2>/dev/null || true)"
+      offered="$(jq -r '[.acp.pending_permissions[]?.options[]?.optionId] | unique | join(", ")' "$state_file" 2>/dev/null || true)"
       [ -n "$offered" ] && acp_error="$acp_error; offered options: $offered"
+      if [ "${#pending_ids[@]}" -gt 0 ]; then
+        acp_error="$acp_error; pending tool calls: $(printf '%s, ' "${pending_ids[@]}" | sed 's/, $//')"
+        acp_error="$acp_error; pass --tool-call <id>"
+      fi
       die_json "answer_failed" "cannot answer the ACP permission request: $acp_error"
     fi
+    local answered_id answered_grant
+    answered_id="$(printf '%s' "$acp_resp" | jq -r '.tool_call_id // empty' 2>/dev/null || true)"
+    answered_grant="$(printf '%s' "$acp_resp" | jq -r '.grant // false' 2>/dev/null || printf false)"
     append_event "$(events_file_for "$project" "$change")" answer \
-      "$(jq -nc --arg c "$change" --arg p "$project" --arg o "$option" \
-        '{change: $c, project: $p, transport: "acp", option: $o}')" \
+      "$(jq -nc --arg c "$change" --arg p "$project" --arg o "$option" --arg t "$answered_id" \
+        '{change: $c, project: $p, transport: "acp", option: $o}
+         + (if $t == "" then {} else {tool_call_id: $t} end)')" \
       || log "warning: could not record answer event"
     printf '%s\n' "$(jq -n --arg change "$change" --arg agent "$agent" \
-      --arg option "$option" --arg status "answered" \
-      '{change: $change, agent: $agent, transport: "acp", option: $option, status: $status}')"
+      --arg option "$option" --arg status "answered" --arg tool_call_id "$answered_id" \
+      --argjson grant "$answered_grant" \
+      '{change: $change, agent: $agent, transport: "acp", option: $option, status: $status, grant: $grant}
+       + (if $tool_call_id == "" then {} else {tool_call_id: $tool_call_id} end)')"
     return 0
   fi
 

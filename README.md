@@ -238,6 +238,7 @@ The fields of a runner entry:
 | `model` | ACP only: session model, applied before the first prompt |
 | `mode` | ACP only: session mode; default `smart_approve` |
 | `policy` | ACP only: `allow` (default) or `ask` for an unmatched permission |
+| `isolate` | ACP only: `true` (default) runs the agent with a per-apply profile; `false` uses the user's global agent profile |
 | `deny` | command/path/title globs an apply never needs (default: force-push, mirror-push, `git push --delete`, `git filter-branch`, `git filter-repo`) |
 | `apply` | native: the prompt template with `{change}`; ACP: optional extra instructions (a slash-command template is ignored) |
 | `args`, `env` | native: extra agent start arguments and environment entries |
@@ -710,20 +711,71 @@ the pane.
 
 Permissions are a policy, not a prompt: a command matching `deny` is rejected
 before it runs, a read-only tool or an allowed request proceeds, and with
-`policy = "ask"` an unmatched request stays pending. The apply then reports
-`blocked` and names the pending tool call and its offered options:
+`policy = "ask"` an unmatched request stays pending. Every pending request is
+queued independently by tool-call id, so concurrent requests are reported
+together and answering one never discards another. The apply reports `blocked`
+and `boss status` lists every pending tool call with its id, command and
+offered options:
 
 ```bash
-boss status <change>                # blocked; shows the request and options
-boss answer <change> allow_once     # select one offered option
-boss interrupt <change>             # answer it as cancelled, then session/cancel
+boss status <change>                                # all pending requests
+boss answer <change> allow_once --tool-call <id>    # answer one request
+boss answer <change> allow_once <id>                # same, positional form
+boss interrupt <change>                             # cancel every pending request
 ```
 
+With exactly one pending request the option alone is still enough; with more,
+an answer without a tool-call id is refused with `ambiguous_pending` and names
+the ids.
+
+An automatic allow always selects the agent's `allow_once` option and never
+`allow_always`, so it cannot create a persistent agent-level grant. If the agent
+offers no allow-once option, the request stays pending (fail closed) and the
+supervisor logs why. An Explorer `allow_always` answer is recorded as an
+apply-scoped grant in `acp.apply_allows`, sent to the agent as `allow_once`, and
+kept for the rest of the apply; every matching request is auto-allowed. Nothing
+is written to the agent's global permission store.
+
 `boss interrupt` sends `session/cancel` and never keystrokes; it records the
-`cancelled` stop reason. If the agent does not confirm within
-`BOSS_ACP_CANCEL_TIMEOUT_S`, the state records `cancel_unconfirmed` and the boss
-is woken. `boss finish` closes the session (`session/close`) and stops the
-supervisor.
+`cancelled` stop reason and cancels every queued request first. If the agent does
+not confirm within `BOSS_ACP_CANCEL_TIMEOUT_S`, the state records
+`cancel_unconfirmed` and the boss is woken. `boss finish` closes the session
+(`session/close`), stops the supervisor and removes the per-apply profile.
+
+### Isolated agent state
+
+By default the ACP child runs with a per-apply profile below
+`$BOSS_STATE_DIR/acp/profile-<hash>/`:
+
+```text
+config/goose/   config.yaml, secrets.yaml and provider state linked from the
+                user's profile; permission.yaml generated and boss-owned
+data/goose/     private sessions/, apps and model catalog linked read-through
+```
+
+`XDG_CONFIG_HOME` and `XDG_DATA_HOME` point at that root. The generated
+`permission.yaml` has empty `always_allow`/`never_allow` lists in both the
+`user` and `smart_approve` sections and lists `shell`, `write`, `edit`,
+`read_image` and the extension manager under both `ask_before` lists, so Goose
+asks and the supervisor sees every request. A supervisor restart reuses the
+same profile; `boss finish` removes it together with the apply state.
+`isolate = false` is the escape hatch and uses the user's global profile.
+
+### Doctor and the effective policy
+
+`boss doctor` validates every configured ACP runner: the command is on `PATH`,
+the handshake succeeds (`initialize` + `session/new`), and the configured model
+and mode are offered (a mismatch names the available values). It also reports
+the isolation state and the effective permission store. An ACP runner is skipped
+by the Herdr integration and `kind` checks.
+
+A runner is reported as `enforced` when its profile is isolated, or when a
+non-isolated runner's global permission store has no `always_allow` entry for
+`shell`, `write` or `edit`. If such an entry exists, the doctor reports
+`weakened`, names the entry and points at the per-apply profile; it reads the
+store read-only and never edits it. Doctor probes run with a temporary profile
+and delete it afterwards, so a probe leaves no session or permission entry
+behind.
 
 The supervisor persists the session id, model, mode and last stop reason.
 After a crash, `boss resume` calls `session/load` when the agent advertises it,
@@ -733,11 +785,6 @@ reported as `unresumable` and `boss retrigger` starts an explicit new session
 instead of silently editing the same worktree twice. A dead supervisor frees
 its concurrency slot and wakes the boss; the declared resource locks remain
 until the apply is finished.
-
-`boss doctor` validates every configured ACP runner: the command is on `PATH`,
-the handshake succeeds (`initialize` + `session/new`), and the configured model
-and mode are offered (a mismatch names the available values). An ACP runner is
-skipped by the Herdr integration and `kind` checks.
 
 ## Trust model and limits
 

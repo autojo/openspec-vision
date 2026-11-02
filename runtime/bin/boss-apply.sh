@@ -1051,6 +1051,7 @@ dispatch_change() {
 
   local acp_prompt="" acp_command="" acp_model="" acp_mode="" acp_policy="" acp_transcript=""
   local acp_socket="" acp_deny="[]" acp_events="" acp_boss_bin="" acp_heartbeat=""
+  local acp_isolate="false" acp_profile=""
   if [ "$start" = "acp" ]; then
     acp_prompt="$(compose_acp_apply_prompt "$apply_root" "$change" "$note" "$lessons_block" \
       "$external_block" "$commit_block" "$runner_yield" "$apply_cmd")"
@@ -1058,12 +1059,16 @@ dispatch_change() {
     acp_model="$(printf '%s' "$runner" | jq -r '.model // empty')"
     acp_mode="$(printf '%s' "$runner" | jq -r '.mode // "smart_approve"')"
     acp_policy="$(printf '%s' "$runner" | jq -r '.policy // "allow"')"
+    acp_isolate="$(printf '%s' "$runner" | jq -r 'if has("isolate") then (.isolate != false) else true end')"
     acp_transcript="$(acp_transcript_for "$state_file")"
     acp_socket="$(acp_socket_for "$state_file")"
     acp_heartbeat="$(acp_heartbeat_for "$state_file")"
     acp_deny="$(policy_denies "$runner" | jq -Rsc 'split("\n") | map(select(length > 0))')"
     acp_events="$(events_file_for "$project" "$change")"
     acp_boss_bin="${BIN_DIR:-$(dirname "$(resolve_path "${BASH_SOURCE[0]}")")}/boss"
+    if [ "$acp_isolate" = "true" ]; then
+      acp_profile="$(acp_profile_dir_for "$state_file")"
+    fi
     mkdir -p "$(dirname "$acp_transcript")" "$(dirname "$acp_socket")" 2>/dev/null || true
   fi
 
@@ -1110,6 +1115,7 @@ dispatch_change() {
     --arg acp_mode "$acp_mode" --arg acp_policy "$acp_policy" --arg acp_transcript "$acp_transcript" \
     --arg acp_socket "$acp_socket" --arg acp_events "$acp_events" --arg acp_boss_bin "$acp_boss_bin" \
     --arg acp_heartbeat "$acp_heartbeat" --arg acp_root "$apply_root" --argjson acp_deny "${acp_deny:-[]}" \
+    --arg acp_isolate "$acp_isolate" --arg acp_profile "$acp_profile" \
     --argjson mode "$mode_json" \
     '{change: $change, project: $project, runner: $runner, kind: $kind, transport: $start, apply_cmd: $apply_cmd, note: $note, lessons: $lessons, external_block: $external_block, commit_block: $commit_block, commit_policy: $commit_policy, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), touches: $touches, declared: $declared, merge_state: "none", merged: false, merge_test: "not_run", kept: false, boss: $boss, boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_workspace: (if $boss_workspace == "" then null else $boss_workspace end), boss_cwd: (if $boss_cwd == "" then null else $boss_cwd end), boss_cross_workspace: $boss_cross, boss_cross_project: $boss_cross_project, base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at, opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode,
      acp: (if $start == "acp" then {
@@ -1119,8 +1125,11 @@ dispatch_change() {
        session_id: null, supervisor_pid: null, control_socket: $acp_socket,
        transcript: $acp_transcript, events_file: $acp_events,
        boss_bin: $acp_boss_bin, heartbeat_file: $acp_heartbeat,
+       isolated: ($acp_isolate == "true"),
+       profile_root: (if $acp_profile == "" then null else $acp_profile end),
        ready: false, phase: "starting", last_stop_reason: null,
-       pending_permission: null, usage: null, last_update: null,
+       pending_permission: null, pending_permissions: [], apply_allows: [],
+       usage: null, last_update: null,
        error: null, dead_reported: false, load_session: null, resume: false
      } else null end)}' \
     >"$state_file" || die_json "state_write" "cannot write state file $state_file"

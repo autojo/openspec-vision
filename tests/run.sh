@@ -362,20 +362,35 @@ def emit_updates():
     note("usage_update", {"usage": {"inputTokens": 3, "outputTokens": 5}})
 
 
-def ask_permission(command, title):
-    out({"jsonrpc": "2.0", "id": 9000, "method": "session/request_permission",
+def ask_permission(command, title, tool_id="tc1", req_id=9000, options=None):
+    if options is None:
+        options = [
+            {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+            {"optionId": "allow_always", "name": "Always allow", "kind": "allow_always"},
+            {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
+        ]
+    out({"jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
          "params": {"sessionId": SESSION,
-                    "toolCall": {"toolCallId": "tc1", "title": title, "kind": "other",
+                    "toolCall": {"toolCallId": tool_id, "title": title, "kind": "other",
                                  "rawInput": {"command": command}},
-                    "options": [
-                        {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
-                        {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
-                    ]}})
+                    "options": options}})
+
+
+def log_option(req_id, msg):
+    path = os.environ.get("FAKE_ACP_OPTION_LOG")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"id": req_id, "response": msg}) + "\n")
+    except OSError:
+        pass
 
 
 def main():
     prompt = None
     prompt_kind = None
+    pending = set()
     for line in sys.stdin:
         if not line.strip():
             continue
@@ -388,22 +403,25 @@ def main():
         params = msg.get("params") or {}
 
         if req_id is not None and ("result" in msg or "error" in msg):
-            if req_id != 9000 or prompt is None:
+            log_option(req_id, msg)
+            if req_id not in pending or prompt is None:
                 continue
+            pending.discard(req_id)
             kind = prompt_kind
-            prompt_kind = None
             if kind == "deny":
                 note("agent_message_chunk", {"messageId": "m2",
                                               "content": {"type": "text", "text": "denied"}})
                 result(prompt, {"stopReason": "end_turn", "usage": {"inputTokens": 1}})
                 prompt = None
+                prompt_kind = None
             elif kind == "cancel_tool":
                 note("tool_call_update", {"toolCallId": "tc1", "status": "in_progress"})
-            else:
+            elif not pending:
                 note("agent_message_chunk", {"messageId": "m3",
                                               "content": {"type": "text", "text": "answered"}})
                 result(prompt, {"stopReason": "end_turn", "usage": {"inputTokens": 2}})
                 prompt = None
+                prompt_kind = None
             continue
 
         if method == "initialize":
@@ -452,23 +470,41 @@ def main():
         elif method == "session/prompt":
             prompt = req_id
             prompt_kind = MODE
+            pending.clear()
             emit_updates()
             if MODE in ("cancel", "cancel_unconfirmed", "slow"):
                 pass
+            elif MODE == "ask_two":
+                ask_permission("alpha", "first", tool_id="tc-a", req_id=9100)
+                pending.add(9100)
+                ask_permission("beta", "second", tool_id="tc-b", req_id=9101)
+                pending.add(9101)
+            elif MODE == "ask_no_once":
+                ask_permission("alpha", "first", req_id=9100, options=[
+                    {"optionId": "allow_always", "name": "Always allow", "kind": "allow_always"},
+                    {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
+                ])
+                pending.add(9100)
             elif MODE == "ask":
                 ask_permission("deploy production", "deploy")
+                pending.add(9000)
             elif MODE == "deny":
                 ask_permission("git push --force origin main", "shell")
+                pending.add(9000)
             elif MODE == "cancel_tool":
                 ask_permission("sleep 60", "shell")
+                pending.add(9000)
             else:
                 ask_permission("ls -la", "shell")
+                pending.add(9000)
         elif method == "session/cancel":
             if prompt is not None and MODE in ("cancel", "cancel_tool"):
                 note("agent_message_chunk", {"messageId": "m4",
                                               "content": {"type": "text", "text": "cancelled"}})
                 result(prompt, {"stopReason": "cancelled"})
                 prompt = None
+                prompt_kind = None
+                pending.clear()
         elif method is not None and req_id is not None:
             result(req_id, {})
     return 0
@@ -3768,6 +3804,17 @@ fi
 # network is involved. Each scenario uses its own state root so a forgotten
 # supervisor cannot consume another scenario's slot.
 
+# A minimal user Goose profile: the per-apply profile links these read-through,
+# while its permission store stays boss-owned.
+export XDG_CONFIG_HOME="$TMP/.config"
+mkdir -p "$TMP/.config/goose" "$TMP/.local/share/goose/apps"
+printf 'provider: fake\n' >"$TMP/.config/goose/config.yaml"
+printf 'secret: fake\n' >"$TMP/.config/goose/secrets.yaml"
+printf 'user:\n  always_allow: []\n  never_allow: []\n' >"$TMP/.config/goose/permission.yaml"
+: >"$TMP/.config/goose/permission.yaml.lock"
+GLOBAL_PERMISSION="$TMP/.config/goose/permission.yaml"
+GLOBAL_PERMISSION_CONTENT="$(cat "$GLOBAL_PERMISSION")"
+
 AP="$TMP/acp-project"
 make_project "$AP"
 ACP_CONF="$TMP/acp-boss.toml"
@@ -3836,8 +3883,29 @@ check_eq "acp permission: allowed" "1" \
 check_contains "acp tab: transcript tail" "tail -n +1 -f" "$(cat "$PANE_RUN_LOG")"
 check_eq "acp init: no fs capability" "none" "$(jq -r '.clientCapabilities.fs // "none"' "$ACP_INIT_LOG")"
 check_eq "acp init: no terminal capability" "none" "$(jq -r '.clientCapabilities.terminal // "none"' "$ACP_INIT_LOG")"
+
+# The apply runs from a per-apply profile. Provider files are links, the
+# permission store is boss-owned, and the user's global store is untouched.
+P1="$(jq -r '.acp.profile_root' "$S1")"
+check_eq "acp profile: recorded" "true" "$([ -n "$P1" ] && [ -d "$P1" ] && echo true || echo false)"
+check_eq "acp profile: config link" "$TMP/.config/goose/config.yaml" \
+  "$(readlink "$P1/config/goose/config.yaml" 2>/dev/null || true)"
+check_eq "acp profile: secrets link" "$TMP/.config/goose/secrets.yaml" \
+  "$(readlink "$P1/config/goose/secrets.yaml" 2>/dev/null || true)"
+check_eq "acp profile: apps link" "$TMP/.local/share/goose/apps" \
+  "$(readlink "$P1/data/goose/apps" 2>/dev/null || true)"
+check_eq "acp profile: private sessions" "true" \
+  "$([ -d "$P1/data/goose/sessions" ] && [ ! -L "$P1/data/goose/sessions" ] && echo true || echo false)"
+check_eq "acp profile: permission is not a link" "true" \
+  "$([ -f "$P1/config/goose/permission.yaml" ] && [ ! -L "$P1/config/goose/permission.yaml" ] && echo true || echo false)"
+check_contains "acp profile: empty always_allow" "always_allow: []" "$(cat "$P1/config/goose/permission.yaml")"
+check_contains "acp profile: shell asks first" "- shell" "$(cat "$P1/config/goose/permission.yaml")"
+check_eq "acp profile: lock file not linked" "true" \
+  "$([ ! -e "$P1/config/goose/permission.yaml.lock" ] && echo true || echo false)"
+check_eq "acp profile: global store unchanged" "$GLOBAL_PERMISSION_CONTENT" "$(cat "$GLOBAL_PERMISSION")"
 acp_boss "$AS1" finish acp-allow --project acp-test >/dev/null 2>&1
 if [ -f "$S1" ]; then bad "acp finish: state file left behind"; else ok; fi
+if [ -d "$P1" ]; then bad "acp finish: profile left behind"; else ok; fi
 
 # 60b. A retrigger sends a second prompt through the control socket.
 make_change "$AP" acp-retrigger '- [ ] 1.1 Do the work.'
@@ -3982,6 +4050,207 @@ check_eq "acp blocked interrupt: answered cancelled" "1" \
 acp_wait_phase "$S5" idle || true
 acp_boss "$AS5" finish acp-blocked-interrupt --project acp-test >/dev/null 2>&1
 
+# 64a. Concurrent permission requests: both are pending, the answer names one
+# tool call, and an ambiguous answer is refused with the pending ids.
+make_change "$AP" acp-queue '- [ ] 1.1 Do the work.'
+ASQ="$TMP/acp-state-queue"; mkdir -p "$ASQ"
+SQ="$(acp_state "$ASQ" "$AP" acp-queue)"
+EVQ="$(acp_events_file "$ASQ" "$AP" acp-queue)"
+FAKE_ACP_MODE=ask_two acp_boss "$ASQ" dispatch acp-queue --project acp-test --runner goose-ask >/dev/null
+if acp_wait_phase "$SQ" blocked; then ok; else bad "acp queue: never blocked"; fi
+out="$(acp_boss "$ASQ" status acp-queue --project acp-test --json 2>/dev/null)"
+check_eq "acp queue: two pending" "2" "$(printf '%s' "$out" | jq -r '.pending_permissions | length')"
+check_eq "acp queue: first id" "tc-a" "$(printf '%s' "$out" | jq -r '.pending_permissions[0].tool_call_id')"
+check_eq "acp queue: second id" "tc-b" "$(printf '%s' "$out" | jq -r '.pending_permissions[1].tool_call_id')"
+check_eq "acp queue: alias is first" "tc-a" "$(printf '%s' "$out" | jq -r '.pending_permission.tool_call_id')"
+check_contains "acp queue: dialog lists both" "tc-b" "$(printf '%s' "$out" | jq -r '.blocked_dialog')"
+check_contains "acp queue: dialog names command" "beta" "$(printf '%s' "$out" | jq -r '.blocked_dialog')"
+check_contains "acp queue: dialog names options" "allow_once" "$(printf '%s' "$out" | jq -r '.blocked_dialog')"
+err="$(acp_boss_fail "$ASQ" answer acp-queue allow_once --project acp-test)"
+check_contains "acp queue: ambiguous refused" "ambiguous_pending" "$err"
+check_contains "acp queue: ambiguous names ids" "tc-a" "$err"
+check_contains "acp queue: ambiguous names second" "tc-b" "$err"
+out="$(acp_boss "$ASQ" answer acp-queue allow_once --tool-call tc-b --project acp-test)"
+check_eq "acp queue: answer by id" "tc-b" "$(printf '%s' "$out" | jq -r '.tool_call_id')"
+i=0
+while [ "$i" -lt 50 ]; do
+  [ "$(jq -r '.acp.pending_permissions | length' "$SQ")" = "1" ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
+check_eq "acp queue: one remains" "1" "$(jq -r '.acp.pending_permissions | length' "$SQ")"
+check_eq "acp queue: remaining id" "tc-a" "$(jq -r '.acp.pending_permissions[0].tool_call_id' "$SQ")"
+check_eq "acp queue: still blocked" "blocked" "$(jq -r '.acp.phase' "$SQ")"
+out="$(acp_boss "$ASQ" answer acp-queue allow_once tc-a --project acp-test)"
+check_eq "acp queue: option and id positionally" "tc-a" "$(printf '%s' "$out" | jq -r '.tool_call_id')"
+acp_wait_phase "$SQ" idle || bad "acp queue: did not return to idle"
+check_eq "acp queue: queue empty" "0" "$(jq -r '.acp.pending_permissions | length' "$SQ")"
+TRQ="$(jq -r '.acp.transcript' "$SQ")"
+check_contains "acp transcript: permission ids" '"tool_call_id":"tc-a"' "$(cat "$TRQ")"
+check_contains "acp transcript: permission request id" '"request_id":9100' "$(cat "$TRQ")"
+check_contains "acp transcript: answered ids" '"type":"permission_answered"' "$(cat "$TRQ")"
+check_contains "acp event: permission request id" '"request_id":9100' "$(cat "$EVQ")"
+check_contains "acp event: answered request id" '"event":"acp_permission_answered"' "$(cat "$EVQ")"
+acp_boss "$ASQ" finish acp-queue --project acp-test >/dev/null 2>&1
+
+# 64b. Interrupt cancels every queued request.
+make_change "$AP" acp-cancel-all '- [ ] 1.1 Do the work.'
+ASC="$TMP/acp-state-cancel-all"; mkdir -p "$ASC"
+SC="$(acp_state "$ASC" "$AP" acp-cancel-all)"
+EVC="$(acp_events_file "$ASC" "$AP" acp-cancel-all)"
+FAKE_ACP_MODE=ask_two acp_boss "$ASC" dispatch acp-cancel-all --project acp-test --runner goose-ask >/dev/null
+if acp_wait_phase "$SC" blocked; then ok; else bad "acp cancel-all: never blocked"; fi
+out="$(acp_boss "$ASC" interrupt acp-cancel-all --project acp-test)"
+check_eq "acp cancel-all: status" "cancelled" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp cancel-all: both cancelled" "2" \
+  "$(jq -Rrc 'select(length > 0) | (fromjson? | select(type=="object")) | select(.event=="acp_permission_answered" and .decision=="cancelled")' "$EVC" | wc -l | tr -d ' ')"
+check_eq "acp cancel-all: queue empty" "0" "$(jq -r '.acp.pending_permissions | length' "$SC")"
+acp_wait_phase "$SC" idle || true
+acp_boss "$ASC" finish acp-cancel-all --project acp-test >/dev/null 2>&1
+
+# 64c. Finish with queued requests closes the supervisor and leaves nothing
+# unresolved.
+make_change "$AP" acp-shutdown-pending '- [ ] 1.1 Do the work.'
+ASS="$TMP/acp-state-shutdown-pending"; mkdir -p "$ASS"
+SS="$(acp_state "$ASS" "$AP" acp-shutdown-pending)"
+FAKE_ACP_MODE=ask_two acp_boss "$ASS" dispatch acp-shutdown-pending --project acp-test --runner goose-ask >/dev/null
+if acp_wait_phase "$SS" blocked; then ok; else bad "acp shutdown: never blocked"; fi
+SPID="$(jq -r '.acp.supervisor_pid // empty' "$SS")"
+out="$(acp_boss "$ASS" finish acp-shutdown-pending --project acp-test --force)"
+check_eq "acp shutdown: finish with pending" "finished" "$(printf '%s' "$out" | jq -r '.status')"
+if [ -f "$SS" ]; then bad "acp shutdown: state left behind"; else ok; fi
+if [ -n "$SPID" ] && kill -0 "$SPID" 2>/dev/null; then
+  bad "acp shutdown: supervisor still alive"
+else
+  ok
+fi
+
+# 64d. Automatic allow always selects allow_once; allow-always stays inside
+# the apply and is sent to the agent as allow_once.
+OPTLOG="$TMP/acp-options.log"; : >"$OPTLOG"
+make_change "$AP" acp-allow-once '- [ ] 1.1 Do the work.'
+ASO="$TMP/acp-state-allow-once"; mkdir -p "$ASO"
+SO="$(acp_state "$ASO" "$AP" acp-allow-once)"
+FAKE_ACP_MODE=allow FAKE_ACP_OPTION_LOG="$OPTLOG" \
+  acp_boss "$ASO" dispatch acp-allow-once --project acp-test --runner goose >/dev/null
+acp_wait_stop "$SO" || bad "acp allow once: no stop reason"
+check_eq "acp allow once: automatic option" "allow_once" \
+  "$(jq -sr '[.[] | select(.id == 9000)][-1].response.result.outcome.optionId' "$OPTLOG")"
+acp_boss "$ASO" finish acp-allow-once --project acp-test >/dev/null 2>&1
+
+: >"$OPTLOG"
+make_change "$AP" acp-apply-allow '- [ ] 1.1 Do the work.'
+ASA="$TMP/acp-state-apply-allow"; mkdir -p "$ASA"
+SA="$(acp_state "$ASA" "$AP" acp-apply-allow)"
+EVA="$(acp_events_file "$ASA" "$AP" acp-apply-allow)"
+FAKE_ACP_MODE=ask FAKE_ACP_OPTION_LOG="$OPTLOG" \
+  acp_boss "$ASA" dispatch acp-apply-allow --project acp-test --runner goose-ask >/dev/null
+if acp_wait_phase "$SA" blocked; then ok; else bad "acp apply allow: never blocked"; fi
+out="$(acp_boss "$ASA" answer acp-apply-allow allow_always --project acp-test)"
+check_eq "acp apply allow: grant recorded" "true" "$(printf '%s' "$out" | jq -r '.grant')"
+check_eq "acp apply allow: stored" "1" "$(jq -r '.acp.apply_allows | length' "$SA")"
+check_eq "acp apply allow: sent once" "allow_once" \
+  "$(jq -sr '[.[] | select(.id == 9000)][-1].response.result.outcome.optionId' "$OPTLOG")"
+check_eq "acp apply allow: global untouched" "$GLOBAL_PERMISSION_CONTENT" "$(cat "$GLOBAL_PERMISSION")"
+acp_wait_phase "$SA" idle || bad "acp apply allow: did not finish the turn"
+out="$(acp_boss "$ASA" retrigger acp-apply-allow --project acp-test)"
+check_eq "acp apply allow: retrigger" "retriggered" "$(printf '%s' "$out" | jq -r '.status')"
+i=0
+while [ "$i" -lt 100 ]; do
+  [ "$(acp_count "$EVA" acp_stop)" -ge 2 ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
+check_eq "acp apply allow: grant persists" "1" "$(jq -r '.acp.apply_allows | length' "$SA")"
+check_eq "acp apply allow: auto allow event" "1" \
+  "$(jq -Rrc 'select(length > 0) | (fromjson? | select(type=="object")) | select(.event=="acp_permission" and .decision=="allow" and .apply_allow==true)' "$EVA" | wc -l | tr -d ' ')"
+out="$(acp_boss "$ASA" retrigger acp-apply-allow --project acp-test)"
+check_eq "acp apply allow: second retrigger" "retriggered" "$(printf '%s' "$out" | jq -r '.status')"
+i=0
+while [ "$i" -lt 100 ]; do
+  [ "$(acp_count "$EVA" acp_stop)" -ge 3 ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
+check_eq "acp apply allow: grant still persists" "1" "$(jq -r '.acp.apply_allows | length' "$SA")"
+check_eq "acp apply allow: second auto allow event" "2" \
+  "$(jq -Rrc 'select(length > 0) | (fromjson? | select(type=="object")) | select(.event=="acp_permission" and .decision=="allow" and .apply_allow==true)' "$EVA" | wc -l | tr -d ' ')"
+check_eq "acp apply allow: second sent once" "allow_once" \
+  "$(jq -sr '[.[] | select(.id == 9000)][-1].response.result.outcome.optionId' "$OPTLOG")"
+acp_boss "$ASA" finish acp-apply-allow --project acp-test >/dev/null 2>&1
+
+# 64e. Without an allow-once option an automatic allow fails closed; an
+# Explorer allow-always is refused on a non-isolated runner.
+cat >>"$ACP_CONF" <<'EOF'
+
+[runners.goose-noiso]
+start = "acp"
+command = "fake-goose"
+model = "model-a"
+mode = "smart_approve"
+policy = "allow"
+isolate = false
+EOF
+make_change "$AP" acp-no-once '- [ ] 1.1 Do the work.'
+ASN="$TMP/acp-state-no-once"; mkdir -p "$ASN"
+SN="$(acp_state "$ASN" "$AP" acp-no-once)"
+FAKE_ACP_MODE=ask_no_once acp_boss "$ASN" dispatch acp-no-once --project acp-test --runner goose-noiso >/dev/null
+if acp_wait_phase "$SN" blocked; then ok; else bad "acp no once: did not fail closed"; fi
+err="$(acp_boss_fail "$ASN" answer acp-no-once allow_always --project acp-test)"
+check_contains "acp no once: allow-always refused" "no_allow_once" "$err"
+acp_boss "$ASN" interrupt acp-no-once --project acp-test >/dev/null 2>&1
+acp_boss "$ASN" finish acp-no-once --project acp-test --force >/dev/null 2>&1
+
+# 64f. Isolation and the permission store are visible in the doctor; the probe
+# leaves no session behind.
+DAS="$TMP/acp-doctor-state"; mkdir -p "$DAS"
+DTMP="$TMP/acp-doctor-tmp"; mkdir -p "$DTMP"
+out="$(TMPDIR="$DTMP" HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$ACP_CONF" \
+  run_boss_state "$DAS" doctor --project acp-test --json 2>/dev/null)"
+check_eq "acp doctor: isolated policy" "ok" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .status')"
+check_contains "acp doctor: isolation reported" "isolated: true" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .hint')"
+check_contains "acp doctor: store reported" "per-apply profile" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .hint')"
+if [ -z "$(ls -A "$DTMP" 2>/dev/null)" ]; then ok; else bad "acp doctor: probe left temporary state"; fi
+
+# 64g. A global always_allow for shell weakens a non-isolated runner.
+WCONF="$TMP/acp-weakened.toml"
+cat >"$WCONF" <<EOF
+default = "goose"
+
+[projects]
+acp-test = "$AP"
+
+[runners.goose]
+start = "acp"
+command = "fake-goose"
+model = "model-a"
+mode = "smart_approve"
+policy = "allow"
+isolate = false
+
+[missions]
+EOF
+printf 'user:\n  always_allow:\n    - shell\n  never_allow: []\n' >"$GLOBAL_PERMISSION"
+out="$(XDG_CONFIG_HOME="$TMP/.config" run_lib policy_check \
+  '{"name":"goose","kind":"acp","isolate":false,"deny":["git push --force*"]}' "$AP")"
+check_eq "acp policy: weakened" "weakened" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp policy: names the entry" "shell" "$(printf '%s' "$out" | jq -r '.entry')"
+out="$(TMPDIR="$DTMP" HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$WCONF" \
+  run_boss_state "$DAS" doctor --project acp-test --json 2>/dev/null)"
+check_eq "acp doctor: policy warn" "warn" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="policy") | .status')"
+check_contains "acp doctor: policy names shell" "shell" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="policy") | .hint')"
+check_eq "acp doctor: runner policy warn" "warn" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .status')"
+check_contains "acp doctor: runner policy names shell" "shell" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .hint')"
+printf '%s\n' "$GLOBAL_PERMISSION_CONTENT" >"$GLOBAL_PERMISSION"
+out="$(XDG_CONFIG_HOME="$TMP/.config" run_lib policy_check \
+  '{"name":"goose","kind":"acp","isolate":false,"deny":["git push --force*"]}' "$AP")"
+check_eq "acp policy: clean store enforced" "enforced" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp policy: clean store flag" "false" "$(printf '%s' "$out" | jq -r '.isolated')"
+out="$(XDG_CONFIG_HOME="$TMP/.config" run_lib policy_check \
+  '{"name":"goose","kind":"acp","isolate":true,"deny":["git push --force*"]}' "$AP")"
+check_eq "acp policy: isolated enforced" "enforced" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp policy: isolated flag" "true" "$(printf '%s' "$out" | jq -r '.isolated')"
+
 # 65. Cancel during generation, during a tool call, and a timeout.
 make_change "$AP" acp-cancel '- [ ] 1.1 Do the work.'
 AS6="$TMP/acp-state-6"; mkdir -p "$AS6"
@@ -4019,10 +4288,13 @@ AS9="$TMP/acp-state-9"; mkdir -p "$AS9"
 S9="$(acp_state "$AS9" "$AP" acp-resume)"
 FAKE_ACP_MODE=allow acp_boss "$AS9" dispatch acp-resume --project acp-test --runner goose >/dev/null
 acp_wait_stop "$S9" || bad "acp resume: first turn did not finish"
+P9="$(jq -r '.acp.profile_root // empty' "$S9")"
 kill_acp_supervisor "$S9"
 sleep 0.3
 out="$(FAKE_ACP_MODE=load acp_boss "$AS9" resume acp-resume --project acp-test)"
 check_eq "acp resume: status" "resumed" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp resume: same profile" "$P9" "$(jq -r '.acp.profile_root // empty' "$S9")"
+check_eq "acp resume: profile survives" "true" "$([ -n "$P9" ] && [ -d "$P9" ] && echo true || echo false)"
 check_eq "acp resume: load event" "1" "$(acp_count "$(acp_events_file "$AS9" "$AP" acp-resume)" acp_load)"
 TR9="$(jq -r '.acp.transcript' "$S9")"
 check_contains "acp resume: boundary" '"reason":"session_load"' "$(cat "$TR9")"

@@ -9,7 +9,7 @@ per-apply Unix control socket without a second state machine.
 Usage:
   boss_acp.py <state-file>
   boss_acp.py --probe <command> [--cwd DIR] [--model M] [--mode MODE]
-              [--timeout S]
+              [--timeout S] [--profile-temp]
 """
 
 from __future__ import annotations
@@ -24,9 +24,21 @@ import shlex
 import shutil
 import signal
 import sys
+import tempfile
 import time
 
 PROTOCOL_VERSION = 1
+
+# Tools that must always reach the supervisor instead of being pre-approved by
+# an agent-level permission store. Kept in both the user and the smart-approve
+# section of the generated permission.yaml.
+PERMISSION_ASK_TOOLS = (
+    "shell",
+    "write",
+    "edit",
+    "read_image",
+    "extensionmanager__manage_extensions",
+)
 
 
 def now_iso() -> str:
@@ -55,6 +67,92 @@ def pid_alive(pid) -> bool:
         return False
 
 
+def boss_state_dir() -> str:
+    return os.environ.get(
+        "BOSS_STATE_DIR",
+        os.path.join(os.path.expanduser("~"), ".local", "state", "openspec-boss"),
+    )
+
+
+def user_config_home() -> str:
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+
+
+def user_data_home() -> str:
+    return os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "share"
+    )
+
+
+def profile_root_for(state_path: str) -> str:
+    """The per-apply agent profile root; the same state path always maps to the
+    same root, so a supervisor restart reuses it."""
+    key = hashlib.sha1(
+        ("profile:" + os.path.abspath(state_path)).encode("utf-8")
+    ).hexdigest()
+    return os.path.join(boss_state_dir(), "acp", "profile-" + key)
+
+
+def write_permission_store(path: str) -> None:
+    lines = []
+    for section in ("user", "smart_approve"):
+        lines.append(f"{section}:")
+        lines.append("  always_allow: []")
+        lines.append("  never_allow: []")
+        lines.append("  ask_before:")
+        for tool in PERMISSION_ASK_TOOLS:
+            lines.append(f"    - {tool}")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def link_entries(source: str, target: str, skip=()) -> None:
+    if not os.path.isdir(source):
+        return
+    os.makedirs(target, exist_ok=True)
+    for name in sorted(os.listdir(source)):
+        if name in skip or name.endswith(".lock"):
+            continue
+        src = os.path.join(source, name)
+        dst = os.path.join(target, name)
+        if os.path.lexists(dst):
+            continue
+        os.symlink(src, dst)
+        log(f"acp profile: linked {dst} -> {src}")
+
+
+def build_agent_profile(root: str) -> str:
+    """Create a boss-owned Goose profile below root and return it.
+
+    Provider configuration and secrets are linked read-through, so the user's
+    own setup keeps working. The permission store is generated here and never
+    links the user's store, so no global grant can bypass the supervisor.
+    """
+    config_goose = os.path.join(root, "config", "goose")
+    data_goose = os.path.join(root, "data", "goose")
+    os.makedirs(config_goose, exist_ok=True)
+    os.makedirs(os.path.join(data_goose, "sessions"), exist_ok=True)
+    link_entries(
+        os.path.join(user_config_home(), "goose"),
+        config_goose,
+        skip=("permission.yaml", "sessions", "logs"),
+    )
+    link_entries(
+        os.path.join(user_data_home(), "goose"),
+        data_goose,
+        skip=("sessions",),
+    )
+    permission_path = os.path.join(config_goose, "permission.yaml")
+    if not os.path.exists(permission_path):
+        write_permission_store(permission_path)
+        log(f"acp profile: wrote boss-owned permission store {permission_path}")
+    return root
+
+
 class AcpError(Exception):
     def __init__(self, code: str, message: str = "", data=None):
         super().__init__(message or code)
@@ -68,10 +166,7 @@ class StateFile:
 
     def __init__(self, path: str):
         self.path = path
-        self.state_dir = os.environ.get(
-            "BOSS_STATE_DIR",
-            os.path.join(os.path.expanduser("~"), ".local", "state", "openspec-boss"),
-        )
+        self.state_dir = boss_state_dir()
         key = hashlib.sha1(os.path.abspath(path).encode("utf-8")).hexdigest()
         self.lock_dir = os.path.join(self.state_dir, "locks", key + ".lock")
 
@@ -162,6 +257,27 @@ def pick_option(options, want: str):
         if want == "reject" and ("reject" in name or "deny" in name or "no" in name):
             return option
     return None
+
+
+def pick_option_once(options):
+    """Pick an allow-once option. Never falls back to allow_always: an automatic
+    decision must not create a persistent agent-level grant."""
+    for option in options:
+        if str(option.get("kind") or "").lower() == "allow_once":
+            return option
+    for option in options:
+        name = str(option.get("name") or "").lower()
+        if "once" in name and ("allow" in name or "approve" in name or "yes" in name):
+            return option
+    return None
+
+
+def option_is_allow_always(option) -> bool:
+    if not isinstance(option, dict):
+        return False
+    kind = str(option.get("kind") or "").lower()
+    oid = option_id(option).lower()
+    return kind == "allow_always" or "always" in oid
 
 
 def offered_values(config_options, config_id: str):
@@ -307,9 +423,16 @@ class Supervisor:
         self.load_session = self.acp.get("load_session")
         self.resume = bool(self.acp.get("resume"))
         self.phase = str(self.acp.get("phase") or "starting")
+        raw_isolate = self.acp.get("isolated")
+        if raw_isolate is None:
+            raw_isolate = self.acp.get("isolate")
+        self.isolated = True if raw_isolate is None else bool(raw_isolate)
+        self.profile_root = str(self.acp.get("profile_root") or profile_root_for(state_path))
         self.usage = None
-        self.permission_future = None
-        self.permission_request = None
+        # Pending permissions are independent and keyed by tool-call id. A
+        # second request must never replace the first one's future.
+        self.pending: dict[str, dict] = {}
+        self.apply_allows = [dict(item) for item in (self.acp.get("apply_allows") or []) if isinstance(item, dict)]
         self.turn_task = None
         self.next_prompt = None
         self.control_event = asyncio.Event()
@@ -694,6 +817,69 @@ class Supervisor:
             )
         return result
 
+    # -- apply-scoped allow-always grants -----------------------------------
+    def grant_matches(self, grant: dict, tool: dict) -> bool:
+        raw = tool.get("rawInput") or {}
+        command = str(raw.get("command") or raw.get("path") or "")
+        title = str(tool.get("title") or "")
+        grant_command = str(grant.get("command") or "")
+        grant_title = str(grant.get("title") or "")
+        grant_kind = str(grant.get("kind") or "")
+        kind = str(tool.get("kind") or "")
+        if grant_kind and kind and grant_kind != kind:
+            return False
+        if grant_command:
+            if command == grant_command:
+                return True
+            try:
+                return bool(fnmatch.fnmatchcase(command, grant_command))
+            except Exception:
+                return False
+        return bool(grant_title) and title == grant_title
+
+    def find_apply_allow(self, tool: dict):
+        for index, grant in enumerate(self.apply_allows):
+            if self.grant_matches(grant, tool):
+                return index
+        return None
+
+    def remember_apply_allow(self, tool: dict, title: str, command: str) -> None:
+        raw = tool.get("rawInput") or {}
+        grant = {
+            "title": title,
+            "kind": tool.get("kind"),
+            "command": command or str(raw.get("path") or ""),
+        }
+        if grant not in self.apply_allows:
+            self.apply_allows.append(grant)
+            self.acp_set(apply_allows=self.apply_allows)
+
+    # -- pending queue ------------------------------------------------------
+    def pending_public(self, key: str, entry: dict) -> dict:
+        return {
+            "tool_call_id": key,
+            "request_id": entry.get("request_id"),
+            "title": entry.get("title"),
+            "command": entry.get("command"),
+            "raw_input": entry.get("raw_input"),
+            "options": entry.get("recorded") or [],
+        }
+
+    def pending_list(self) -> list:
+        return [self.pending_public(key, entry) for key, entry in self.pending.items()]
+
+    def persist_pending(self) -> None:
+        items = self.pending_list()
+        # pending_permission stays as an alias for readers from before the
+        # queue; it always names the first still-unanswered request.
+        self.acp_set(
+            pending_permissions=items,
+            pending_permission=(items[0] if items else None),
+        )
+
+    def pending_ids(self) -> list:
+        return list(self.pending.keys())
+
     async def on_request(self, message: dict) -> None:
         method = message.get("method")
         request_id = message.get("id")
@@ -710,66 +896,125 @@ class Supervisor:
         title = str(tool.get("title") or "permission request")
         command = str(raw.get("command") or raw.get("path") or "")
         description = f"{title} -- {command}" if command else title
+        tool_call_id = str(tool.get("toolCallId") or f"request-{request_id}")
         decision = self.decide(tool)
+        from_apply_allow = False
+        grant_index = None
+        if decision != "reject":
+            grant_index = self.find_apply_allow(tool)
+            if grant_index is not None:
+                decision = "allow"
+                from_apply_allow = True
         if decision == "reject":
             option = pick_option(options, "reject")
             await self.respond_permission(request_id, option)
             self.event(
                 "acp_permission",
-                {"decision": "reject", "title": title, "command": command, "tool_call_id": tool.get("toolCallId")},
+                {
+                    "decision": "reject",
+                    "title": title,
+                    "command": command,
+                    "tool_call_id": tool_call_id,
+                    "request_id": request_id,
+                },
             )
             self.transcript_append(
-                {"type": "permission", "decision": "reject", "title": title, "command": command}
+                {
+                    "type": "permission",
+                    "decision": "reject",
+                    "title": title,
+                    "command": command,
+                    "tool_call_id": tool_call_id,
+                    "request_id": request_id,
+                }
             )
             return
         if decision == "allow":
-            option = pick_option(options, "allow")
-            await self.respond_permission(request_id, option)
-            self.event(
-                "acp_permission",
-                {"decision": "allow", "title": title, "command": command, "tool_call_id": tool.get("toolCallId")},
-            )
-            self.transcript_append(
-                {"type": "permission", "decision": "allow", "title": title, "command": command}
-            )
-            return
+            option = pick_option_once(options)
+            if option is None:
+                # Fail closed: without an allow-once option, an automatic
+                # allow would have to write an agent-level grant.
+                log(
+                    "warning: permission request offers no allow-once option; "
+                    "leaving it pending instead of granting allow-always"
+                )
+            else:
+                await self.respond_permission(request_id, option)
+                self.event(
+                    "acp_permission",
+                    {
+                        "decision": "allow",
+                        "title": title,
+                        "command": command,
+                        "tool_call_id": tool_call_id,
+                        "request_id": request_id,
+                        "apply_allow": from_apply_allow,
+                    },
+                )
+                self.transcript_append(
+                    {
+                        "type": "permission",
+                        "decision": "allow",
+                        "title": title,
+                        "command": command,
+                        "tool_call_id": tool_call_id,
+                        "request_id": request_id,
+                    }
+                )
+                return
 
         # ask: the request stays open, the apply becomes blocked and the boss
-        # decides through 'boss answer' (or 'boss interrupt').
-        self.permission_future = asyncio.get_running_loop().create_future()
-        self.permission_request = {
+        # decides through 'boss answer' (or 'boss interrupt'). Each request owns
+        # its future, so a concurrent request cannot orphan it.
+        future = asyncio.get_running_loop().create_future()
+        entry = {
             "request_id": request_id,
             "options": options,
             "recorded": recorded,
-        }
-        pending = {
-            "tool_call_id": tool.get("toolCallId"),
+            "tool_call_id": tool_call_id,
             "title": title,
             "command": command,
             "raw_input": raw,
-            "options": recorded,
+            "tool": tool,
+            "future": future,
         }
-        self.acp_set(pending_permission=pending)
-        self.set_phase("blocked", "blocked")
+        self.pending[tool_call_id] = entry
+        self.persist_pending()
+        first = len(self.pending) == 1
+        if first:
+            self.set_phase("blocked", "blocked")
         self.event(
             "acp_permission",
-            {"decision": "ask", "title": title, "command": command, "tool_call_id": tool.get("toolCallId")},
+            {
+                "decision": "ask",
+                "title": title,
+                "command": command,
+                "tool_call_id": tool_call_id,
+                "request_id": request_id,
+            },
         )
         self.transcript_append(
-            {"type": "permission", "decision": "ask", "title": title, "command": command}
+            {
+                "type": "permission",
+                "decision": "ask",
+                "title": title,
+                "command": command,
+                "tool_call_id": tool_call_id,
+                "request_id": request_id,
+            }
         )
-        self.wake_background(
-            "blocked",
-            "blocked",
-            f"Apply {self.change} in {self.project}: blocked on an ACP permission request ({description}). "
-            f"Options: {', '.join(item['optionId'] for item in recorded) or '(none)'}. "
-            f"Next step: boss answer {self.change} <option> (or boss interrupt {self.change})",
-        )
-        chosen = await self.permission_future
-        self.permission_future = None
-        pending_request = self.permission_request
-        self.permission_request = None
-        self.acp_set(pending_permission=None)
+        if first:
+            self.wake_background(
+                "blocked",
+                "blocked",
+                f"Apply {self.change} in {self.project}: blocked on an ACP permission request ({description}). "
+                f"Options: {', '.join(item['optionId'] for item in recorded) or '(none)'}. "
+                f"Next step: boss answer {self.change} <option> --tool-call {tool_call_id} "
+                f"(or boss interrupt {self.change})",
+            )
+        chosen = await future
+        self.pending.pop(tool_call_id, None)
+        self.persist_pending()
         if chosen and chosen.get("cancel"):
             option = pick_option(options, "reject")
             if option is not None:
@@ -778,36 +1023,55 @@ class Supervisor:
                 await self.client.respond(request_id, {"outcome": {"outcome": "cancelled"}})
             self.event(
                 "acp_permission_answered",
-                {"decision": "cancelled", "title": title, "tool_call_id": tool.get("toolCallId")},
+                {
+                    "decision": "cancelled",
+                    "title": title,
+                    "tool_call_id": tool_call_id,
+                    "request_id": request_id,
+                },
             )
             self.transcript_append(
-                {"type": "permission_answered", "decision": "cancelled", "title": title}
+                {
+                    "type": "permission_answered",
+                    "decision": "cancelled",
+                    "title": title,
+                    "tool_call_id": tool_call_id,
+                    "request_id": request_id,
+                }
             )
-            return
-        selected = (chosen or {}).get("option")
-        option = None
-        for candidate in options:
-            if option_id(candidate) == selected:
-                option = candidate
-                break
-        if option is None:
-            option = pick_option(options, "reject")
-        await self.respond_permission(request_id, option)
-        self.event(
-            "acp_permission_answered",
-            {
-                "decision": "answer",
-                "option": selected,
-                "title": title,
-                "tool_call_id": tool.get("toolCallId"),
-            },
-        )
-        self.transcript_append(
-            {"type": "permission_answered", "decision": "answer", "option": selected, "title": title}
-        )
-        self.set_phase("working", "working")
-        if pending_request is None:
-            log("warning: permission answer had no recorded request")
+        else:
+            selected = (chosen or {}).get("option")
+            option = None
+            for candidate in options:
+                if option_id(candidate) == selected:
+                    option = candidate
+                    break
+            if option is None:
+                option = pick_option(options, "reject")
+            await self.respond_permission(request_id, option)
+            self.event(
+                "acp_permission_answered",
+                {
+                    "decision": "answer",
+                    "option": selected,
+                    "title": title,
+                    "tool_call_id": tool_call_id,
+                    "request_id": request_id,
+                    "apply_allow": bool((chosen or {}).get("grant")),
+                },
+            )
+            self.transcript_append(
+                {
+                    "type": "permission_answered",
+                    "decision": "answer",
+                    "option": selected,
+                    "title": title,
+                    "tool_call_id": tool_call_id,
+                    "request_id": request_id,
+                }
+            )
+        if not self.pending:
+            self.set_phase("working", "working")
 
     async def respond_permission(self, request_id, option) -> None:
         if option is not None:
@@ -818,9 +1082,31 @@ class Supervisor:
         else:
             await self.client.respond(request_id, {"outcome": {"outcome": "cancelled"}})
 
-    def resolve_pending(self, payload: dict) -> None:
-        if self.permission_future is not None and not self.permission_future.done():
-            self.permission_future.set_result(payload)
+    def resolve_pending(self, payload: dict, tool_call_id=None) -> bool:
+        if tool_call_id is not None:
+            entry = self.pending.get(str(tool_call_id))
+            if entry is None:
+                return False
+            future = entry.get("future")
+            if future is not None and not future.done():
+                future.set_result(payload)
+                return True
+            return False
+        if len(self.pending) == 1:
+            future = next(iter(self.pending.values())).get("future")
+            if future is not None and not future.done():
+                future.set_result(payload)
+                return True
+        return False
+
+    def resolve_all(self, payload: dict) -> int:
+        count = 0
+        for entry in list(self.pending.values()):
+            future = entry.get("future")
+            if future is not None and not future.done():
+                future.set_result(payload)
+                count += 1
+        return count
 
     # --------------------------------------------------------------- turns ---
     async def run_turn(self, text: str) -> str:
@@ -880,11 +1166,9 @@ class Supervisor:
         return stop_reason
 
     async def cancel_turn(self) -> str:
-        had_pending = (
-            self.permission_future is not None and not self.permission_future.done()
-        )
+        had_pending = bool(self.pending)
         if had_pending:
-            self.resolve_pending({"cancel": True})
+            self.resolve_all({"cancel": True})
         task = self.turn_task
         if task is None or task.done():
             return "cancelled" if had_pending else "idle"
@@ -931,7 +1215,11 @@ class Supervisor:
                     "session_id": self.session_id,
                     "model": self.acp.get("model"),
                     "mode": self.acp.get("mode"),
-                    "pending": self.permission_request is not None,
+                    "pending": bool(self.pending),
+                    "pending_permissions": self.pending_list(),
+                    "apply_allows": self.apply_allows,
+                    "isolated": self.isolated,
+                    "profile_root": self.profile_root if self.isolated else None,
                     "last_stop_reason": self.acp.get("last_stop_reason"),
                     "usage": self.usage,
                 }
@@ -967,29 +1255,79 @@ class Supervisor:
             pass
 
     async def control_answer(self, command: dict) -> dict:
-        if self.permission_request is None or self.permission_future is None:
+        if not self.pending:
             return {"ok": False, "error": "no_pending_permission"}
         wanted = str(command.get("option") or "")
-        recorded = self.permission_request.get("recorded") or []
+        requested_id = command.get("tool_call_id") or command.get("toolCallId")
+        requested_id = str(requested_id) if requested_id else ""
+        if requested_id:
+            entry = self.pending.get(requested_id)
+            if entry is None:
+                return {
+                    "ok": False,
+                    "error": "unknown_pending",
+                    "pending": self.pending_ids(),
+                }
+        elif len(self.pending) > 1:
+            return {
+                "ok": False,
+                "error": "ambiguous_pending",
+                "pending": self.pending_ids(),
+            }
+        else:
+            entry = next(iter(self.pending.values()))
+        key = str(entry.get("tool_call_id"))
+        recorded = entry.get("recorded") or []
         selected = None
+        selected_option = None
         for item in recorded:
             if wanted == item.get("optionId") or wanted == str(item.get("name") or ""):
                 selected = item.get("optionId")
+                selected_option = item
                 break
         if selected is None:
             return {
                 "ok": False,
                 "error": "unknown_option",
+                "tool_call_id": key,
                 "offered": [item.get("optionId") for item in recorded],
             }
-        self.resolve_pending({"option": selected})
-        return {"ok": True, "command": "answer", "option": selected}
+
+        grant = False
+        if option_is_allow_always(selected_option):
+            once = pick_option_once(entry.get("options") or [])
+            if once is not None:
+                selected = option_id(once)
+            elif not self.isolated:
+                # A persistent agent-level grant could bypass the supervisor.
+                # The request stays pending and the Explorer must choose an
+                # allow-once option.
+                return {
+                    "ok": False,
+                    "error": "no_allow_once",
+                    "tool_call_id": key,
+                    "message": "the agent offers no allow-once option; allow-always would become a persistent grant",
+                }
+            self.remember_apply_allow(
+                entry.get("tool") or {},
+                str(entry.get("title") or ""),
+                str(entry.get("command") or ""),
+            )
+            grant = True
+        self.resolve_pending({"option": selected, "grant": grant}, key)
+        return {
+            "ok": True,
+            "command": "answer",
+            "option": selected,
+            "tool_call_id": key,
+            "grant": grant,
+        }
 
     async def shutdown_from_control(self) -> None:
         log("acp: finish requested by the control socket")
         self.stop_event.set()
         self.control_event.set()
-        self.resolve_pending({"cancel": True})
+        self.resolve_all({"cancel": True})
         if self.turn_task is not None and not self.turn_task.done() and self.session_id:
             try:
                 await self.client.notify("session/cancel", {"sessionId": self.session_id})
@@ -1007,7 +1345,7 @@ class Supervisor:
         log("acp: stop signal received")
         self.stop_event.set()
         self.control_event.set()
-        self.resolve_pending({"cancel": True})
+        self.resolve_all({"cancel": True})
         if self.proc is not None and self.proc.returncode is None:
             try:
                 self.proc.terminate()
@@ -1066,6 +1404,20 @@ class Supervisor:
             raise AcpError("command_missing", "the apply state carries no ACP command")
         argv = shlex.split(command) + ["acp"]
         env = os.environ.copy()
+        if self.isolated:
+            try:
+                build_agent_profile(self.profile_root)
+            except OSError as exc:
+                raise AcpError(
+                    "profile_failed",
+                    f"cannot create the per-apply agent profile {self.profile_root}: {exc}",
+                )
+            env["XDG_CONFIG_HOME"] = os.path.join(self.profile_root, "config")
+            env["XDG_DATA_HOME"] = os.path.join(self.profile_root, "data")
+        self.acp_set(
+            isolated=self.isolated,
+            profile_root=self.profile_root if self.isolated else None,
+        )
         try:
             self.proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -1085,12 +1437,29 @@ class Supervisor:
         self.client.on_closed = self.child_closed
         asyncio.create_task(self.client.reader_loop())
         self.stderr_task = asyncio.create_task(self.drain_stderr())
-        self.event("acp_started_child", {"command": command, "pid": self.proc.pid, "cwd": self.root})
+        self.event(
+            "acp_started_child",
+            {
+                "command": command,
+                "pid": self.proc.pid,
+                "cwd": self.root,
+                "isolated": self.isolated,
+                "profile_root": self.profile_root if self.isolated else None,
+            },
+        )
         self.transcript_append(
-            {"type": "start", "command": command, "cwd": self.root, "pid": self.proc.pid}
+            {
+                "type": "start",
+                "command": command,
+                "cwd": self.root,
+                "pid": self.proc.pid,
+                "isolated": self.isolated,
+            }
         )
 
     async def child_closed(self) -> None:
+        # No future may survive an unexpected child exit.
+        self.resolve_all({"cancel": True})
         if not self.stop_event.is_set():
             self.event("acp_exit", {"reason": "child_exit"})
             self.acp_set(error="the ACP child exited unexpectedly")
@@ -1107,6 +1476,10 @@ class Supervisor:
             error=None,
             dead_reported=False,
             pending_permission=None,
+            pending_permissions=[],
+            apply_allows=self.apply_allows,
+            isolated=self.isolated,
+            profile_root=self.profile_root if self.isolated else None,
         )
         self.set_phase("starting", "starting")
         self.heartbeat_task = asyncio.create_task(self.heartbeat())
@@ -1175,7 +1548,7 @@ class Supervisor:
         log("acp: cleanup started")
         if self.stop_event.is_set() is False:
             self.stop_event.set()
-        self.resolve_pending({"cancel": True})
+        self.resolve_all({"cancel": True})
         # Close the ACP session explicitly when one exists.
         if self.client is not None and self.session_id and not self.client.closed:
             try:
@@ -1228,14 +1601,19 @@ class Supervisor:
             except (asyncio.CancelledError, Exception):
                 pass
         self.event("acp_exit", {"reason": "closed", "stop_reason": self.acp.get("last_stop_reason")})
-        self.acp_set(phase="closed", supervisor_pid=None, pending_permission=None)
+        self.acp_set(
+            phase="closed",
+            supervisor_pid=None,
+            pending_permission=None,
+            pending_permissions=[],
+        )
         self.closed_event.set()
         log("acp: supervisor stopped")
 
 
 # ------------------------------------------------------------------ probe ---
 
-async def probe(command: str, cwd: str, model, mode, timeout: float) -> dict:
+async def probe(command: str, cwd: str, model, mode, timeout: float, profile_temp: bool = False) -> dict:
     result = {
         "status": "ok",
         "command": command,
@@ -1248,19 +1626,36 @@ async def probe(command: str, cwd: str, model, mode, timeout: float) -> dict:
     }
     argv = shlex.split(command) + ["acp"]
     stderr_tail = []
+    profile_root = None
+    env = os.environ.copy()
+    if profile_temp:
+        profile_root = tempfile.mkdtemp(prefix="boss-acp-probe-")
+        try:
+            build_agent_profile(profile_root)
+        except OSError as exc:
+            shutil.rmtree(profile_root, ignore_errors=True)
+            result.update(status="fail", message=f"cannot create the probe profile: {exc}")
+            return result
+        env["XDG_CONFIG_HOME"] = os.path.join(profile_root, "config")
+        env["XDG_DATA_HOME"] = os.path.join(profile_root, "data")
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
             cwd=cwd or None,
+            env=env,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
     except FileNotFoundError:
         result.update(status="fail", message=f"command '{argv[0]}' not found")
+        if profile_root:
+            shutil.rmtree(profile_root, ignore_errors=True)
         return result
     except OSError as exc:
         result.update(status="fail", message=f"cannot start '{argv[0]}': {exc}")
+        if profile_root:
+            shutil.rmtree(profile_root, ignore_errors=True)
         return result
     client = AcpClient(proc)
 
@@ -1345,6 +1740,8 @@ async def probe(command: str, cwd: str, model, mode, timeout: float) -> dict:
                 pass
         for task in (reader, err):
             task.cancel()
+        if profile_root:
+            shutil.rmtree(profile_root, ignore_errors=True)
     return result
 
 
@@ -1356,11 +1753,19 @@ def main() -> int:
     parser.add_argument("--model", default="")
     parser.add_argument("--mode", default="")
     parser.add_argument("--timeout", type=float, default=20.0)
+    parser.add_argument("--profile-temp", action="store_true")
     args = parser.parse_args()
 
     if args.probe:
         result = asyncio.run(
-            probe(args.probe, args.cwd, args.model or None, args.mode or None, args.timeout)
+            probe(
+                args.probe,
+                args.cwd,
+                args.model or None,
+                args.mode or None,
+                args.timeout,
+                profile_temp=args.profile_temp,
+            )
         )
         print(json.dumps(result))
         return 0 if result["status"] == "ok" else 1

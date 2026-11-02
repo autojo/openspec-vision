@@ -105,14 +105,34 @@ keystrokes to it, never read its pane for state, and do not call
 (`working`, `blocked`, `idle`), model, mode and last stop reason.
 
 Permissions follow the runner policy. `policy = "ask"` leaves an unmatched
-request pending and wakes you with `blocked`; answer it with
-`boss answer <change> <option>` (the option ids are shown by `boss status`),
-or cancel it with `boss interrupt <change>`. An applied `deny` rule rejects a
-request before the tool runs. `boss interrupt` uses `session/cancel`, never
-keys. `boss finish` closes the ACP session; `boss resume` calls
-`session/load` when the agent advertises it, and an `unresumable` result
-means use `boss retrigger` for an explicit new session. The apply prompt is
-the OpenSpec CLI workflow
+request pending and wakes you with `blocked`; every pending request is queued by
+tool-call id, so `boss status` may list several. Answer one with
+`boss answer <change> <option> --tool-call <id>` (the option ids and ids are
+shown by `boss status`), or cancel every queued request with
+`boss interrupt <change>`. With exactly one pending request the option alone is
+enough; several without an id are refused as `ambiguous_pending`. An applied
+`deny` rule rejects a request before the tool runs.
+
+An automatic allow always uses the agent's allow-once option; it never creates a
+persistent agent-level grant. If the agent offers none, the request stays
+pending and the supervisor logs why. An Explorer `allow_always` answer means
+"for this apply": the supervisor stores it in `acp.apply_allows`, sends
+allow-once to the agent for every matching request and keeps the grant for the rest of the apply.
+Nothing is written to the global agent permission store.
+
+By default the ACP child runs with a per-apply profile below
+`$BOSS_STATE_DIR/acp/` (`XDG_CONFIG_HOME` and `XDG_DATA_HOME` point at it):
+provider files are linked, `permission.yaml` is boss-owned with empty
+`always_allow` lists, and sessions are private. `boss finish` removes the
+profile; a resume reuses it. Set `isolate = false` only when you deliberately
+want the user's global profile. `boss doctor` reports the isolation state and
+the effective store, and reports `weakened` when a non-isolated global store
+always allows `shell`, `write` or `edit`.
+
+`boss interrupt` uses `session/cancel`, never keys. `boss finish` closes the ACP
+session; `boss resume` calls `session/load` when the agent advertises it, and an
+`unresumable` result means use `boss retrigger` for an explicit new session. The
+apply prompt is the OpenSpec CLI workflow
 (`openspec instructions apply --change <change> --json`), not a slash command.
 
 ### The mission loop

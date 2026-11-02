@@ -62,15 +62,15 @@ requests arrive together.
 
 Add `pick_option_once(options)` that prefers `kind == "allow_once"` (then a
 name containing "once"). Automatic decisions use it. If the agent offers no
-allow-once option, the supervisor uses `allow_always` only when the profile is
-isolated (see decision 3); otherwise it leaves the request pending and logs a
-warning, so a non-isolated runner fails closed.
+allow-once option, the request stays pending even when the profile is isolated;
+an automatic decision never sends `allow_always`. The supervisor logs why, so
+the runner fails closed.
 
 When the Explorer chooses an option whose kind is `allow_always`, the
 supervisor stores an apply-scoped grant (tool title/kind/command pattern) in
-`acp.apply_allows` and answers Goose with `allow_once`. Later matching requests
-are auto-allowed once. Nothing is written to the agent's global permission
-store. The CLI keeps the familiar `allow_always` option id; its meaning is now
+`acp.apply_allows` and answers Goose with `allow_once`. Every later matching
+request is auto-allowed for the rest of the apply. Nothing is written to the
+agent's global permission store. The CLI keeps the familiar `allow_always` option id; its meaning is now
 "for this apply".
 
 *Alternative rejected:* remove `allow_always` from the offered options. The
