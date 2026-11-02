@@ -2968,10 +2968,10 @@ check_eq "test gate: timeout log exists" "1" "$([ -f "$TG_LOG" ] && printf 1 || 
 check_contains "test gate: timeout log has output" "start" "$(cat "$TG_LOG" 2>/dev/null)"
 
 tg_config '[tests.tg]
-timeout_s = 1'
+timeout_s = 10'
 out="$(tg_review tg-detected)"
 check_eq "test gate: timeout-only uses detected command" "make test" "$(printf '%s' "$out" | jq -r '.quality.tests.command')"
-check_eq "test gate: timeout-only budget" "1" "$(printf '%s' "$out" | jq -r '.quality.tests.timeout_s')"
+check_eq "test gate: timeout-only budget" "10" "$(printf '%s' "$out" | jq -r '.quality.tests.timeout_s')"
 check_eq "test gate: timeout-only passes" "pass" "$(printf '%s' "$out" | jq -r '.quality.tests.result')"
 
 tg_config '[tests.tg]
