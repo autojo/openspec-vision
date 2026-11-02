@@ -60,8 +60,14 @@ BOSS_WAITER_SETTLE_GRACE_MS="${BOSS_WAITER_SETTLE_GRACE_MS:-5000}"
 # supervisor early.
 BOSS_ACP_START_TIMEOUT_MS="${BOSS_ACP_START_TIMEOUT_MS:-240000}"
 # A turn that does not answer within this time is recorded as 'turn_timeout'
-# instead of waking as if the turn had ended. 0 disables the timeout.
-BOSS_ACP_TURN_TIMEOUT_S="${BOSS_ACP_TURN_TIMEOUT_S:-0}"
+# instead of waking as if the turn had ended. The default is two hours: above
+# any expected command (the full suite takes about eight minutes) and below an
+# unattended hang. 0 disables the timeout explicitly.
+BOSS_ACP_TURN_TIMEOUT_S="${BOSS_ACP_TURN_TIMEOUT_S:-7200}"
+# A working turn whose transcript has made no progress for this long wakes the
+# boss once with 'stalled' and the last activity. The supervisor checks every
+# min(30 s, this value / 2). Blocked turns are excluded. 0 disables the check.
+BOSS_ACP_STALL_S="${BOSS_ACP_STALL_S:-1800}"
 # How long 'boss interrupt' waits for the agent to confirm the cancellation
 # before it records 'cancel_unconfirmed'.
 BOSS_ACP_CANCEL_TIMEOUT_S="${BOSS_ACP_CANCEL_TIMEOUT_S:-15}"
@@ -792,7 +798,7 @@ EOF
 # in 'boss doctor'.
 policy_check() {
   local runner="$1" dir="${2:-}" effective="${3:-}" kind denies mode_json
-  kind="$(printf '%s' "$runner" | jq -r '.kind // empty')"
+  kind="$(printf '%s' "$runner" | jq -r '.kind // (if (.start // "") == "acp" then "acp" else "" end)')"
   denies="$(policy_denies "$runner")"
   mode_json="$(runner_mode_of "$runner")"
 
@@ -814,11 +820,39 @@ policy_check() {
   fi
 
   if [ "$kind" = "acp" ]; then
+    local isolated store offenders first_entry
+    isolated="$(printf '%s' "$runner" | jq -r 'if type == "object" and has("isolate") then (.isolate != false) else true end')"
+    store="$(acp_permission_store_path)"
+    if [ "$isolated" = "true" ]; then
+      jq -nc --arg k "$kind" --argjson m "$mode_json" \
+        --argjson d "$(printf '%s' "$denies" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+        --arg store "$store" \
+        '{status: "enforced", kind: $k, mode: $m.permission_mode, denies: $d,
+          missing: [], source: "isolated per-apply permission store",
+          isolated: true, store: $store, always_allow: [],
+          hint: "the ACP agent runs with a boss-owned per-apply profile; its global permission store is not used"}'
+      return 0
+    fi
+    offenders="$(acp_permission_always_allow "$store" | grep -E '^(shell|write|edit)$' || true)"
+    if [ -z "$offenders" ]; then
+      jq -nc --arg k "$kind" --argjson m "$mode_json" \
+        --argjson d "$(printf '%s' "$denies" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+        --arg store "$store" \
+        '{status: "enforced", kind: $k, mode: $m.permission_mode, denies: $d,
+          missing: [], source: "global agent permission store",
+          isolated: false, store: $store, always_allow: [],
+          hint: "the agent profile is not isolated, but its permission store has no shell/write/edit always_allow entry"}'
+      return 0
+    fi
+    first_entry="$(printf '%s\n' "$offenders" | head -n 1)"
     jq -nc --arg k "$kind" --argjson m "$mode_json" \
       --argjson d "$(printf '%s' "$denies" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-      '{status: "enforced", kind: $k, mode: $m.permission_mode, denies: $d,
-        missing: [], source: "acp permission policy",
-        hint: "the ACP supervisor rejects a matching permission request before the tool runs"}'
+      --arg store "$store" --arg entry "$first_entry" \
+      --argjson allow "$(printf '%s\n' "$offenders" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+      '{status: "weakened", kind: $k, mode: $m.permission_mode, denies: $d,
+        missing: [], source: "global agent permission store",
+        isolated: false, store: $store, always_allow: $allow, entry: $entry,
+        hint: ("the global agent permission store always allows " + $entry + " at " + $store + "; remove the entry or enable the per-apply profile (isolate = true)")}'
     return 0
   fi
 
@@ -1760,6 +1794,74 @@ acp_heartbeat_for() {
   printf '%s/acp/%s.heartbeat\n' "$BOSS_STATE_DIR" "$(sha1_hex "heartbeat:$1")"
 }
 
+# acp_profile_dir_for <state-file> -- the per-apply agent profile root. The
+# supervisor derives the same path from the state path, so a resume reuses it.
+acp_profile_dir_for() {
+  printf '%s/acp/profile-%s\n' "$BOSS_STATE_DIR" "$(sha1_hex "profile:$1")"
+}
+
+# acp_remove_profile <state-file> -- remove the per-apply profile after finish.
+acp_remove_profile() {
+  local dir
+  [ -n "${1:-}" ] || return 0
+  dir="$(acp_profile_dir_for "$1")"
+  [ -n "$dir" ] || return 0
+  rm -rf "$dir" 2>/dev/null || true
+  return 0
+}
+
+# acp_permission_store_path -- the user's global Goose permission store. The
+# per-apply profile never uses it; the doctor reads it read-only.
+acp_permission_store_path() {
+  printf '%s/goose/permission.yaml\n' "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+
+# acp_permission_always_allow <store-file> -- print every always_allow entry of
+# the YAML store. A tiny line-based reader keeps the runtime free of a YAML
+# dependency; the structure boss writes and Goose reads is flat.
+acp_permission_always_allow() {
+  local file="${1:-}"
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  python3 - "$file" <<'PY'
+import re
+import sys
+
+try:
+    lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+except OSError:
+    sys.exit(0)
+
+block_indent = None
+for raw in lines:
+    line = raw.rstrip()
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        continue
+    indent = len(line) - len(line.lstrip())
+    match = re.match(r"^(\s*)always_allow\s*:\s*(.*)$", line)
+    if match:
+        block_indent = len(match.group(1))
+        rest = match.group(2).strip()
+        if rest.startswith("["):
+            for item in rest.strip("[]").split(","):
+                item = item.strip().strip("\"'")
+                if item:
+                    print(item)
+        elif rest:
+            print(rest.strip("\"'"))
+        continue
+    if block_indent is None:
+        continue
+    if re.match(r"^\s*-\s+", line):
+        item = re.sub(r"^\s*-\s+", "", line).split("#", 1)[0].strip().strip("\"'")
+        if item:
+            print(item)
+        continue
+    if indent <= block_indent:
+        block_indent = None
+PY
+}
+
 # runner_start_of <runner-json> -- the runner's transport: herdr (default) or
 # acp. Kept in the library because the waiter and doctor also read it.
 runner_start_of() {
@@ -2556,6 +2658,20 @@ test_log_file() {
   mktemp "${TMPDIR:-/tmp}/boss-$name-$label-XXXXXXXX" 2>/dev/null
 }
 
+# test_command_available <root> <command> -- whether the command's program can
+# be resolved. A detected convention command is a path ('./tests/run.sh'), so it
+# is checked against <root> where test_gate_run executes it; everything else is
+# a program name checked against PATH. A command that cannot be found is not a
+# red test and must be reported as not_run.
+test_command_available() {
+  local root="$1" prog="${2%% *}"
+  case "$prog" in
+    ""|/*) [ -n "$prog" ] && [ -x "$prog" ] ;;
+    ./*|../*) [ -x "$root/$prog" ] ;;
+    *) command -v "$prog" >/dev/null 2>&1 ;;
+  esac
+}
+
 # test_gate_run <root> <command> <timeout-seconds> <log-file> -- run the
 # project's test command in <root>, capture both streams to <log-file>, and
 # print pass, fail or timeout.
@@ -2655,6 +2771,31 @@ acp_supervisor_alive() {
   local pid
   pid="$(acp_supervisor_pid "$1")"
   acp_pid_alive "$pid"
+}
+
+# effective_waiter_pid <state-file> -- the pid whose liveness says whether the
+# apply is watched: the ACP supervisor for an ACP apply, else waiter_pid. One
+# rule for the per-apply and the aggregate status view.
+effective_waiter_pid() {
+  local f="$1" pid
+  if acp_is_acp "$f"; then
+    pid="$(acp_supervisor_pid "$f")"
+    if [ -n "$pid" ]; then
+      printf '%s' "$pid"
+      return 0
+    fi
+  fi
+  jq -r '.waiter_pid // empty' "$f" 2>/dev/null || true
+}
+
+# effective_waiter_alive <state-file> -- 0 when the effective waiter lives.
+effective_waiter_alive() {
+  local f="$1"
+  if acp_is_acp "$f"; then
+    acp_supervisor_alive "$f"
+  else
+    waiter_alive "$(effective_waiter_pid "$f")"
+  fi
 }
 
 # acp_is_acp <state-file> -- 0 for an ACP apply (old state files are native).

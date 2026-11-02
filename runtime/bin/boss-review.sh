@@ -180,6 +180,17 @@ detect_test_command() {
     printf 'make test'
     return 0
   fi
+  # Repository conventions come after the manifest-based checks so a project
+  # that declares its suite keeps that declaration. The command runs from the
+  # project root, so the relative path stays correct.
+  if [ -f "$project/tests/run.sh" ] && [ -x "$project/tests/run.sh" ]; then
+    printf './tests/run.sh'
+    return 0
+  fi
+  if [ -f "$project/scripts/test.sh" ] && [ -x "$project/scripts/test.sh" ]; then
+    printf './scripts/test.sh'
+    return 0
+  fi
   return 0
 }
 
@@ -301,8 +312,8 @@ cmd_review() {
   [ -n "$test_cmd" ] || test_cmd="$(detect_test_command "$review_root")"
   # A command whose program is not installed did not run and must not read as
   # a red test: drop it and report not_run instead.
-  if [ -n "$test_cmd" ] && ! command -v "${test_cmd%% *}" >/dev/null 2>&1; then
-    log "test command '$test_cmd' not found in PATH; reporting not_run"
+  if [ -n "$test_cmd" ] && ! test_command_available "$review_root" "$test_cmd"; then
+    log "test command '$test_cmd' not found; reporting not_run"
     test_cmd=""
   fi
   test_timeout="$(config_test_timeout "$project")"

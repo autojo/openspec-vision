@@ -58,6 +58,11 @@ check_not_contains() {
   esac
 }
 
+# file_mode <path> -- permission bits as an octal string, on Linux and BSD/macOS.
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || printf 'unknown'
+}
+
 # --------------------------------------------------------------- stubs ---
 
 cat >"$BIN/openspec" <<'EOF'
@@ -362,20 +367,35 @@ def emit_updates():
     note("usage_update", {"usage": {"inputTokens": 3, "outputTokens": 5}})
 
 
-def ask_permission(command, title):
-    out({"jsonrpc": "2.0", "id": 9000, "method": "session/request_permission",
+def ask_permission(command, title, tool_id="tc1", req_id=9000, options=None):
+    if options is None:
+        options = [
+            {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+            {"optionId": "allow_always", "name": "Always allow", "kind": "allow_always"},
+            {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
+        ]
+    out({"jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
          "params": {"sessionId": SESSION,
-                    "toolCall": {"toolCallId": "tc1", "title": title, "kind": "other",
+                    "toolCall": {"toolCallId": tool_id, "title": title, "kind": "other",
                                  "rawInput": {"command": command}},
-                    "options": [
-                        {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
-                        {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
-                    ]}})
+                    "options": options}})
+
+
+def log_option(req_id, msg):
+    path = os.environ.get("FAKE_ACP_OPTION_LOG")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"id": req_id, "response": msg}) + "\n")
+    except OSError:
+        pass
 
 
 def main():
     prompt = None
     prompt_kind = None
+    pending = set()
     for line in sys.stdin:
         if not line.strip():
             continue
@@ -388,22 +408,25 @@ def main():
         params = msg.get("params") or {}
 
         if req_id is not None and ("result" in msg or "error" in msg):
-            if req_id != 9000 or prompt is None:
+            log_option(req_id, msg)
+            if req_id not in pending or prompt is None:
                 continue
+            pending.discard(req_id)
             kind = prompt_kind
-            prompt_kind = None
             if kind == "deny":
                 note("agent_message_chunk", {"messageId": "m2",
                                               "content": {"type": "text", "text": "denied"}})
                 result(prompt, {"stopReason": "end_turn", "usage": {"inputTokens": 1}})
                 prompt = None
+                prompt_kind = None
             elif kind == "cancel_tool":
                 note("tool_call_update", {"toolCallId": "tc1", "status": "in_progress"})
-            else:
+            elif not pending:
                 note("agent_message_chunk", {"messageId": "m3",
                                               "content": {"type": "text", "text": "answered"}})
                 result(prompt, {"stopReason": "end_turn", "usage": {"inputTokens": 2}})
                 prompt = None
+                prompt_kind = None
             continue
 
         if method == "initialize":
@@ -452,23 +475,87 @@ def main():
         elif method == "session/prompt":
             prompt = req_id
             prompt_kind = MODE
+            pending.clear()
+            if MODE == "stream":
+                # One message streamed in chunks, then a whitespace-only chunk
+                # (another message id) and a usage update: last_update must
+                # describe the message, not the last token.
+                for chunk in ("Refactor the", " status JSON", " now."):
+                    note("agent_message_chunk", {"messageId": "m1",
+                                                 "content": {"type": "text", "text": chunk}})
+                note("agent_message_chunk", {"messageId": "m2",
+                                             "content": {"type": "text", "text": "  \n "}})
+                note("usage_update", {"usage": {"inputTokens": 7, "outputTokens": 9}})
+                result(req_id, {"stopReason": "end_turn", "usage": {"inputTokens": 7}})
+                prompt = None
+                prompt_kind = None
+                continue
             emit_updates()
-            if MODE in ("cancel", "cancel_unconfirmed", "slow"):
+            if MODE == "progress":
+                # A tool call that runs longer than a short stall interval but
+                # keeps emitting updates: progress, not a stall.
+                import threading
+                import time as _time
+
+                def progress_ticker():
+                    for _ in range(6):
+                        _time.sleep(0.4)
+                        note("tool_call_update", {"toolCallId": "tc1", "title": "shell",
+                                                  "status": "in_progress"})
+                    _time.sleep(0.2)
+                    note("agent_message_chunk", {"messageId": "m6",
+                                                 "content": {"type": "text",
+                                                             "text": "done"}})
+                    result(req_id, {"stopReason": "end_turn", "usage": {"inputTokens": 4}})
+
+                threading.Thread(target=progress_ticker, daemon=True).start()
+            elif MODE == "stall_resume":
+                # Silence past the stall interval, then new activity clears it.
+                import threading
+                import time as _time
+
+                def resume_ticker():
+                    _time.sleep(3.0)
+                    note("agent_message_chunk", {"messageId": "m5",
+                                                 "content": {"type": "text",
+                                                             "text": "back again"}})
+                    _time.sleep(0.2)
+                    result(req_id, {"stopReason": "end_turn", "usage": {"inputTokens": 5}})
+
+                threading.Thread(target=resume_ticker, daemon=True).start()
+            elif MODE in ("cancel", "cancel_unconfirmed", "slow"):
                 pass
+            elif MODE == "ask_two":
+                ask_permission("alpha", "first", tool_id="tc-a", req_id=9100)
+                pending.add(9100)
+                ask_permission("beta", "second", tool_id="tc-b", req_id=9101)
+                pending.add(9101)
+            elif MODE == "ask_no_once":
+                ask_permission("alpha", "first", req_id=9100, options=[
+                    {"optionId": "allow_always", "name": "Always allow", "kind": "allow_always"},
+                    {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
+                ])
+                pending.add(9100)
             elif MODE == "ask":
                 ask_permission("deploy production", "deploy")
+                pending.add(9000)
             elif MODE == "deny":
                 ask_permission("git push --force origin main", "shell")
+                pending.add(9000)
             elif MODE == "cancel_tool":
                 ask_permission("sleep 60", "shell")
+                pending.add(9000)
             else:
                 ask_permission("ls -la", "shell")
+                pending.add(9000)
         elif method == "session/cancel":
             if prompt is not None and MODE in ("cancel", "cancel_tool"):
                 note("agent_message_chunk", {"messageId": "m4",
                                               "content": {"type": "text", "text": "cancelled"}})
                 result(prompt, {"stopReason": "cancelled"})
                 prompt = None
+                prompt_kind = None
+                pending.clear()
         elif method is not None and req_id is not None:
             result(req_id, {})
     return 0
@@ -3007,6 +3094,66 @@ timeout_s = $tg_bad"
   check_contains "test gate: invalid budget names project $tg_bad" "$P_TG" "$err"
 done
 
+# 65a.1 Detection knows the repository conventions, and the manifest checks keep
+# precedence over them. Each case is its own project so nothing is added after a
+# review has seen it.
+td_detect() {
+  local project="$1" change="$2" name="$3" state="$4"
+  printf 'default = "opencode"\n[projects]\n%s = "%s"\n[tests.%s]\ntimeout_s = 30\n[runners.opencode]\nkind = "opencode"\nargs = []\napply = "/opsx-apply {change}"\n' \
+    "$name" "$project" "$name" >"$TMP/test-detect-$name.toml"
+  BOSS_CONFIG="$TMP/test-detect-$name.toml" run_boss_state "$state" review "$change" --project "$project" --json
+}
+
+TDST="$TMP/test-detect-state"
+P_TDR="$TMP/project-test-detect-runsh"
+make_git_project "$P_TDR"
+mkdir -p "$P_TDR/tests"
+printf '#!/bin/sh\nprintf "suite ok\\n"\n' >"$P_TDR/tests/run.sh"
+chmod +x "$P_TDR/tests/run.sh"
+git -C "$P_TDR" add tests/run.sh; git -C "$P_TDR" commit -qm "convention suite"
+make_change "$P_TDR" td-runsh '- [ ] 1.1 Code.'
+make_review_state "$TDST" "$P_TDR" td-runsh
+out="$(td_detect "$P_TDR" td-runsh tdr "$TDST")"
+check_eq "test detect: tests/run.sh" "./tests/run.sh" "$(printf '%s' "$out" | jq -r '.quality.tests.command')"
+check_eq "test detect: tests/run.sh passes" "pass" "$(printf '%s' "$out" | jq -r '.quality.tests.result')"
+
+P_TDM="$TMP/project-test-detect-manifest"
+make_git_project "$P_TDM"
+mkdir -p "$P_TDM/tests"
+printf '#!/bin/sh\nprintf "convention suite\\n"\n' >"$P_TDM/tests/run.sh"
+chmod +x "$P_TDM/tests/run.sh"
+printf 'test:\n\t@printf "manifest suite\\n"\n' >"$P_TDM/Makefile"
+git -C "$P_TDM" add tests/run.sh Makefile; git -C "$P_TDM" commit -qm "manifest and convention suite"
+make_change "$P_TDM" td-manifest '- [ ] 1.1 Code.'
+make_review_state "$TDST" "$P_TDM" td-manifest
+out="$(td_detect "$P_TDM" td-manifest tdm "$TDST")"
+check_eq "test detect: manifest wins over tests/run.sh" "make test" "$(printf '%s' "$out" | jq -r '.quality.tests.command')"
+
+P_TDS="$TMP/project-test-detect-script"
+make_git_project "$P_TDS"
+mkdir -p "$P_TDS/scripts"
+printf '#!/bin/sh\nprintf "script suite\\n"\n' >"$P_TDS/scripts/test.sh"
+chmod +x "$P_TDS/scripts/test.sh"
+git -C "$P_TDS" add scripts/test.sh; git -C "$P_TDS" commit -qm "script suite"
+make_change "$P_TDS" td-script '- [ ] 1.1 Code.'
+make_review_state "$TDST" "$P_TDS" td-script
+out="$(td_detect "$P_TDS" td-script tds "$TDST")"
+check_eq "test detect: scripts/test.sh" "./scripts/test.sh" "$(printf '%s' "$out" | jq -r '.quality.tests.command')"
+check_eq "test detect: scripts/test.sh passes" "pass" "$(printf '%s' "$out" | jq -r '.quality.tests.result')"
+
+P_TDN="$TMP/project-test-detect-nonexec"
+make_git_project "$P_TDN"
+mkdir -p "$P_TDN/tests"
+printf '#!/bin/sh\nprintf "not a suite\\n"\n' >"$P_TDN/tests/run.sh"
+chmod -x "$P_TDN/tests/run.sh"
+git -C "$P_TDN" add tests/run.sh; git -C "$P_TDN" commit -qm "non-executable suite"
+make_change "$P_TDN" td-nonexec '- [ ] 1.1 Code.'
+make_review_state "$TDST" "$P_TDN" td-nonexec
+out="$(td_detect "$P_TDN" td-nonexec tdn "$TDST")"
+check_eq "test detect: non-executable tests/run.sh is not a suite" "null" \
+  "$(printf '%s' "$out" | jq -r '.quality.tests.command')"
+check_eq "test detect: non-executable suite is not_run" "not_run" "$(printf '%s' "$out" | jq -r '.quality.tests.result')"
+
 # 65b. Output capture: a bounded tail and an empty-output command.
 TG_TAIL_LOG="$TMP/test-gate-tail.log"
 awk 'BEGIN { for (i = 1; i <= 100; i++) print i }' >"$TG_TAIL_LOG"
@@ -3768,6 +3915,20 @@ fi
 # network is involved. Each scenario uses its own state root so a forgotten
 # supervisor cannot consume another scenario's slot.
 
+# A minimal user Goose profile: the per-apply profile links these read-through,
+# while its permission store stays boss-owned. Both XDG roots are pinned here:
+# a suite started from inside an ACP apply inherits that apply's profile roots
+# and would otherwise link the profile into itself.
+export XDG_CONFIG_HOME="$TMP/.config"
+export XDG_DATA_HOME="$TMP/.local/share"
+mkdir -p "$TMP/.config/goose" "$TMP/.local/share/goose/apps"
+printf 'provider: fake\n' >"$TMP/.config/goose/config.yaml"
+printf 'secret: fake\n' >"$TMP/.config/goose/secrets.yaml"
+printf 'user:\n  always_allow: []\n  never_allow: []\n' >"$TMP/.config/goose/permission.yaml"
+: >"$TMP/.config/goose/permission.yaml.lock"
+GLOBAL_PERMISSION="$TMP/.config/goose/permission.yaml"
+GLOBAL_PERMISSION_CONTENT="$(cat "$GLOBAL_PERMISSION")"
+
 AP="$TMP/acp-project"
 make_project "$AP"
 ACP_CONF="$TMP/acp-boss.toml"
@@ -3827,6 +3988,8 @@ check_contains "acp transcript: message update" "Hello from fake" "$(cat "$TR1")
 check_contains "acp transcript: tool update" '"type":"tool_call"' "$(cat "$TR1")"
 check_contains "acp transcript: usage update" '"type":"usage"' "$(cat "$TR1")"
 check_contains "acp transcript: stop reason" '"stop_reason":"end_turn"' "$(cat "$TR1")"
+check_eq "acp transcript: private mode" "600" "$(file_mode "$TR1")"
+check_eq "acp supervisor log: private mode" "600" "$(file_mode "$AS1/logs/acp-allow-acp.log")"
 EV1="$(acp_events_file "$AS1" "$AP" acp-allow)"
 acp_wait_event "$EV1" wake || bad "acp dispatch: no wake event"
 check_eq "acp dispatch: acp_started event" "1" "$(acp_count "$EV1" acp_started)"
@@ -3836,8 +3999,29 @@ check_eq "acp permission: allowed" "1" \
 check_contains "acp tab: transcript tail" "tail -n +1 -f" "$(cat "$PANE_RUN_LOG")"
 check_eq "acp init: no fs capability" "none" "$(jq -r '.clientCapabilities.fs // "none"' "$ACP_INIT_LOG")"
 check_eq "acp init: no terminal capability" "none" "$(jq -r '.clientCapabilities.terminal // "none"' "$ACP_INIT_LOG")"
+
+# The apply runs from a per-apply profile. Provider files are links, the
+# permission store is boss-owned, and the user's global store is untouched.
+P1="$(jq -r '.acp.profile_root' "$S1")"
+check_eq "acp profile: recorded" "true" "$([ -n "$P1" ] && [ -d "$P1" ] && echo true || echo false)"
+check_eq "acp profile: config link" "$TMP/.config/goose/config.yaml" \
+  "$(readlink "$P1/config/goose/config.yaml" 2>/dev/null || true)"
+check_eq "acp profile: secrets link" "$TMP/.config/goose/secrets.yaml" \
+  "$(readlink "$P1/config/goose/secrets.yaml" 2>/dev/null || true)"
+check_eq "acp profile: apps link" "$TMP/.local/share/goose/apps" \
+  "$(readlink "$P1/data/goose/apps" 2>/dev/null || true)"
+check_eq "acp profile: private sessions" "true" \
+  "$([ -d "$P1/data/goose/sessions" ] && [ ! -L "$P1/data/goose/sessions" ] && echo true || echo false)"
+check_eq "acp profile: permission is not a link" "true" \
+  "$([ -f "$P1/config/goose/permission.yaml" ] && [ ! -L "$P1/config/goose/permission.yaml" ] && echo true || echo false)"
+check_contains "acp profile: empty always_allow" "always_allow: []" "$(cat "$P1/config/goose/permission.yaml")"
+check_contains "acp profile: shell asks first" "- shell" "$(cat "$P1/config/goose/permission.yaml")"
+check_eq "acp profile: lock file not linked" "true" \
+  "$([ ! -e "$P1/config/goose/permission.yaml.lock" ] && echo true || echo false)"
+check_eq "acp profile: global store unchanged" "$GLOBAL_PERMISSION_CONTENT" "$(cat "$GLOBAL_PERMISSION")"
 acp_boss "$AS1" finish acp-allow --project acp-test >/dev/null 2>&1
 if [ -f "$S1" ]; then bad "acp finish: state file left behind"; else ok; fi
+if [ -d "$P1" ]; then bad "acp finish: profile left behind"; else ok; fi
 
 # 60b. A retrigger sends a second prompt through the control socket.
 make_change "$AP" acp-retrigger '- [ ] 1.1 Do the work.'
@@ -3846,6 +4030,8 @@ SR="$(acp_state "$ASR" "$AP" acp-retrigger)"
 EVR="$(acp_events_file "$ASR" "$AP" acp-retrigger)"
 FAKE_ACP_MODE=allow acp_boss "$ASR" dispatch acp-retrigger --project acp-test --runner goose >/dev/null
 acp_wait_stop "$SR" || bad "acp retrigger: first turn did not finish"
+TRR="$(jq -r '.acp.transcript' "$SR")"
+chmod 666 "$TRR"
 out="$(acp_boss "$ASR" retrigger acp-retrigger --project acp-test --note "Do another pass.")"
 check_eq "acp retrigger: status" "retriggered" "$(printf '%s' "$out" | jq -r '.status')"
 i=0
@@ -3856,6 +4042,7 @@ while [ "$i" -lt 100 ]; do
 done
 check_eq "acp retrigger: second prompt" "2" "$(acp_count "$EVR" acp_prompt)"
 check_eq "acp retrigger: second stop" "2" "$(acp_count "$EVR" acp_stop)"
+check_eq "acp transcript: world-readable file is corrected" "600" "$(file_mode "$TRR")"
 acp_boss "$ASR" finish acp-retrigger --project acp-test >/dev/null 2>&1
 
 # 61. Config validation and a failed handshake leave no apply behind.
@@ -3982,6 +4169,207 @@ check_eq "acp blocked interrupt: answered cancelled" "1" \
 acp_wait_phase "$S5" idle || true
 acp_boss "$AS5" finish acp-blocked-interrupt --project acp-test >/dev/null 2>&1
 
+# 64a. Concurrent permission requests: both are pending, the answer names one
+# tool call, and an ambiguous answer is refused with the pending ids.
+make_change "$AP" acp-queue '- [ ] 1.1 Do the work.'
+ASQ="$TMP/acp-state-queue"; mkdir -p "$ASQ"
+SQ="$(acp_state "$ASQ" "$AP" acp-queue)"
+EVQ="$(acp_events_file "$ASQ" "$AP" acp-queue)"
+FAKE_ACP_MODE=ask_two acp_boss "$ASQ" dispatch acp-queue --project acp-test --runner goose-ask >/dev/null
+if acp_wait_phase "$SQ" blocked; then ok; else bad "acp queue: never blocked"; fi
+out="$(acp_boss "$ASQ" status acp-queue --project acp-test --json 2>/dev/null)"
+check_eq "acp queue: two pending" "2" "$(printf '%s' "$out" | jq -r '.pending_permissions | length')"
+check_eq "acp queue: first id" "tc-a" "$(printf '%s' "$out" | jq -r '.pending_permissions[0].tool_call_id')"
+check_eq "acp queue: second id" "tc-b" "$(printf '%s' "$out" | jq -r '.pending_permissions[1].tool_call_id')"
+check_eq "acp queue: alias is first" "tc-a" "$(printf '%s' "$out" | jq -r '.pending_permission.tool_call_id')"
+check_contains "acp queue: dialog lists both" "tc-b" "$(printf '%s' "$out" | jq -r '.blocked_dialog')"
+check_contains "acp queue: dialog names command" "beta" "$(printf '%s' "$out" | jq -r '.blocked_dialog')"
+check_contains "acp queue: dialog names options" "allow_once" "$(printf '%s' "$out" | jq -r '.blocked_dialog')"
+err="$(acp_boss_fail "$ASQ" answer acp-queue allow_once --project acp-test)"
+check_contains "acp queue: ambiguous refused" "ambiguous_pending" "$err"
+check_contains "acp queue: ambiguous names ids" "tc-a" "$err"
+check_contains "acp queue: ambiguous names second" "tc-b" "$err"
+out="$(acp_boss "$ASQ" answer acp-queue allow_once --tool-call tc-b --project acp-test)"
+check_eq "acp queue: answer by id" "tc-b" "$(printf '%s' "$out" | jq -r '.tool_call_id')"
+i=0
+while [ "$i" -lt 50 ]; do
+  [ "$(jq -r '.acp.pending_permissions | length' "$SQ")" = "1" ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
+check_eq "acp queue: one remains" "1" "$(jq -r '.acp.pending_permissions | length' "$SQ")"
+check_eq "acp queue: remaining id" "tc-a" "$(jq -r '.acp.pending_permissions[0].tool_call_id' "$SQ")"
+check_eq "acp queue: still blocked" "blocked" "$(jq -r '.acp.phase' "$SQ")"
+out="$(acp_boss "$ASQ" answer acp-queue allow_once tc-a --project acp-test)"
+check_eq "acp queue: option and id positionally" "tc-a" "$(printf '%s' "$out" | jq -r '.tool_call_id')"
+acp_wait_phase "$SQ" idle || bad "acp queue: did not return to idle"
+check_eq "acp queue: queue empty" "0" "$(jq -r '.acp.pending_permissions | length' "$SQ")"
+TRQ="$(jq -r '.acp.transcript' "$SQ")"
+check_contains "acp transcript: permission ids" '"tool_call_id":"tc-a"' "$(cat "$TRQ")"
+check_contains "acp transcript: permission request id" '"request_id":9100' "$(cat "$TRQ")"
+check_contains "acp transcript: answered ids" '"type":"permission_answered"' "$(cat "$TRQ")"
+check_contains "acp event: permission request id" '"request_id":9100' "$(cat "$EVQ")"
+check_contains "acp event: answered request id" '"event":"acp_permission_answered"' "$(cat "$EVQ")"
+acp_boss "$ASQ" finish acp-queue --project acp-test >/dev/null 2>&1
+
+# 64b. Interrupt cancels every queued request.
+make_change "$AP" acp-cancel-all '- [ ] 1.1 Do the work.'
+ASC="$TMP/acp-state-cancel-all"; mkdir -p "$ASC"
+SC="$(acp_state "$ASC" "$AP" acp-cancel-all)"
+EVC="$(acp_events_file "$ASC" "$AP" acp-cancel-all)"
+FAKE_ACP_MODE=ask_two acp_boss "$ASC" dispatch acp-cancel-all --project acp-test --runner goose-ask >/dev/null
+if acp_wait_phase "$SC" blocked; then ok; else bad "acp cancel-all: never blocked"; fi
+out="$(acp_boss "$ASC" interrupt acp-cancel-all --project acp-test)"
+check_eq "acp cancel-all: status" "cancelled" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp cancel-all: both cancelled" "2" \
+  "$(jq -Rrc 'select(length > 0) | (fromjson? | select(type=="object")) | select(.event=="acp_permission_answered" and .decision=="cancelled")' "$EVC" | wc -l | tr -d ' ')"
+check_eq "acp cancel-all: queue empty" "0" "$(jq -r '.acp.pending_permissions | length' "$SC")"
+acp_wait_phase "$SC" idle || true
+acp_boss "$ASC" finish acp-cancel-all --project acp-test >/dev/null 2>&1
+
+# 64c. Finish with queued requests closes the supervisor and leaves nothing
+# unresolved.
+make_change "$AP" acp-shutdown-pending '- [ ] 1.1 Do the work.'
+ASS="$TMP/acp-state-shutdown-pending"; mkdir -p "$ASS"
+SS="$(acp_state "$ASS" "$AP" acp-shutdown-pending)"
+FAKE_ACP_MODE=ask_two acp_boss "$ASS" dispatch acp-shutdown-pending --project acp-test --runner goose-ask >/dev/null
+if acp_wait_phase "$SS" blocked; then ok; else bad "acp shutdown: never blocked"; fi
+SPID="$(jq -r '.acp.supervisor_pid // empty' "$SS")"
+out="$(acp_boss "$ASS" finish acp-shutdown-pending --project acp-test --force)"
+check_eq "acp shutdown: finish with pending" "finished" "$(printf '%s' "$out" | jq -r '.status')"
+if [ -f "$SS" ]; then bad "acp shutdown: state left behind"; else ok; fi
+if [ -n "$SPID" ] && kill -0 "$SPID" 2>/dev/null; then
+  bad "acp shutdown: supervisor still alive"
+else
+  ok
+fi
+
+# 64d. Automatic allow always selects allow_once; allow-always stays inside
+# the apply and is sent to the agent as allow_once.
+OPTLOG="$TMP/acp-options.log"; : >"$OPTLOG"
+make_change "$AP" acp-allow-once '- [ ] 1.1 Do the work.'
+ASO="$TMP/acp-state-allow-once"; mkdir -p "$ASO"
+SO="$(acp_state "$ASO" "$AP" acp-allow-once)"
+FAKE_ACP_MODE=allow FAKE_ACP_OPTION_LOG="$OPTLOG" \
+  acp_boss "$ASO" dispatch acp-allow-once --project acp-test --runner goose >/dev/null
+acp_wait_stop "$SO" || bad "acp allow once: no stop reason"
+check_eq "acp allow once: automatic option" "allow_once" \
+  "$(jq -sr '[.[] | select(.id == 9000)][-1].response.result.outcome.optionId' "$OPTLOG")"
+acp_boss "$ASO" finish acp-allow-once --project acp-test >/dev/null 2>&1
+
+: >"$OPTLOG"
+make_change "$AP" acp-apply-allow '- [ ] 1.1 Do the work.'
+ASA="$TMP/acp-state-apply-allow"; mkdir -p "$ASA"
+SA="$(acp_state "$ASA" "$AP" acp-apply-allow)"
+EVA="$(acp_events_file "$ASA" "$AP" acp-apply-allow)"
+FAKE_ACP_MODE=ask FAKE_ACP_OPTION_LOG="$OPTLOG" \
+  acp_boss "$ASA" dispatch acp-apply-allow --project acp-test --runner goose-ask >/dev/null
+if acp_wait_phase "$SA" blocked; then ok; else bad "acp apply allow: never blocked"; fi
+out="$(acp_boss "$ASA" answer acp-apply-allow allow_always --project acp-test)"
+check_eq "acp apply allow: grant recorded" "true" "$(printf '%s' "$out" | jq -r '.grant')"
+check_eq "acp apply allow: stored" "1" "$(jq -r '.acp.apply_allows | length' "$SA")"
+check_eq "acp apply allow: sent once" "allow_once" \
+  "$(jq -sr '[.[] | select(.id == 9000)][-1].response.result.outcome.optionId' "$OPTLOG")"
+check_eq "acp apply allow: global untouched" "$GLOBAL_PERMISSION_CONTENT" "$(cat "$GLOBAL_PERMISSION")"
+acp_wait_phase "$SA" idle || bad "acp apply allow: did not finish the turn"
+out="$(acp_boss "$ASA" retrigger acp-apply-allow --project acp-test)"
+check_eq "acp apply allow: retrigger" "retriggered" "$(printf '%s' "$out" | jq -r '.status')"
+i=0
+while [ "$i" -lt 100 ]; do
+  [ "$(acp_count "$EVA" acp_stop)" -ge 2 ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
+check_eq "acp apply allow: grant persists" "1" "$(jq -r '.acp.apply_allows | length' "$SA")"
+check_eq "acp apply allow: auto allow event" "1" \
+  "$(jq -Rrc 'select(length > 0) | (fromjson? | select(type=="object")) | select(.event=="acp_permission" and .decision=="allow" and .apply_allow==true)' "$EVA" | wc -l | tr -d ' ')"
+out="$(acp_boss "$ASA" retrigger acp-apply-allow --project acp-test)"
+check_eq "acp apply allow: second retrigger" "retriggered" "$(printf '%s' "$out" | jq -r '.status')"
+i=0
+while [ "$i" -lt 100 ]; do
+  [ "$(acp_count "$EVA" acp_stop)" -ge 3 ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
+check_eq "acp apply allow: grant still persists" "1" "$(jq -r '.acp.apply_allows | length' "$SA")"
+check_eq "acp apply allow: second auto allow event" "2" \
+  "$(jq -Rrc 'select(length > 0) | (fromjson? | select(type=="object")) | select(.event=="acp_permission" and .decision=="allow" and .apply_allow==true)' "$EVA" | wc -l | tr -d ' ')"
+check_eq "acp apply allow: second sent once" "allow_once" \
+  "$(jq -sr '[.[] | select(.id == 9000)][-1].response.result.outcome.optionId' "$OPTLOG")"
+acp_boss "$ASA" finish acp-apply-allow --project acp-test >/dev/null 2>&1
+
+# 64e. Without an allow-once option an automatic allow fails closed; an
+# Explorer allow-always is refused on a non-isolated runner.
+cat >>"$ACP_CONF" <<'EOF'
+
+[runners.goose-noiso]
+start = "acp"
+command = "fake-goose"
+model = "model-a"
+mode = "smart_approve"
+policy = "allow"
+isolate = false
+EOF
+make_change "$AP" acp-no-once '- [ ] 1.1 Do the work.'
+ASN="$TMP/acp-state-no-once"; mkdir -p "$ASN"
+SN="$(acp_state "$ASN" "$AP" acp-no-once)"
+FAKE_ACP_MODE=ask_no_once acp_boss "$ASN" dispatch acp-no-once --project acp-test --runner goose-noiso >/dev/null
+if acp_wait_phase "$SN" blocked; then ok; else bad "acp no once: did not fail closed"; fi
+err="$(acp_boss_fail "$ASN" answer acp-no-once allow_always --project acp-test)"
+check_contains "acp no once: allow-always refused" "no_allow_once" "$err"
+acp_boss "$ASN" interrupt acp-no-once --project acp-test >/dev/null 2>&1
+acp_boss "$ASN" finish acp-no-once --project acp-test --force >/dev/null 2>&1
+
+# 64f. Isolation and the permission store are visible in the doctor; the probe
+# leaves no session behind.
+DAS="$TMP/acp-doctor-state"; mkdir -p "$DAS"
+DTMP="$TMP/acp-doctor-tmp"; mkdir -p "$DTMP"
+out="$(TMPDIR="$DTMP" HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$ACP_CONF" \
+  run_boss_state "$DAS" doctor --project acp-test --json 2>/dev/null)"
+check_eq "acp doctor: isolated policy" "ok" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .status')"
+check_contains "acp doctor: isolation reported" "isolated: true" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .hint')"
+check_contains "acp doctor: store reported" "per-apply profile" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .hint')"
+if [ -z "$(ls -A "$DTMP" 2>/dev/null)" ]; then ok; else bad "acp doctor: probe left temporary state"; fi
+
+# 64g. A global always_allow for shell weakens a non-isolated runner.
+WCONF="$TMP/acp-weakened.toml"
+cat >"$WCONF" <<EOF
+default = "goose"
+
+[projects]
+acp-test = "$AP"
+
+[runners.goose]
+start = "acp"
+command = "fake-goose"
+model = "model-a"
+mode = "smart_approve"
+policy = "allow"
+isolate = false
+
+[missions]
+EOF
+printf 'user:\n  always_allow:\n    - shell\n  never_allow: []\n' >"$GLOBAL_PERMISSION"
+out="$(XDG_CONFIG_HOME="$TMP/.config" run_lib policy_check \
+  '{"name":"goose","kind":"acp","isolate":false,"deny":["git push --force*"]}' "$AP")"
+check_eq "acp policy: weakened" "weakened" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp policy: names the entry" "shell" "$(printf '%s' "$out" | jq -r '.entry')"
+out="$(TMPDIR="$DTMP" HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$WCONF" \
+  run_boss_state "$DAS" doctor --project acp-test --json 2>/dev/null)"
+check_eq "acp doctor: policy warn" "warn" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="policy") | .status')"
+check_contains "acp doctor: policy names shell" "shell" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="policy") | .hint')"
+check_eq "acp doctor: runner policy warn" "warn" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .status')"
+check_contains "acp doctor: runner policy names shell" "shell" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .hint')"
+printf '%s\n' "$GLOBAL_PERMISSION_CONTENT" >"$GLOBAL_PERMISSION"
+out="$(XDG_CONFIG_HOME="$TMP/.config" run_lib policy_check \
+  '{"name":"goose","kind":"acp","isolate":false,"deny":["git push --force*"]}' "$AP")"
+check_eq "acp policy: clean store enforced" "enforced" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp policy: clean store flag" "false" "$(printf '%s' "$out" | jq -r '.isolated')"
+out="$(XDG_CONFIG_HOME="$TMP/.config" run_lib policy_check \
+  '{"name":"goose","kind":"acp","isolate":true,"deny":["git push --force*"]}' "$AP")"
+check_eq "acp policy: isolated enforced" "enforced" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp policy: isolated flag" "true" "$(printf '%s' "$out" | jq -r '.isolated')"
+
 # 65. Cancel during generation, during a tool call, and a timeout.
 make_change "$AP" acp-cancel '- [ ] 1.1 Do the work.'
 AS6="$TMP/acp-state-6"; mkdir -p "$AS6"
@@ -4019,10 +4407,13 @@ AS9="$TMP/acp-state-9"; mkdir -p "$AS9"
 S9="$(acp_state "$AS9" "$AP" acp-resume)"
 FAKE_ACP_MODE=allow acp_boss "$AS9" dispatch acp-resume --project acp-test --runner goose >/dev/null
 acp_wait_stop "$S9" || bad "acp resume: first turn did not finish"
+P9="$(jq -r '.acp.profile_root // empty' "$S9")"
 kill_acp_supervisor "$S9"
 sleep 0.3
 out="$(FAKE_ACP_MODE=load acp_boss "$AS9" resume acp-resume --project acp-test)"
 check_eq "acp resume: status" "resumed" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp resume: same profile" "$P9" "$(jq -r '.acp.profile_root // empty' "$S9")"
+check_eq "acp resume: profile survives" "true" "$([ -n "$P9" ] && [ -d "$P9" ] && echo true || echo false)"
 check_eq "acp resume: load event" "1" "$(acp_count "$(acp_events_file "$AS9" "$AP" acp-resume)" acp_load)"
 TR9="$(jq -r '.acp.transcript' "$S9")"
 check_contains "acp resume: boundary" '"reason":"session_load"' "$(cat "$TR9")"
@@ -4179,6 +4570,173 @@ if [ -n "$E2E_SOCKET" ] && [ -S "$E2E_SOCKET" ]; then bad "acp e2e: socket after
 # No ACP interrupt may send keystrokes: only the display tail is ever typed.
 check_not_contains "acp e2e: no interrupt keystrokes" "esc" "$(cat "$KEYS_LOG")"
 
+
+# 73. Status names the runner and the aggregate view uses the same liveness
+# rule as the per-apply view: a live supervisor is never reported dead.
+make_change "$AP" acp-observability '- [ ] 1.1 Do the work.'
+AS13="$TMP/acp-state-13"; mkdir -p "$AS13"
+S13="$(acp_state "$AS13" "$AP" acp-observability)"
+FAKE_ACP_MODE=allow acp_boss "$AS13" dispatch acp-observability --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S13" || bad "acp observability: no stop reason"
+out="$(acp_boss "$AS13" status acp-observability --project acp-test --json 2>/dev/null)"
+check_eq "acp status: runner" "goose" "$(printf '%s' "$out" | jq -r '.runner')"
+check_eq "acp status: model" "model-a" "$(printf '%s' "$out" | jq -r '.acp.model')"
+check_eq "acp status: mode" "smart_approve" "$(printf '%s' "$out" | jq -r '.acp.mode')"
+check_eq "acp status: no pending list" "0" "$(printf '%s' "$out" | jq -r '.pending_permissions | length')"
+check_eq "acp status: no pending alias" "null" "$(printf '%s' "$out" | jq -r '.pending_permission')"
+check_eq "acp status: not stalled" "false" "$(printf '%s' "$out" | jq -r '.acp_stalled')"
+agg="$(acp_boss "$AS13" status --json 2>/dev/null)"
+check_eq "acp aggregate: waiter alive" "true" \
+  "$(printf '%s' "$agg" | jq -r '.[] | select(.change=="acp-observability") | .waiter_alive')"
+check_eq "acp aggregate: waiter pid is the supervisor" "$(jq -r '.acp.supervisor_pid' "$S13")" \
+  "$(printf '%s' "$agg" | jq -r '.[] | select(.change=="acp-observability") | .waiter_pid')"
+check_eq "acp aggregate: runner" "goose" \
+  "$(printf '%s' "$agg" | jq -r '.[] | select(.change=="acp-observability") | .runner')"
+agg_text="$(acp_boss "$AS13" status 2>/dev/null)"
+check_contains "acp aggregate: alive in text" "waiter: alive (pid $(jq -r '.acp.supervisor_pid' "$S13"))" "$agg_text"
+check_contains "acp aggregate: names the runner" "goose" "$agg_text"
+check_not_contains "acp aggregate: never reports a live supervisor as dead" "waiter: DEAD" "$agg_text"
+acp_boss "$AS13" finish acp-observability --project acp-test >/dev/null 2>&1
+
+# 74. last_update describes the last message, not its final token: streamed
+# chunks are joined, a whitespace-only chunk and a usage update are ignored.
+make_change "$AP" acp-stream '- [ ] 1.1 Do the work.'
+AS14="$TMP/acp-state-14"; mkdir -p "$AS14"
+S14="$(acp_state "$AS14" "$AP" acp-stream)"
+FAKE_ACP_MODE=stream acp_boss "$AS14" dispatch acp-stream --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S14" || bad "acp stream: no stop reason"
+out="$(acp_boss "$AS14" status acp-stream --project acp-test --json 2>/dev/null)"
+check_eq "acp last update: joined message" "Refactor the status JSON now." \
+  "$(printf '%s' "$out" | jq -r '.acp_last_update')"
+check_eq "acp last update: state field" "Refactor the status JSON now." \
+  "$(printf '%s' "$out" | jq -r '.acp.last_update')"
+check_contains "acp last update: text view" "last update: Refactor the status JSON now." \
+  "$(acp_boss "$AS14" status acp-stream --project acp-test 2>/dev/null)"
+acp_boss "$AS14" finish acp-stream --project acp-test >/dev/null 2>&1
+
+# 75. The turn timeout is bounded by default and records turn_timeout.
+defaults="$(bash -c '. "$1/runtime/bin/boss-lib.sh"; printf "%s %s" "$BOSS_ACP_TURN_TIMEOUT_S" "$BOSS_ACP_STALL_S"' _ "$ROOT")"
+check_eq "acp defaults: turn timeout and stall" "7200 1800" "$defaults"
+make_change "$AP" acp-turn-timeout '- [ ] 1.1 Do the work.'
+AS15="$TMP/acp-state-15"; mkdir -p "$AS15"
+S15="$(acp_state "$AS15" "$AP" acp-turn-timeout)"
+EV15="$(acp_events_file "$AS15" "$AP" acp-turn-timeout)"
+FAKE_ACP_MODE=slow BOSS_ACP_TURN_TIMEOUT_S=1 BOSS_ACP_STALL_S=0 \
+  acp_boss "$AS15" dispatch acp-turn-timeout --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S15" 200 || bad "acp turn timeout: no stop reason"
+check_eq "acp turn timeout: stop reason" "turn_timeout" "$(jq -r '.acp.last_stop_reason' "$S15")"
+check_eq "acp turn timeout: phase idle" "idle" "$(jq -r '.acp.phase' "$S15")"
+acp_wait_event "$EV15" settled || bad "acp turn timeout: no settled wake"
+check_eq "acp turn timeout: wake names it" "1" \
+  "$(jq -Rrc 'select(length > 0) | (fromjson? | select(type=="object")) | select(.event=="settled" and .state=="turn_timeout")' "$EV15" | wc -l | tr -d ' ')"
+check_eq "acp turn timeout: no stall" "0" "$(acp_count "$EV15" stalled)"
+acp_boss "$AS15" finish acp-turn-timeout --project acp-test --force >/dev/null 2>&1
+
+# 76. A silent working turn wakes once with 'stalled'; the phase stays
+# working and the state carries the flag.
+make_change "$AP" acp-stall '- [ ] 1.1 Do the work.'
+AS16="$TMP/acp-state-16"; mkdir -p "$AS16"
+S16="$(acp_state "$AS16" "$AP" acp-stall)"
+EV16="$(acp_events_file "$AS16" "$AP" acp-stall)"
+FAKE_ACP_MODE=slow BOSS_ACP_STALL_S=1 BOSS_ACP_TURN_TIMEOUT_S=0 \
+  acp_boss "$AS16" dispatch acp-stall --project acp-test --runner goose >/dev/null
+if acp_wait_event "$EV16" stalled 100; then ok; else bad "acp stall: no stalled wake"; fi
+check_eq "acp stall: one wake" "1" "$(acp_count "$EV16" stalled)"
+check_eq "acp stall: wake state" "stalled" \
+  "$(jq -r 'select(.event=="stalled") | .state' "$EV16" | head -n 1)"
+check_contains "acp stall: names the last activity" "tool shell" \
+  "$(jq -r 'select(.event=="stalled") | .text' "$EV16" | head -n 1)"
+check_eq "acp stall: state flag" "true" "$(jq -r '.acp.stalled' "$S16")"
+check_eq "acp stall: phase stays working" "working" "$(jq -r '.acp.phase' "$S16")"
+check_eq "acp stall: status shows it" "1" \
+  "$(acp_boss "$AS16" status acp-stall --project acp-test 2>/dev/null | grep -c 'acp stalled: yes' || true)"
+out="$(acp_boss "$AS16" status acp-stall --project acp-test --json 2>/dev/null)"
+check_eq "acp stall: json flag" "true" "$(printf '%s' "$out" | jq -r '.acp_stalled')"
+sleep 1.5
+check_eq "acp stall: still one wake" "1" "$(acp_count "$EV16" stalled)"
+acp_boss "$AS16" finish acp-stall --project acp-test --force >/dev/null 2>&1
+
+# 76a. A long-running tool call that keeps emitting updates is not a stall.
+make_change "$AP" acp-progress '- [ ] 1.1 Do the work.'
+AS17="$TMP/acp-state-17"; mkdir -p "$AS17"
+S17="$(acp_state "$AS17" "$AP" acp-progress)"
+EV17="$(acp_events_file "$AS17" "$AP" acp-progress)"
+FAKE_ACP_MODE=progress BOSS_ACP_STALL_S=1 BOSS_ACP_TURN_TIMEOUT_S=0 \
+  acp_boss "$AS17" dispatch acp-progress --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S17" 200 || bad "acp progress: no stop reason"
+check_eq "acp progress: long command is not a stall" "0" "$(acp_count "$EV17" stalled)"
+check_eq "acp progress: stop reason" "end_turn" "$(jq -r '.acp.last_stop_reason' "$S17")"
+check_eq "acp progress: not stalled" "false" "$(jq -r '.acp.stalled' "$S17")"
+acp_boss "$AS17" finish acp-progress --project acp-test >/dev/null 2>&1
+
+# 76b. New activity clears a reported stall and restarts the timer.
+make_change "$AP" acp-stall-resume '- [ ] 1.1 Do the work.'
+AS18="$TMP/acp-state-18"; mkdir -p "$AS18"
+S18="$(acp_state "$AS18" "$AP" acp-stall-resume)"
+EV18="$(acp_events_file "$AS18" "$AP" acp-stall-resume)"
+FAKE_ACP_MODE=stall_resume BOSS_ACP_STALL_S=1 BOSS_ACP_TURN_TIMEOUT_S=0 \
+  acp_boss "$AS18" dispatch acp-stall-resume --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S18" 200 || bad "acp stall resume: no stop reason"
+check_eq "acp stall resume: one stall" "1" "$(acp_count "$EV18" stalled)"
+check_eq "acp stall resume: cleared by activity" "false" "$(jq -r '.acp.stalled' "$S18")"
+check_eq "acp stall resume: stop reason" "end_turn" "$(jq -r '.acp.last_stop_reason' "$S18")"
+acp_boss "$AS18" finish acp-stall-resume --project acp-test >/dev/null 2>&1
+
+# 76c. A blocked turn waits for the Explorer and is not a stall.
+make_change "$AP" acp-stall-blocked '- [ ] 1.1 Do the work.'
+AS19="$TMP/acp-state-19"; mkdir -p "$AS19"
+S19="$(acp_state "$AS19" "$AP" acp-stall-blocked)"
+EV19="$(acp_events_file "$AS19" "$AP" acp-stall-blocked)"
+FAKE_ACP_MODE=ask BOSS_ACP_STALL_S=1 BOSS_ACP_TURN_TIMEOUT_S=0 \
+  acp_boss "$AS19" dispatch acp-stall-blocked --project acp-test --runner goose-ask >/dev/null
+if acp_wait_phase "$S19" blocked; then ok; else bad "acp stall blocked: never blocked"; fi
+sleep 2
+check_eq "acp stall blocked: blocked phase excluded" "0" "$(acp_count "$EV19" stalled)"
+acp_boss "$AS19" answer acp-stall-blocked allow_once --project acp-test >/dev/null
+acp_wait_phase "$S19" idle || bad "acp stall blocked: did not finish the turn"
+check_eq "acp stall blocked: still no stall" "0" "$(acp_count "$EV19" stalled)"
+acp_boss "$AS19" finish acp-stall-blocked --project acp-test >/dev/null 2>&1
+
+# 77. Two concurrent permission requests produce one blocked wake that names
+# the count; status lists both and the aggregate shows the count and the ids.
+make_change "$AP" acp-wake-dedupe '- [ ] 1.1 Do the work.'
+AS20="$TMP/acp-state-20"; mkdir -p "$AS20"
+S20="$(acp_state "$AS20" "$AP" acp-wake-dedupe)"
+EV20="$(acp_events_file "$AS20" "$AP" acp-wake-dedupe)"
+FAKE_ACP_MODE=ask_two acp_boss "$AS20" dispatch acp-wake-dedupe --project acp-test --runner goose-ask >/dev/null
+i=0
+while [ "$i" -lt 100 ]; do
+  [ "$(jq -r '.acp.pending_permissions | length' "$S20" 2>/dev/null || printf 0)" = "2" ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
+acp_wait_event "$EV20" wake || bad "acp wake dedupe: no wake"
+sleep 0.3
+check_eq "acp wake dedupe: two pending" "2" "$(jq -r '.acp.pending_permissions | length' "$S20")"
+check_eq "acp wake dedupe: one blocked event" "1" "$(acp_count "$EV20" blocked)"
+check_eq "acp wake dedupe: one wake" "1" "$(acp_count "$EV20" wake)"
+check_contains "acp wake dedupe: names the count" "2 ACP permission requests" \
+  "$(jq -r 'select(.event=="blocked") | .text' "$EV20" | head -n 1)"
+out="$(acp_boss "$AS20" status acp-wake-dedupe --project acp-test --json 2>/dev/null)"
+check_eq "acp wake dedupe: pending list" "2" "$(printf '%s' "$out" | jq -r '.pending_permissions | length')"
+check_eq "acp wake dedupe: alias is the first" "tc-a" "$(printf '%s' "$out" | jq -r '.pending_permission.tool_call_id')"
+dedupe_text="$(acp_boss "$AS20" status acp-wake-dedupe --project acp-test 2>/dev/null)"
+check_contains "acp wake dedupe: blocked view names the count" "pending permissions (2):" "$dedupe_text"
+check_contains "acp wake dedupe: blocked view lists the ids" "tc-b" "$dedupe_text"
+agg="$(acp_boss "$AS20" status --json 2>/dev/null)"
+check_eq "acp wake dedupe: aggregate count" "2" \
+  "$(printf '%s' "$agg" | jq -r '.[] | select(.change=="acp-wake-dedupe") | .pending_count')"
+check_eq "acp wake dedupe: aggregate ids" "tc-a,tc-b" \
+  "$(printf '%s' "$agg" | jq -r '.[] | select(.change=="acp-wake-dedupe") | .pending_ids | join(",")')"
+check_contains "acp wake dedupe: aggregate row" "pending: 2 permission requests (tc-a, tc-b)" \
+  "$(acp_boss "$AS20" status 2>/dev/null)"
+acp_boss "$AS20" answer acp-wake-dedupe allow_once --tool-call tc-a --project acp-test >/dev/null
+acp_boss "$AS20" answer acp-wake-dedupe allow_once tc-b --project acp-test >/dev/null
+acp_wait_phase "$S20" idle || bad "acp wake dedupe: did not finish the turn"
+acp_wait_event "$EV20" settled || bad "acp wake dedupe: no settled wake"
+check_eq "acp wake dedupe: settled wake after the answers" "1" \
+  "$(jq -Rrc 'select(length > 0) | (fromjson? | select(type=="object")) | select(.event=="settled")' "$EV20" | wc -l | tr -d ' ')"
+acp_boss "$AS20" finish acp-wake-dedupe --project acp-test >/dev/null 2>&1
 
 # ------------------------------------------------------- runtime hygiene ---
 # The version is part of the contract: an installed copy must name its source.

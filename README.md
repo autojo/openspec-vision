@@ -238,9 +238,10 @@ The fields of a runner entry:
 | `model` | ACP only: session model, applied before the first prompt |
 | `mode` | ACP only: session mode; default `smart_approve` |
 | `policy` | ACP only: `allow` (default) or `ask` for an unmatched permission |
+| `isolate` | ACP only: `true` (default) runs the agent with a per-apply profile; `false` uses the user's global agent profile |
 | `deny` | command/path/title globs an apply never needs (default: force-push, mirror-push, `git push --delete`, `git filter-branch`, `git filter-repo`) |
 | `apply` | native: the prompt template with `{change}`; ACP: optional extra instructions (a slash-command template is ignored) |
-| `args`, `env` | native: extra agent start arguments and environment entries |
+| `args`, `env` | native only: extra agent start arguments and environment entries; an ACP runner ignores them and is configured with `command`, `model`, `mode`, `policy`, `deny` and `apply` instead |
 | `commit` | `explorer` (default) or `agent` |
 | `interrupt_keys` | native: keys for `boss interrupt` |
 | `ready`, `ready_regex`, `ready_timeout_ms` | native: readiness marker and timeout |
@@ -258,6 +259,13 @@ The assignment rule used by the vision skill:
 | research, legal text, evaluation | `claude-sonnet` |
 | licenses, regulatory/legal, privacy, other expensive mistakes | `claude-opus` |
 | primarily code | `default` (here `opencode`) |
+| apply-only work that suits an ACP agent | `goose` (`start = "acp"`; permissions come from its `policy` and `mode`) |
+
+An ACP runner is apply-only. `boss session` rejects it with
+`acp_session_unsupported`, because the session needs a Herdr-native agent to
+attach to; there is no hidden native path. A change whose work needs an
+interactive session therefore belongs to a native runner, while the ACP runner
+takes the change as a normal detached apply with its transcript in the tab.
 
 A mixed change uses the runner of its dominant part or is split into two
 changes.
@@ -395,7 +403,9 @@ timeout_s = 1800
 ```
 
 `command` is optional: without it the detected command (`just test`,
-`npm test`, `pytest`, `make test`) runs with the configured budget. The legacy
+`npm test`, `pytest`, `make test`, `./tests/run.sh`, `./scripts/test.sh`) runs
+with the configured budget. The two repository conventions come last and only
+when the file is executable, so a project manifest keeps precedence. The legacy
 string form stays valid and means "this command, default budget":
 
 ```toml
@@ -414,6 +424,15 @@ negative and non-numeric values are rejected with `invalid_test_timeout`
 naming the project. The budget is a hang guard, not a liveness check: raise it
 for a suite that legitimately needs longer, and do not wrap the suite in an
 outer `timeout` shorter than the budget.
+
+`command` and `timeout_s` belong together. The budget must exceed the runtime of
+the whole suite on this machine with margin: the suite is run inside the merge
+step, and a budget below it turns a green change into `merge_state=test_timeout`
+with the merge already applied. A suite that takes eight minutes needs a budget
+well above 480 seconds; the safe form is to measure the suite once and set the
+budget to roughly twice that. `[tests]` (the string form) cannot carry a budget
+of its own and always uses the default 300 seconds, so use the table form for
+anything slower.
 
 A test that exceeds its budget is a `timeout`, not a red test. `boss review`
 reports `quality.tests.result` as `pass`, `fail`, `timeout` or `not_run`
@@ -689,6 +708,11 @@ permissions, cancellation, resume and a JSONL transcript. The apply tab still
 exists for a human view, but it only tails the transcript and hosts no agent;
 no behavior reads the pane.
 
+An ACP runner is apply-only: `boss session` rejects it with
+`acp_session_unsupported`. `command` names the agent binary that speaks ACP;
+`args` and `env` are native-only and have no effect on an ACP child, while
+`model`, `mode`, `policy`, `deny` and `apply` are the supported knobs.
+
 ```toml
 [runners.goose]
 start = "acp"
@@ -705,25 +729,166 @@ sends the apply prompt over ACP; the prompt runs
 `openspec instructions apply --change <change> --json` and never depends on a
 slash command. `session/update` notifications are appended to a JSONL
 transcript and shown in the apply tab. `boss status` reads the state file and
-the transcript tail (last update, model, mode, usage, pending permission), not
-the pane.
+the transcript tail, not the pane.
+
+### Dispatch runs the installed runtime
+
+A dispatch uses the installed runtime (`~/.local/bin/boss` and `boss-acp`), not
+the repository branch the Explorer reads. A merged runtime change therefore has
+no effect until it is installed:
+
+```bash
+./install.sh
+boss --version                     # names the installed commit and origin
+```
+
+Before trusting the first ACP apply after such a change, check its state:
+`acp.isolated` must be `true` and `acp.profile_root` must name the per-apply
+profile (`boss status <change> --json`). Without them the dispatch came from an
+older runtime and keeps the old behaviour, including world-readable
+transcripts and no permission queueing. Re-run `./install.sh` and dispatch
+again instead of debugging the change.
+
+The status JSON names what drives the session and what it waits for:
+
+| Field | Meaning |
+| --- | --- |
+| `runner` | the configured runner (`goose`); the aggregate row shows it too |
+| `acp.model`, `acp.mode` | the model and mode applied to the session |
+| `acp.last_update` | the last message text or tool activity (at most 200 characters). Streamed chunks are joined per message id; usage-only and whitespace-only chunks do not overwrite it |
+| `pending_permissions` | every pending request with tool-call id, command and options |
+| `pending_permission` | compatibility alias for the first entry; `null` when nothing is pending |
+| `acp.stalled` | `true` while a working turn has made no progress and the boss has been woken about it |
+
+The aggregate `boss status` derives liveness from the same process as the
+per-apply view: for an ACP apply that is the supervisor pid, so a live
+supervisor is never printed as `waiter: DEAD`. The aggregate row also names the
+pending count and the pending tool-call ids.
 
 Permissions are a policy, not a prompt: a command matching `deny` is rejected
 before it runs, a read-only tool or an allowed request proceeds, and with
-`policy = "ask"` an unmatched request stays pending. The apply then reports
-`blocked` and names the pending tool call and its offered options:
+`policy = "ask"` an unmatched request stays pending. Every pending request is
+queued independently by tool-call id, so concurrent requests are reported
+together and answering one never discards another. The apply reports `blocked`
+and `boss status` lists every pending tool call with its id, command and
+offered options:
 
 ```bash
-boss status <change>                # blocked; shows the request and options
-boss answer <change> allow_once     # select one offered option
-boss interrupt <change>             # answer it as cancelled, then session/cancel
+boss status <change>                                # all pending requests
+boss answer <change> allow_once --tool-call <id>    # answer one request
+boss answer <change> allow_once <id>                # same, positional form
+boss interrupt <change>                             # cancel every pending request
 ```
 
+With exactly one pending request the option alone is still enough; with more,
+an answer without a tool-call id is refused with `ambiguous_pending` and names
+the ids.
+
+One blocked transition wakes the boss once, however many requests arrive
+before the first answer: the wake names the number of pending requests and their
+ids, and the flag clears when the last request is answered. A new blocked
+transition wakes again.
+
+### Turn bounds
+
+An ACP turn is bounded twice, and both bounds are configurable:
+
+- `BOSS_ACP_TURN_TIMEOUT_S` (default `7200`, two hours) is the longest a turn
+  may wait for the prompt response. On expiry the supervisor sends
+  `session/cancel`, records `turn_timeout` as the stop reason, ends the turn and
+  wakes the boss. `0` disables the timeout explicitly.
+- `BOSS_ACP_STALL_S` (default `1800`, thirty minutes) is the longest a `working`
+  turn may go without transcript progress. The supervisor checks every
+  `min(30 s, BOSS_ACP_STALL_S / 2)`; when the interval passes it wakes the boss
+  once with state `stalled` and the last activity, and sets `acp.stalled`. Any
+  new transcript entry clears the flag and restarts the timer, so a turn that
+  recovers can be reported as stalled again later. A `blocked` turn waits for
+  the Explorer and is never a stall. `0` disables the check.
+
+The defaults sit above the longest expected command (the full suite takes about
+eight minutes) so a normal `./tests/run.sh` is not a stall. A tool call that
+keeps emitting `tool_call_update` is progress; a silent tool call is not, which
+is why the stall interval, not the tool-execution time, is the measure. Raise
+both values for a project with a longer run rather than disabling them.
+
+An automatic allow always selects the agent's `allow_once` option and never
+`allow_always`, so it cannot create a persistent agent-level grant. If the agent
+offers no allow-once option, the request stays pending (fail closed) and the
+supervisor logs why. An Explorer `allow_always` answer is recorded as an
+apply-scoped grant in `acp.apply_allows`, sent to the agent as `allow_once`, and
+kept for the rest of the apply; every matching request is auto-allowed. Nothing
+is written to the agent's global permission store.
+
+`allow_always` is an agent-level grant in the agent's own model: it applies to
+every later session of that agent, not only to this apply. The runner therefore
+never creates one and maps an Explorer's `allow_always` answer to the
+apply-scoped `acp.apply_allows` above. A user who writes such an entry into
+Goose's own `permission.yaml` gives it to every session; an isolated runner is
+unaffected because its store is boss-owned and empty, while a non-isolated
+runner is reported as `weakened` by `boss doctor`, which names the entry. The
+grant only skips the prompt; only an OS sandbox or a separate user confines what
+the shell can do.
+
 `boss interrupt` sends `session/cancel` and never keystrokes; it records the
-`cancelled` stop reason. If the agent does not confirm within
-`BOSS_ACP_CANCEL_TIMEOUT_S`, the state records `cancel_unconfirmed` and the boss
-is woken. `boss finish` closes the session (`session/close`) and stops the
-supervisor.
+`cancelled` stop reason and cancels every queued request first. If the agent does
+not confirm within `BOSS_ACP_CANCEL_TIMEOUT_S`, the state records
+`cancel_unconfirmed` and the boss is woken. `boss finish` closes the session
+(`session/close`), stops the supervisor and removes the per-apply profile.
+
+### Isolated agent state
+
+By default the ACP child runs with a per-apply profile below
+`$BOSS_STATE_DIR/acp/profile-<hash>/`:
+
+```text
+config/goose/   config.yaml, secrets.yaml and provider state linked from the
+                user's profile; permission.yaml generated and boss-owned
+data/goose/     private sessions/, apps and model catalog linked read-through
+```
+
+`XDG_CONFIG_HOME` and `XDG_DATA_HOME` point at that root. The generated
+`permission.yaml` has empty `always_allow`/`never_allow` lists in both the
+`user` and `smart_approve` sections and lists `shell`, `write`, `edit`,
+`read_image` and the extension manager under both `ask_before` lists, so Goose
+asks and the supervisor sees every request. A supervisor restart reuses the
+same profile; `boss finish` removes it together with the apply state.
+`isolate = false` is the escape hatch and uses the user's global profile.
+
+The profile isolates Goose's configuration, permission store and sessions. It
+is **not a filesystem sandbox**: the shell, write and edit tools still run with
+the user's OS permissions and reach every path that user can reach. Only an OS
+sandbox (a container, a sandboxed unit) or a separate user confines them; the
+worktree only keeps parallel applies out of each other's index.
+
+### Transcript and log privacy
+
+The transcript below `$BOSS_STATE_DIR/transcripts/` and the supervisor log
+`$BOSS_STATE_DIR/logs/<change>-acp.log` are created with mode `0600`. Both hold
+full commands, tool output and model text, so they are readable by the operator
+only. The supervisor chmods the file on every append, so a transcript created
+world-readable by an older runtime is corrected the next time it is written.
+
+A transcript is retained until the operator removes it. `boss finish` deletes
+the state file, the profile and the socket, but keeps the transcript: it is the
+evidence for the finished apply and for a later audit. Rotation keeps one
+previous file (`<transcript>.1`) with the same mode. A cleanup (a cron job or a
+manual `rm`) is an operator decision; no retention policy is implemented.
+
+### Doctor and the effective policy
+
+`boss doctor` validates every configured ACP runner: the command is on `PATH`,
+the handshake succeeds (`initialize` + `session/new`), and the configured model
+and mode are offered (a mismatch names the available values). It also reports
+the isolation state and the effective permission store. An ACP runner is skipped
+by the Herdr integration and `kind` checks.
+
+A runner is reported as `enforced` when its profile is isolated, or when a
+non-isolated runner's global permission store has no `always_allow` entry for
+`shell`, `write` or `edit`. If such an entry exists, the doctor reports
+`weakened`, names the entry and points at the per-apply profile; it reads the
+store read-only and never edits it. Doctor probes run with a temporary profile
+and delete it afterwards, so a probe leaves no session or permission entry
+behind.
 
 The supervisor persists the session id, model, mode and last stop reason.
 After a crash, `boss resume` calls `session/load` when the agent advertises it,
@@ -733,11 +898,6 @@ reported as `unresumable` and `boss retrigger` starts an explicit new session
 instead of silently editing the same worktree twice. A dead supervisor frees
 its concurrency slot and wakes the boss; the declared resource locks remain
 until the apply is finished.
-
-`boss doctor` validates every configured ACP runner: the command is on `PATH`,
-the handshake succeeds (`initialize` + `session/new`), and the configured model
-and mode are offered (a mismatch names the available values). An ACP runner is
-skipped by the Herdr integration and `kind` checks.
 
 ## Trust model and limits
 
@@ -764,7 +924,8 @@ control, so the boundaries are worth stating once:
   `deny = [...]` in its `[runners.<name>]` table; `deny = []` turns it off.
   The check never blocks a dispatch - it makes a weak configuration visible.
 - **`boss review` runs the project's test command.** It executes what it
-  detects (`just test`, `npm test`, `pytest`, `make test`, the legacy `[tests]`
+  detects (`just test`, `npm test`, `pytest`, `make test`, `./tests/run.sh`,
+  `./scripts/test.sh`, the legacy `[tests]`
   string or `[tests.<project>].command`) with the resolved budget. That is code
   from the target repository, run with the user's rights, exactly as a developer
   would run it.

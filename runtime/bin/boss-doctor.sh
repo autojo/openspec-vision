@@ -168,13 +168,15 @@ doctor_check_worktrees() {
 # runner is configured. The probe is the same boss_acp.py that the supervisor
 # uses, so a passing doctor run exercises the real handshake.
 doctor_check_acp_runners() {
-  local project="$1" cfg="$2" name command binary model mode script out rc status hint
+  local project="$1" cfg="$2" name command binary model mode script out rc status hint errfile
+  local runner_json isolated store policy policy_status policy_hint
   script="$(boss_acp_py)"
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     command="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.runners[$n].command // empty')"
     model="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.runners[$n].model // empty')"
     mode="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.runners[$n].mode // "smart_approve"')"
+    runner_json="$(printf '%s' "$cfg" | jq -c --arg n "$name" '.runners[$n] + {name: $n}')"
     if [ -z "$command" ]; then
       doctor_add "acp_runner:$name" fail "runner '$name' uses start = \"acp\" but has no command; set command = \"goose\""
       continue
@@ -188,21 +190,50 @@ doctor_check_acp_runners() {
       doctor_add "acp_runner:$name" fail "the ACP supervisor library boss_acp.py is missing; reinstall the runtime"
       continue
     fi
+    errfile="$(mktemp "${TMPDIR:-/tmp}/boss-acp-probe.XXXXXX")"
     out="$(cd "$project" && run_with_deadline 300 python3 "$script" --probe "$command" --cwd "$project" \
-      --timeout 120 ${model:+--model "$model"} ${mode:+--mode "$mode"} 2>&1)"
+      --profile-temp --timeout 120 ${model:+--model "$model"} ${mode:+--mode "$mode"} 2>"$errfile")"
     rc=$?
     if ! printf '%s' "$out" | jq -e '.status' >/dev/null 2>&1; then
-      hint="$(printf '%s' "$out" | tail -n 1 | cut -c1-400)"
+      hint="$(tail -n 1 "$errfile" 2>/dev/null | cut -c1-400)"
+      [ -n "$hint" ] || hint="$(printf '%s' "$out" | tail -n 1 | cut -c1-400)"
+      rm -f "$errfile"
       doctor_add "acp_runner:$name" fail "the ACP handshake for runner '$name' failed (exit $rc): ${hint:-no output}"
       continue
     fi
     status="$(printf '%s' "$out" | jq -r '.status')"
     hint="$(printf '%s' "$out" | jq -r '.message // empty')"
+    rm -f "$errfile"
     if [ "$status" = "ok" ]; then
       doctor_add "acp_runner:$name" ok "$(printf '%s' "$out" | jq -r '"command \(.command), protocol \(.protocol // "?"), models \(.models | join(", "))"')"
     else
       doctor_add "acp_runner:$name" fail "runner '$name': ${hint:-ACP probe failed}"
+      continue
     fi
+
+    # The effective policy: an isolated profile cannot be bypassed by the
+    # user's global store; otherwise a global always_allow for shell/write/edit
+    # weakens the deny policy and is named here.
+    policy="$(policy_check "$runner_json" "$project")"
+    policy_status="$(printf '%s' "$policy" | jq -r '.status // "unavailable"')"
+    policy_hint="$(printf '%s' "$policy" | jq -r '.hint // ""')"
+    isolated="$(printf '%s' "$runner_json" | jq -r 'if has("isolate") then (.isolate != false) else true end')"
+    if [ "$isolated" = "true" ]; then
+      store="per-apply profile under \$BOSS_STATE_DIR/acp"
+    else
+      store="$(acp_permission_store_path)"
+    fi
+    case "$policy_status" in
+      weakened)
+        doctor_add "acp_policy:$name" warn "isolated: $isolated; store: $store; $policy_hint"
+        ;;
+      enforced|verified)
+        doctor_add "acp_policy:$name" ok "isolated: $isolated; store: $store; $policy_hint"
+        ;;
+      *)
+        doctor_add "acp_policy:$name" warn "isolated: $isolated; store: $store; $policy_hint"
+        ;;
+    esac
   done < <(printf '%s' "$cfg" | jq -r '(.runners // {}) | to_entries[] | select((.value.start // "herdr") == "acp") | .key' 2>/dev/null || true)
 }
 
