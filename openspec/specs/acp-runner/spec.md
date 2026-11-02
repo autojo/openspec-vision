@@ -79,10 +79,6 @@ agent continues. The policy SHALL allow, reject, or leave the request pending fo
 the Explorer, and SHALL match a request by its tool input and title. Concurrent
 requests SHALL be queued independently; answering one SHALL NOT discard another.
 
-An automatic allow SHALL select an allow-once option and SHALL NOT create a
-persistent agent-level grant. An Explorer allow-always SHALL be scoped to the
-current apply and SHALL be sent to the agent as allow-once.
-
 #### Scenario: Denied command
 
 - **WHEN** a permission request carries a command matching the deny list
@@ -104,6 +100,12 @@ current apply and SHALL be sent to the agent as allow-once.
 - **WHEN** two permission requests arrive before either is answered
 - **THEN** both are recorded as pending and answering the first leaves the
   second pending
+
+### Requirement: Permission grants
+
+An automatic allow SHALL select an allow-once option and SHALL NOT create a
+persistent agent-level grant. An Explorer allow-always SHALL be scoped to the
+current apply and SHALL be sent to the agent as allow-once.
 
 #### Scenario: Automatic allow does not persist
 
