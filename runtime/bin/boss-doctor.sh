@@ -168,13 +168,14 @@ doctor_check_worktrees() {
 # runner is configured. The probe is the same boss_acp.py that the supervisor
 # uses, so a passing doctor run exercises the real handshake.
 doctor_check_acp_runners() {
-  local project="$1" cfg="$2" name command binary model mode script out rc status hint errfile
-  local runner_json isolated store policy policy_status policy_hint
+  local project="$1" cfg="$2" name command binary model effort mode script out rc status hint errfile
+  local runner_json isolated store policy policy_status policy_hint profile_flag session_left
   script="$(boss_acp_py)"
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     command="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.runners[$n].command // empty')"
     model="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.runners[$n].model // empty')"
+    effort="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.runners[$n].effort // empty')"
     mode="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.runners[$n].mode // "smart_approve"')"
     runner_json="$(printf '%s' "$cfg" | jq -c --arg n "$name" '.runners[$n] + {name: $n}')"
     if [ -z "$command" ]; then
@@ -190,9 +191,20 @@ doctor_check_acp_runners() {
       doctor_add "acp_runner:$name" fail "the ACP supervisor library boss_acp.py is missing; reinstall the runtime"
       continue
     fi
+    # The probe uses the same kind of profile a dispatch uses: isolated
+    # runners get a temporary boss-owned profile, non-isolated runners are
+    # probed in the user's own profile so a model a dispatch can select is
+    # not reported as missing.
+    isolated="$(printf '%s' "$runner_json" | jq -r 'if has("isolate") then (.isolate != false) else true end')"
+    if [ "$isolated" = "true" ]; then
+      profile_flag="--profile-temp"
+    else
+      profile_flag=""
+    fi
     errfile="$(mktemp "${TMPDIR:-/tmp}/boss-acp-probe.XXXXXX")"
+    # shellcheck disable=SC2086  # profile_flag is empty or one literal word
     out="$(cd "$project" && run_with_deadline 300 python3 "$script" --probe "$command" --cwd "$project" \
-      --profile-temp --timeout 120 ${model:+--model "$model"} ${mode:+--mode "$mode"} 2>"$errfile")"
+      $profile_flag --timeout 120 ${model:+--model "$model"} ${effort:+--effort "$effort"} ${mode:+--mode "$mode"} 2>"$errfile")"
     rc=$?
     if ! printf '%s' "$out" | jq -e '.status' >/dev/null 2>&1; then
       hint="$(tail -n 1 "$errfile" 2>/dev/null | cut -c1-400)"
@@ -203,12 +215,18 @@ doctor_check_acp_runners() {
     fi
     status="$(printf '%s' "$out" | jq -r '.status')"
     hint="$(printf '%s' "$out" | jq -r '.message // empty')"
+    session_left="$(printf '%s' "$out" | jq -r '.session_left // false')"
     rm -f "$errfile"
     if [ "$status" = "ok" ]; then
-      doctor_add "acp_runner:$name" ok "$(printf '%s' "$out" | jq -r '"command \(.command), protocol \(.protocol // "?"), models \(.models | join(", "))"')"
+      doctor_add "acp_runner:$name" ok "$(printf '%s' "$out" | jq -r '"command \(.command), protocol \(.protocol // "?"), model \(.models | join(", ")), effort \(.efforts | join(", ")), mode \(.modes | join(", "))"')"
     else
       doctor_add "acp_runner:$name" fail "runner '$name': ${hint:-ACP probe failed}"
       continue
+    fi
+    if [ "$session_left" = "true" ]; then
+      doctor_add "acp_probe_session:$name" warn "runner '$name' is non-isolated; the probe closed its session but could not delete it from the user's agent store"
+    else
+      doctor_add "acp_probe_session:$name" ok "the probe sent no prompt and closed its session"
     fi
 
     # The effective policy: an isolated profile cannot be bypassed by the
@@ -217,7 +235,6 @@ doctor_check_acp_runners() {
     policy="$(policy_check "$runner_json" "$project")"
     policy_status="$(printf '%s' "$policy" | jq -r '.status // "unavailable"')"
     policy_hint="$(printf '%s' "$policy" | jq -r '.hint // ""')"
-    isolated="$(printf '%s' "$runner_json" | jq -r 'if has("isolate") then (.isolate != false) else true end')"
     if [ "$isolated" = "true" ]; then
       store="per-apply profile under \$BOSS_STATE_DIR/acp"
     else
@@ -235,6 +252,93 @@ doctor_check_acp_runners() {
         ;;
     esac
   done < <(printf '%s' "$cfg" | jq -r '(.runners // {}) | to_entries[] | select((.value.start // "herdr") == "acp") | .key' 2>/dev/null || true)
+}
+
+# doctor_check_model_runners <project> <config-json> -- the model-selection
+# preflight: unpinned runners and the open mission changes that use them, a
+# missing catalog entry or limit, an invalid or missing trial, a provider that
+# is not allowed for the project, and the helper models the agent configures.
+doctor_check_model_runners() {
+  local project="$1" cfg="$2" policy name runner_json declared entry billing
+  local use_map="" mdir mf mparsed pair rname rchange trial
+  local providers_json pkey provider vendor missing_provider helper_json
+  policy="$(model_policy_json "$cfg" | jq -r '.unpinned')"
+  doctor_add model_policy ok "unpinned runners are handled as '$policy'"
+
+  mdir="$(missions_dir "$project" 2>/dev/null || true)"
+  if [ -n "$mdir" ] && [ -d "$mdir" ]; then
+    for mf in "$mdir"/*.md; do
+      [ -f "$mf" ] || continue
+      mparsed="$(mission_parse "$mf" 2>/dev/null || true)"
+      [ -n "$mparsed" ] || continue
+      while IFS= read -r pair; do
+        [ -n "$pair" ] || continue
+        rchange="${pair%% *}"
+        rname="${pair#* }"
+        use_map="$use_map$rname	$(basename "$mf" .md):$rchange
+"
+      done < <(printf '%s' "$mparsed" | jq -r --arg d "$(printf '%s' "$cfg" | jq -r '.default // empty')" '
+        .change_specs[]?
+        | "\(.name) \(.runner // if $d != "" then $d else "default" end)"' 2>/dev/null)
+    done
+  fi
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    runner_json="$(printf '%s' "$cfg" | jq -c --arg n "$name" '.runners[$n] + {name: $n}')"
+    declared="$(printf '%s' "$runner_json" | jq -r '.model // empty')"
+    if ! model_runner_pinned "$runner_json"; then
+      local uses
+      uses="$(printf '%s' "$use_map" | awk -F '\t' -v n="$name" '$1 == n { print $2 }' | paste -sd ', ' -)"
+      [ -n "$uses" ] || uses="(no open mission change uses it)"
+      doctor_add "model_runner:$name" warn "runner '$name' is unpinned; the agent's own default model may be used; used by: $uses"
+      continue
+    fi
+    entry="$(model_catalog_entry "$cfg" "$declared")"
+    if [ "$entry" = "null" ]; then
+      doctor_add "model_runner:$name" warn "runner '$name' names model '$declared' with no [models] entry; provider, billing and cost are unchecked"
+      continue
+    fi
+    billing="$(printf '%s' "$entry" | jq -r '.billing // empty')"
+    provider="$(printf '%s' "$entry" | jq -r '.provider // empty')"
+    vendor="$(printf '%s' "$entry" | jq -r '.vendor // empty')"
+    pkey="$(model_project_key "$cfg" "$project")"
+    providers_json="$(printf '%s' "$cfg" | jq -c --arg k "$pkey" '.model_providers[$k] // null')"
+    missing_provider=""
+    if [ "$providers_json" = "null" ]; then
+      missing_provider="$provider"
+    else
+      local check_provider
+      for check_provider in "$provider" "$vendor"; do
+        [ -n "$check_provider" ] || continue
+        [ "$(printf '%s' "$providers_json" | jq -r --arg p "$check_provider" 'index($p) != null')" = "true" ] \
+          || missing_provider="$check_provider"
+      done
+    fi
+    if [ -n "$missing_provider" ]; then
+      doctor_add "model_provider:$name" warn "runner '$name' uses provider '$missing_provider', which is not on the list for project '$pkey'"
+    else
+      doctor_add "model_provider:$name" ok "provider '$provider' is allowed for project '$pkey'"
+    fi
+    if [ "$billing" = "metered" ]; then
+      if [ "$(printf '%s' "$entry" | jq -r '(.limit_usd // null) == null and (.limit_tokens // null) == null')" = "true" ]; then
+        doctor_add "model_limit:$name" fail "metered model '$declared' of runner '$name' has no limit_usd or limit_tokens"
+      else
+        doctor_add "model_limit:$name" ok "metered model '$declared' has a per-apply limit"
+      fi
+      trial="$(model_trial_status "$runner_json" "$cfg" "$project")"
+      case "$(printf '%s' "$trial" | jq -r '.status')" in
+        valid) doctor_add "model_trial:$name" ok "a valid trial record exists for '$declared'" ;;
+        *) doctor_add "model_trial:$name" warn "no valid trial for metered model '$declared' (runner '$name'); run 'boss model trial $name'" ;;
+      esac
+    else
+      doctor_add "model_limit:$name" ok "model '$declared' is $billing; no spending limit is needed"
+    fi
+    helper_json="$(model_configured_helpers "$runner_json" "$cfg" "$project")"
+    if [ "$(printf '%s' "$helper_json" | jq 'length')" -gt 0 ]; then
+      doctor_add "model_helpers:$name" ok "runner '$name' lists helper model(s): $(printf '%s' "$helper_json" | jq -r 'join(", ")')"
+    fi
+  done < <(printf '%s' "$cfg" | jq -r '(.runners // {}) | keys[]' 2>/dev/null || true)
 }
 
 # cmd_doctor [--project <name|path>] [--json] [--fix] -- preflight the
@@ -594,6 +698,9 @@ cmd_doctor() {
   # ACP runners are validated only when configured. The probe starts the real
   # command for the handshake; a bad model/mode names the offered values.
   doctor_check_acp_runners "$project" "$cfg"
+
+  # Model selection: pinning, catalog, limits, providers, trials, helpers.
+  doctor_check_model_runners "$project" "$cfg"
 
   local checks overall json
   checks="$(jq -s '.' "$DOCTOR_TMP")"

@@ -266,16 +266,25 @@ After all features have changes assigned, do exactly one sort pass:
   A bullet without an annotation keeps the document order. Never declare a
   dependency cycle.
 - Assign a runner to every change and write it on the same bullet:
-  `- spike-api (runner: claude-opus)`. Research, legal text and
-  evaluations use `claude-sonnet`; licenses, regulatory/legal, privacy and other
-  expensive-error domains use `claude-opus`; primarily code uses the default
-  runner (no annotation). Apply-only work that suits an ACP agent may use
-  `goose`, whose permissions come from its `policy` and `mode`; an ACP runner
-  cannot host `boss session` and is rejected with `acp_session_unsupported`, so
-  a change that needs an interactive session keeps a native runner. A mixed
-  change uses the runner of its dominant part
-  or is split into two changes. The runner names must exist under `[runners]`
-  in `boss.toml`; `boss mission next` starts the change with that runner.
+  `- spike-api (runner: claude-opus)`. Resolve each change's task role through
+  `[model_roles]` (`code`, `ui_hard`, `formula_check`, `second_review`, ...) and
+  write the resolved runner name, not the role. A role without a configured
+  runner is a planning question: ask the operator before the charter closes,
+  never resolve it during the run. An existing `runner:` bullet the operator
+  chose is kept; report a differing role instead of replacing it. Research,
+  legal text and evaluations use `claude-sonnet`; licenses, regulatory/legal,
+  privacy and other expensive-error domains use `claude-opus`; primarily code
+  uses the default runner (no annotation). Apply-only work that suits an ACP
+  agent may use `goose`, whose permissions come from its `policy` and `mode`;
+  an ACP runner cannot host `boss session` and is rejected with
+  `acp_session_unsupported`, so a change that needs an interactive session keeps
+  a native runner. A change planned as an independent second review gets a
+  runner of another model vendor than the change it reviews; record both
+  vendors in the charter. If no runner of another allowed vendor exists, report
+  the gap and do not label the review independent. A mixed change uses the
+  runner of its dominant part or is split into two changes. The runner names
+  must exist under `[runners]` in `boss.toml`; `boss mission next` starts the
+  change with that runner.
 - Assign locks to every change on the same bullet:
   `- spike-api (runner: claude-opus; touches: src/api, deps)`. List the source
   paths or directories the change will edit and the shared resources it uses
@@ -308,13 +317,20 @@ Run this for each mission in version order. Edit
   station and the reporting format.
 - `## Marker Policy` – the human and external-verification markers used here.
 - `## Commit Policy` – `explorer` or `agent` and the reason.
-- `## Runner Policy` – the per-change runner rule and the `[runners]` names.
+- `## Runner Policy` – a table with one row per runner the mission uses:
+  runner, model, effort, provider, billing class (`free`, `metered`, `quota`),
+  per-apply limit and the data classes that may go to that provider. Every
+  metered runner needs a limit and an amount in the Spending / API cost row of
+  `## Authorization`; a metered runner without that amount keeps the charter
+  gate closed. Use `boss model list` and `boss doctor` to check the values
+  against `boss.toml`.
 - `## Start` – `start_after: <slug> (waiting_human|done)` when this mission may
   run beside its predecessor; otherwise "independent".
 - `## Authorization` – one row per category with `granted`, `denied` or
   `bounded` in the decision cell and a concrete bound in the third cell.
   Prefer `denied` or `bounded` over a broad `granted`. An empty decision cell
-  keeps the gate closed.
+  keeps the gate closed. A paid (metered) model and every trial run need their
+  own amount here; a metered runner without an amount is not authorized.
 - `## Stop Conditions` – normally `mission_complete`, plus the
   `waiting_human` handoff when only marked human tasks remain, plus any red
   line that forces the run to stop.
@@ -322,11 +338,12 @@ Run this for each mission in version order. Edit
   configured `[missions] human_markers`, that parked changes are handed over
   with their tasks and acceptance criteria, and that the run never waits for
   the human.
-- Record the runner assignment rule in `## Constraints`: `claude-sonnet` for
-  research, legal text and evaluations; `claude-opus` for licenses, regulatory/legal,
-  privacy and other high-cost error domains; the default runner for code. Name
-  the `[runners]` entries this mission uses. Record the commit policy too:
-  `commit = "explorer"` means only the Explorer commits; use
+- Record the runner assignment rule in `## Constraints`: resolve each change's
+  role through `[model_roles]`; `claude-sonnet` for research, legal text and
+  evaluations; `claude-opus` for licenses, regulatory/legal, privacy and other
+  high-cost error domains; the default runner for code; a second review uses
+  another vendor. Name the `[runners]` entries this mission uses. Record the
+  commit policy too: `commit = "explorer"` means only the Explorer commits; use
   `commit = "agent"` only when the charter explicitly allows the apply to
   commit.
 - `## Open Questions` – every question that could change the assignment while
@@ -339,8 +356,9 @@ Run this for each mission in version order. Edit
   add `start_after: v1 (waiting_human)` (or `done`); `mission next` returns
   `mission_waiting` until that state is reached.
 
-A charter is closed only when every question is `- [x]` and every
-authorization row has a decision. Verify with:
+A charter is closed only when every question is `- [x]`, every
+authorization row has a decision, and no metered runner lacks a limit or an
+authorization amount. Verify with:
 
 ```bash
 boss mission status v1 --project <name|path>
@@ -446,8 +464,14 @@ printed as `waiter: DEAD`.
 An ACP runner is apply-only: `boss session` rejects it with
 `acp_session_unsupported`. There is no hidden native path, and a change that
 needs an interactive session belongs to a native runner. The supported knobs
-are `command`, `model`, `mode`, `policy`, `deny` and `apply`; `args` and `env`
-are native-only and have no effect on an ACP child.
+are `command`, `model`, `effort`, `mode`, `policy`, `deny` and `apply`; `args`
+and `env` are native-only and have no effect on an ACP child. The supervisor
+sets the model first and the effort (ACP category `thought_level`) after it,
+reads both back from the returned configuration and sends no prompt until they
+match the declared values. It repeats that confirmation before every prompt and
+after `session/load`, so a retrigger or resume cannot drift silently.
+`boss model check <runner>` probes the same profile a dispatch uses and sends no
+prompt.
 
 Permissions follow the runner policy. `policy = "ask"` leaves an unmatched
 request pending and wakes you with `blocked`; every pending request is queued by
@@ -514,6 +538,29 @@ removes it: `boss finish` deletes the state and the profile but keeps the
 transcript as the evidence for the apply. Cleanup is an operator decision; no
 retention policy is implemented.
 
+### Model errors
+
+The runtime refuses or stops an apply when the model cannot be guaranteed. Never
+override the runner, substitute the default runner or another model, raise a
+limit, or retrigger into a different model. Journal the failure, leave the
+change undispatched (or park the stopped apply), continue with changes that do
+not depend on it, and hand the decision to the operator at the end.
+
+| Error or stop | Reaction |
+| --- | --- |
+| `model_unpinned` | Add `model` to the runner or use a pinned runner; journal which one |
+| `model_uncataloged` | Add a `[models]` entry (provider, billing, limit) before dispatching again |
+| `model_not_offered` | The agent does not offer the declared model; pick a runner whose model it offers, or fix the catalog |
+| `effort_not_offered` | The agent offers no such effort for that model; fix the runner or catalog |
+| `model_mismatch` | The agent reports another model or effort. Review the kept work; do not retrigger with another model without the operator |
+| `model_confirmation_late` | A metered model needs a transport that confirms first; use an ACP runner |
+| `model_fallback_configured` | Remove the agent-side fallback flag; a missing model must fail |
+| `model_limit_missing` | Set `limit_usd` or `limit_tokens` for a metered model |
+| `model_untried` | Run the authorized `boss model trial <runner>` first |
+| `provider_not_allowed` | The project does not allow the model's provider; a provider change is a charter decision |
+| `invalid_runner_model` | The runner selects a model twice or names an invalid effort; fix `boss.toml` |
+| wake `mismatch` / `cost_limit` | Review the kept worktree; retrigger only after an explicit decision, never with another model and never by raising the limit without authorization |
+
 ### The mission loop
 
 1. **Reconcile before each dispatch.** After a change finished or was parked
@@ -570,6 +617,12 @@ retention policy is implemented.
      runner denies the destructive commands an apply never needs, `missing`,
      `unavailable` or `off` means it does not. Journal that once per run and
      continue - never stop for it, and never treat it as a charter decision.
+   - The dispatch result also carries `model`. Read its `status` before you
+     report anything: `confirmed` may be named as fact together with runner,
+     model, effort and billing class; `pending`, `unpinned`, `unverifiable` and
+     `unknown` must be labelled as such (for example "declared, not yet
+     confirmed"). For a native runner the confirmation happens after the first
+     answer: end your turn and rely on the wake, do not poll.
    - dispatched -> end your turn. The waiter wakes you when the apply settles;
      never poll `boss status`.
 

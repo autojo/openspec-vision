@@ -714,12 +714,17 @@ start_acp_supervisor() {
 # written an error. Dispatch uses this so a bad command/model/mode fails the
 # dispatch instead of leaving a half-created apply behind.
 acp_wait_ready() {
-  local state_file="$1" timeout="${2:-$BOSS_ACP_START_TIMEOUT_MS}" deadline error ready pid change
+  local state_file="$1" timeout="${2:-$BOSS_ACP_START_TIMEOUT_MS}" deadline error ready pid change error_code
   change="$(jq -r '.change // "acp"' "$state_file" 2>/dev/null || printf acp)"
   deadline=$(( $(now_ms) + timeout ))
   while :; do
     error="$(jq -r '.acp.error // empty' "$state_file" 2>/dev/null || true)"
     if [ -n "$error" ]; then
+      error_code="$(jq -r '.acp.error_code // empty' "$state_file" 2>/dev/null || true)"
+      case "$error_code" in
+        model_not_offered|effort_not_offered|model_mismatch|mode_not_offered)
+          die_json "$error_code" "ACP session configuration failed for the apply: $error" ;;
+      esac
       die_json "acp_start_failed" "ACP supervisor failed for the apply: $error"
     fi
     ready="$(jq -r '.acp.ready // false' "$state_file" 2>/dev/null || printf false)"
@@ -829,6 +834,19 @@ dispatch_change() {
   [ -n "$dispatcher_boss" ] || dispatcher_boss="$(boss_agent_name "$dispatcher_workspace")"
 
   check_apply_ready "$project" "$change"
+
+  # The model gate runs before any tab, worktree or state exists. A refused
+  # model therefore leaves nothing behind; under policy 'warn' the same check
+  # returns warnings and an unchecked/unpinned status instead. It is called
+  # directly (not in a command substitution) so its die_json really ends the
+  # dispatch instead of a subshell.
+  local model_cfg model_json model_tmp
+  model_cfg="$(config_json)" || exit 1
+  model_tmp="$(mktemp)"
+  model_gate_dispatch "$runner" "$project" "$model_cfg" >"$model_tmp"
+  model_json="$(cat "$model_tmp")"
+  rm -f "$model_tmp"
+
   local agent_name
   agent_name="$(apply_agent_name "$change")"
 
@@ -912,8 +930,8 @@ dispatch_change() {
       --argjson touches "$touches_json" --argjson declared "$declared" \
       --argjson wake_target "$wake_target" --argjson warnings "$warnings_json" \
       --argjson project_registered "$project_registered" --arg hint "$hint" --arg resource_warning "$resource_warn" \
-      --argjson mode "$mode_json" --argjson policy "$policy_json" \
-      '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, transport: (if $transport == "" then "herdr" else $transport end), worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), touches: $touches, declared: $declared, status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode, policy: $policy}')"
+      --argjson mode "$mode_json" --argjson policy "$policy_json" --argjson model "$model_json" \
+      '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, transport: (if $transport == "" then "herdr" else $transport end), worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), touches: $touches, declared: $declared, status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode, policy: $policy, model: $model}')"
     lock_release "$BOSS_DISPATCH_LOCK"
     BOSS_DISPATCH_LOCK=""
     return 0
@@ -1049,7 +1067,7 @@ dispatch_change() {
     lessons_block="$(lessons_prompt_block "$gfile" "$pfile")" || lessons_block=""
   fi
 
-  local acp_prompt="" acp_command="" acp_model="" acp_mode="" acp_policy="" acp_transcript=""
+  local acp_prompt="" acp_command="" acp_model="" acp_effort="" acp_mode="" acp_policy="" acp_transcript=""
   local acp_socket="" acp_deny="[]" acp_events="" acp_boss_bin="" acp_heartbeat=""
   local acp_isolate="false" acp_profile=""
   if [ "$start" = "acp" ]; then
@@ -1057,6 +1075,7 @@ dispatch_change() {
       "$external_block" "$commit_block" "$runner_yield" "$apply_cmd")"
     acp_command="$(printf '%s' "$runner" | jq -r '.command // empty')"
     acp_model="$(printf '%s' "$runner" | jq -r '.model // empty')"
+    acp_effort="$(printf '%s' "$runner" | jq -r '.effort // empty')"
     acp_mode="$(printf '%s' "$runner" | jq -r '.mode // "smart_approve"')"
     acp_policy="$(printf '%s' "$runner" | jq -r '.policy // "allow"')"
     acp_isolate="$(printf '%s' "$runner" | jq -r 'if has("isolate") then (.isolate != false) else true end')"
@@ -1112,15 +1131,17 @@ dispatch_change() {
     --argjson touches "$touches_json" --argjson declared "$declared" \
     --arg started_at "$now" --arg last_state "$( [ "$start" = "acp" ] && printf starting || printf working )" --arg last_state_at "$now" \
     --arg acp_command "$acp_command" --arg acp_prompt "$acp_prompt" --arg acp_model "$acp_model" \
+    --arg acp_effort "$acp_effort" \
     --arg acp_mode "$acp_mode" --arg acp_policy "$acp_policy" --arg acp_transcript "$acp_transcript" \
     --arg acp_socket "$acp_socket" --arg acp_events "$acp_events" --arg acp_boss_bin "$acp_boss_bin" \
     --arg acp_heartbeat "$acp_heartbeat" --arg acp_root "$apply_root" --argjson acp_deny "${acp_deny:-[]}" \
     --arg acp_isolate "$acp_isolate" --arg acp_profile "$acp_profile" \
-    --argjson mode "$mode_json" \
-    '{change: $change, project: $project, runner: $runner, kind: $kind, transport: $start, apply_cmd: $apply_cmd, note: $note, lessons: $lessons, external_block: $external_block, commit_block: $commit_block, commit_policy: $commit_policy, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), touches: $touches, declared: $declared, merge_state: "none", merged: false, merge_test: "not_run", kept: false, boss: $boss, boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_workspace: (if $boss_workspace == "" then null else $boss_workspace end), boss_cwd: (if $boss_cwd == "" then null else $boss_cwd end), boss_cross_workspace: $boss_cross, boss_cross_project: $boss_cross_project, base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at, opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode,
+    --argjson mode "$mode_json" --argjson model "$model_json" \
+    '{change: $change, project: $project, runner: $runner, kind: $kind, transport: $start, apply_cmd: $apply_cmd, note: $note, lessons: $lessons, external_block: $external_block, commit_block: $commit_block, commit_policy: $commit_policy, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), touches: $touches, declared: $declared, merge_state: "none", merged: false, merge_test: "not_run", kept: false, boss: $boss, boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_workspace: (if $boss_workspace == "" then null else $boss_workspace end), boss_cwd: (if $boss_cwd == "" then null else $boss_cwd end), boss_cross_workspace: $boss_cross, boss_cross_project: $boss_cross_project, base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at, opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode, model: $model,
      acp: (if $start == "acp" then {
        command: $acp_command, apply_root: $acp_root, prompt: $acp_prompt,
        model: (if $acp_model == "" then null else $acp_model end),
+       effort: (if $acp_effort == "" then null else $acp_effort end),
        mode: $acp_mode, policy: $acp_policy, deny: $acp_deny,
        session_id: null, supervisor_pid: null, control_socket: $acp_socket,
        transcript: $acp_transcript, events_file: $acp_events,
@@ -1181,8 +1202,8 @@ dispatch_change() {
     --argjson touches "$touches_json" --argjson declared "$declared" \
     --argjson wake_target "$wake_target" --argjson warnings "$warnings_json" \
     --argjson project_registered "$project_registered" --arg hint "$hint" --arg resource_warning "$resource_warn" \
-    --argjson mode "$mode_json" --argjson policy "$policy_json" \
-    '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, transport: $transport, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), touches: $touches, declared: $declared, status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode, policy: $policy}')"
+    --argjson mode "$mode_json" --argjson policy "$policy_json" --argjson model "$model_json" \
+    '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, transport: $transport, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), touches: $touches, declared: $declared, status: $status, wake_target: $wake_target, warnings: $warnings, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end), resource_warning: (if $resource_warning == "" then null else $resource_warning end), opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode, policy: $policy, model: $model}')"
   lock_release "$BOSS_DISPATCH_LOCK"
   BOSS_DISPATCH_LOCK=""
 }

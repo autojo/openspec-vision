@@ -24,8 +24,8 @@ boss_skill_dirs=(
 boss_skill_marker=".vision-managed"
 runtime_files=(boss boss-lib.sh boss-waiter
   boss-apply.sh boss-status.sh boss-review.sh boss-run.sh boss-doctor.sh boss-mission.sh
-  boss-acp)
-runtime_lib_files=(boss_acp.py)
+  boss-model.sh boss-acp)
+runtime_lib_files=(boss_acp.py boss_model.py)
 opencode_commands_dir="$opencode_dir/commands"
 claude_commands_dir="$claude_dir/commands/boss"
 config_dir="$HOME/.config/openspec-boss"

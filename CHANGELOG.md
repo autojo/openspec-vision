@@ -1,5 +1,77 @@
 # Changelog
 
+## 1.3.0
+
+### Added
+
+- Model selection: a runner declares `model` (native and ACP) and optional
+  `effort`, and every dispatch pins one model. `[models]` records provider,
+  billing class (`free`, `metered`, `quota`), per-apply limits, expected ids and
+  allowed helper models; `[model_policy]`, `[model_roles]` and
+  `[model_providers]` add the unpinned policy, role-to-runner mapping and the
+  project's allowed providers.
+- Confirmation: the ACP supervisor sets the model, then the effort (category
+  `thought_level`), reads both back from the returned configuration and sends no
+  prompt until they match. It repeats the check before every prompt and after
+  `session/load`. A later `config_option_update` that deviates is a mismatch.
+- Native confirmation: after the first answer the waiter reads the model from
+  the `claude` transcript (ignoring synthetic entries) or the OpenCode session
+  API and records `confirmed`, `mismatch` or `unverifiable`.
+- Apply state, dispatch result, `boss status` (text and JSON, single and
+  aggregate), wake text and `boss review` carry a `model` object with declared
+  and confirmed values, source, provider, billing, cost and tokens. An old
+  state reads as `unknown`.
+- Cost limits: reported use is summed across prompts; at 80 percent a warning is
+  recorded, at the limit the turn is cancelled with `cost_limit` and the boss is
+  woken once. Unknown cost stays `unknown`, never zero.
+- `boss model list`, `boss model check` (handshake only, no prompt) and
+  `boss model trial` (one fixed prompt in an empty temporary directory, only
+  with `--confirm-spend` or a charter amount) with regenerated wrappers.
+- Doctor: unpinned runners and the mission changes that use them, catalog,
+  limit, provider, trial and helper-model checks, and a probe that uses the same
+  profile kind a dispatch uses. A non-isolated probe closes and deletes its
+  session or reports the one that remains.
+- New error codes: `model_unpinned`, `model_uncataloged`, `model_not_offered`,
+  `effort_not_offered`, `model_mismatch`, `model_confirmation_late`,
+  `model_fallback_configured`, `model_limit_missing`, `model_untried`,
+  `provider_not_allowed`, plus the extended `invalid_runner_model`; stop reason
+  `cost_limit`.
+- Skills: task roles resolve to `runner:` bullets, a second review uses another
+  vendor, the charter has a Runner Policy table and the shared RUN block reacts
+  to every model error. The boss and vision run blocks stay byte-identical.
+
+### Changed
+
+- A metered model is only dispatched through a transport that confirms before
+  the first prompt (ACP); a native metered runner is refused with
+  `model_confirmation_late`. A model without a catalog entry, a metered model
+  without a limit and a provider not allowed for the project are refused before
+  a tab, worktree or state exists. Under `unpinned = "warn"` they start with a
+  visible warning instead; `strict` refuses them.
+- A runner that declares `model` and also passes `--model`/`--effort` in `args`
+  is refused with `invalid_runner_model`; `--fallback-model` is refused with
+  `model_fallback_configured`.
+- `boss doctor` probes an ACP runner in the user's own profile when
+  `isolate = false` (instead of a temporary profile), so a model a dispatch can
+  select is not reported as missing.
+
+### Migration
+
+Follow the design's Migration Plan in this order:
+
+1. Answer the open design questions and adjust the specs when an answer differs
+   from the recommendation.
+2. Install this runtime with `[model_policy] unpinned = "warn"`; nothing that
+   runs today stops.
+3. Add `[models]`, `[model_roles]` and `[model_providers]`, and move a native
+   `--model` from `args` to the runner's `model` field (and `--effort` to
+   `effort`).
+4. Run `boss doctor` until no unpinned runner is in use, run the authorized
+   trials, then switch to `unpinned = "strict"`.
+
+Rollback: set `warn` or remove the new tables; old states and missions stay
+readable.
+
 ## 1.2.0
 
 ### Added

@@ -15,6 +15,8 @@ BOSS_CYCLES_DIR="$BOSS_STATE_DIR/cycles"
 BOSS_BOSSES_DIR="$BOSS_STATE_DIR/bosses"
 BOSS_INBOX_DIR="$BOSS_STATE_DIR/inbox"
 BOSS_WORKTREES_DIR="$BOSS_STATE_DIR/worktrees"
+# Trial records for metered models (model-selection capability).
+BOSS_MODELS_DIR="$BOSS_STATE_DIR/models"
 
 # cpu_count -- number of online CPUs, or 1 when it cannot be determined.
 cpu_count() {
@@ -318,6 +320,12 @@ die_json() {
     BOSS_FAILED_TAB=""
   fi
   if [ -n "$extra" ]; then
+    if ! printf '%s' "$extra" | jq -e . >/dev/null 2>&1; then
+      log "warning: dropping malformed error extra for $code"
+      extra=""
+    fi
+  fi
+  if [ -n "$extra" ]; then
     jq -nc --arg code "$code" --arg msg "$msg" --argjson tail "$tail_json" --argjson extra "$extra" \
       '{error: $code, message: $msg} + (if $tail == null then {} else {pane_tail: $tail} end) + $extra' >&2
   else
@@ -581,7 +589,7 @@ opencode_major_version() {
 # runner with absent or empty args gets '--auto' on OpenCode V2; V1 and an
 # unknown version get no extra argument and keep their legacy behavior.
 runner_args_of() {
-  local runner="$1" with_policy="${2:-1}" args kind version
+  local runner="$1" with_policy="${2:-1}" args kind version model effort
   args="$(printf '%s' "$runner" | jq -r '.args[]? // empty')"
   if [ -n "$args" ]; then
     printf '%s\n' "$args"
@@ -591,6 +599,15 @@ runner_args_of() {
       version="$(opencode_major_version)"
       [ "$version" = "2" ] && printf '%s\n' '--auto'
     fi
+  fi
+  # A native agent that takes a model at start gets it from the runner's
+  # declared fields (a second --model in args is refused by resolve_runner).
+  kind="$(printf '%s' "$runner" | jq -r '.kind // empty')"
+  if [ "$kind" = "claude" ]; then
+    model="$(printf '%s' "$runner" | jq -r '.model // empty')"
+    effort="$(printf '%s' "$runner" | jq -r '.effort // empty')"
+    [ -n "$model" ] && printf '%s\n' "--model" "$model"
+    [ -n "$effort" ] && printf '%s\n' "--effort" "$effort"
   fi
   # The deny block goes last: '--disallowedTools' takes several values, so
   # anything after it would be read as a tool name. It applies to the apply
@@ -1881,6 +1898,436 @@ boss_acp_py() {
   fi
 }
 
+# boss_model_py -- path of the native session-record adapter library.
+boss_model_py() {
+  local dir="${BIN_DIR:-}"
+  [ -n "$dir" ] || dir="$(dirname "$(resolve_path "${BASH_SOURCE[0]}")")"
+  if [ -f "$dir/boss_model.py" ]; then
+    printf '%s\n' "$dir/boss_model.py"
+  elif [ -f "$dir/../lib/boss_model.py" ]; then
+    printf '%s\n' "$dir/../lib/boss_model.py"
+  fi
+}
+
+# ---------------------------------------------------- model selection ---
+# The model-selection capability keeps the declared and the confirmed model
+# apart. The runtime reads these tables from boss.toml; a config without them
+# keeps the previous behavior (policy 'warn', no catalog).
+
+# model_policy_json <config-json> -- {unpinned, confirm_timeout_s}.
+model_policy_json() {
+  printf '%s' "$1" | jq -c '
+    (.model_policy // {}) as $p
+    | {unpinned: ($p.unpinned // "warn"),
+       confirm_timeout_s: ($p.confirm_timeout_s // 120)}'
+}
+
+# model_config_validate <config-json> -- die with a specific config error when
+# [models], [model_policy], [model_roles] or [model_providers] is malformed.
+# Validates the billing class, positive limits, the policy values, known runner
+# names in roles and project lists of provider names.
+model_config_validate() {
+  local cfg="$1" bad first code msg
+  bad="$(printf '%s' "$cfg" | jq -r '
+    . as $c
+    | def bad($code; $msg): $code + "\t" + $msg;
+    ( (.models // {}) | to_entries[]
+      | .key as $k | .value as $v
+      | if ($v | type) != "object" then
+          bad("invalid_model_billing"; "model \($k) must be a table")
+        elif (($v.billing // "") | IN("free", "metered", "quota") | not) then
+          bad("invalid_model_billing"; "model \($k) has invalid billing \($v.billing // "missing"); use free, metered or quota")
+        elif (($v.provider // "") | type) != "string" or ($v.provider // "") == "" then
+          bad("invalid_model_billing"; "model \($k) names no provider")
+        elif ($v.limit_usd != null) and (($v.limit_usd | type) != "number" or $v.limit_usd <= 0) then
+          bad("invalid_model_limit"; "model \($k) limit_usd must be a positive number")
+        elif ($v.limit_tokens != null) and (($v.limit_tokens | type) != "number" or $v.limit_tokens <= 0 or ($v.limit_tokens | floor) != $v.limit_tokens) then
+          bad("invalid_model_limit"; "model \($k) limit_tokens must be a positive integer")
+        elif (($v.expect // []) | type) != "array" or any((($v.expect // [])[]); type != "string") then
+          bad("invalid_model_billing"; "model \($k) expect must be a list of model ids")
+        elif (($v.helpers // []) | type) != "array" or any((($v.helpers // [])[]); type != "string") then
+          bad("invalid_model_billing"; "model \($k) helpers must be a list of globs")
+        else empty end )
+    , ( (.model_policy // {}) as $p
+      | if (($p.unpinned // "warn") | IN("warn", "strict") | not) then
+          bad("invalid_model_policy"; "model_policy.unpinned must be warn or strict")
+        elif ($p.confirm_timeout_s != null) and (($p.confirm_timeout_s | type) != "number" or $p.confirm_timeout_s <= 0) then
+          bad("invalid_model_policy"; "model_policy.confirm_timeout_s must be a positive number")
+        else empty end )
+    , ( (.model_roles // {}) | to_entries[]
+      | .key as $role | .value as $n
+      | if ($n | type) != "string" or (($c.runners // {}) | has($n) | not) then
+          bad("invalid_model_role"; "model role \($role) names unknown runner \($n)")
+        else empty end )
+    , ( (.model_providers // {}) | to_entries[]
+      | .key as $p | .value as $v
+      | if ($v | type) != "array" or any($v[]; type != "string" or length == 0) then
+          bad("invalid_model_providers"; "model_providers.\($p) must be a list of provider names")
+        else empty end )
+  ' 2>/dev/null || true)"
+  [ -n "$bad" ] || return 0
+  first="$(printf '%s\n' "$bad" | head -n 1)"
+  code="${first%%$'\t'*}"
+  msg="${first#*$'\t'}"
+  die_json "$code" "$msg"
+}
+
+# model_project_key <config-json> <project-path> -- the [model_providers] key
+# for a project: its registry name when one matches, otherwise the basename.
+model_project_key() {
+  local cfg="$1" project="$2" key
+  key="$(printf '%s' "$cfg" | jq -r --arg p "$project" --arg b "$(basename "$project")" '
+    (.projects // {}) | to_entries[]
+    | select((.value | type) == "string")
+    | select(.value == $p or .value == $b)
+    | .key' 2>/dev/null | head -n 1)"
+  [ -n "$key" ] || key="$(basename "$project")"
+  printf '%s' "$key"
+}
+
+# model_catalog_entry <config-json> <model> -- the entry as compact JSON, or
+# null. The caller distinguishes "no entry" from "null entry".
+model_catalog_entry() {
+  printf '%s' "$1" | jq -c --arg m "$2" '.models[$m] // null'
+}
+
+# model_runner_pinned <runner-json> -- 0 when the runner pins a model in a way
+# its transport can apply. Native OpenCode cannot be given a model at start, so
+# a model field there does not count.
+model_runner_pinned() {
+  local runner="$1" declared start kind
+  declared="$(printf '%s' "$runner" | jq -r '.model // empty')"
+  [ -n "$declared" ] || return 1
+  start="$(runner_start_of "$runner")"
+  kind="$(printf '%s' "$runner" | jq -r '.kind // empty')"
+  [ "$start" = "acp" ] && return 0
+  [ "$kind" = "claude" ] && return 0
+  return 1
+}
+
+# model_pinned_runners <config-json> -- names of the runners a dispatch can use
+# with a pinned model, one per line.
+model_pinned_runners() {
+  printf '%s' "$1" | jq -r '
+    (.runners // {}) | to_entries[]
+    | select((.value.model // "") != "")
+    | select(((.value.start // "herdr") == "acp") or ((.value.kind // "") == "claude"))
+    | .key' 2>/dev/null || true
+}
+
+# model_agent_version <command|kind> -- a one-line version of the agent behind
+# a runner, or empty when it cannot be read. BOSS_MODEL_AGENT_VERSION overrides
+# the probe (tests, a wrapper that has no --version).
+model_agent_version() {
+  local command="$1" bin out
+  [ -n "$command" ] || return 0
+  if [ -n "${BOSS_MODEL_AGENT_VERSION:-}" ]; then
+    printf '%s' "$BOSS_MODEL_AGENT_VERSION"
+    return 0
+  fi
+  bin="${command%% *}"
+  command -v "$bin" >/dev/null 2>&1 || return 0
+  out="$(run_with_deadline 5 bash -c "$command --version" 2>/dev/null || true)"
+  printf '%s' "$out" | sed -n '1p' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# model_trial_record_for <model> -- path of the trial record of a model.
+model_trial_record_for() {
+  printf '%s/%s.json\n' "$BOSS_MODELS_DIR" "$(sha1_hex "trial:$1")"
+}
+
+# model_trial_status <runner-json> <config-json> <project> -- compact JSON
+# {status, reasons, record, path}. status is missing, stale or valid. A trial
+# counts as missing when the model, effort, command or agent version differs
+# from the record, matching the spec's stale rule.
+model_trial_status() {
+  local runner="$1" cfg="$2" project="$3"
+  local model entry command effort path record reasons_json="[]" reason
+  model="$(printf '%s' "$runner" | jq -r '.model // empty')"
+  entry="$(model_catalog_entry "$cfg" "$model")"
+  command="$(printf '%s' "$runner" | jq -r '.command // .kind // empty')"
+  effort="$(printf '%s' "$runner" | jq -r '.effort // empty')"
+  path="$(model_trial_record_for "$model")"
+  if [ "$entry" != "null" ] && [ "$(printf '%s' "$entry" | jq -r '.billing // empty')" != "metered" ]; then
+    jq -nc --arg p "$path" '{status: "not_required", reasons: [], record: null, path: $p}'
+    return 0
+  fi
+  if [ -z "$model" ] || [ ! -f "$path" ]; then
+    jq -nc --arg p "$path" '{status: "missing", reasons: ["no_record"], record: null, path: $p}'
+    return 0
+  fi
+  record="$(jq -c '.' "$path" 2>/dev/null || printf null)"
+  if [ "$record" = "null" ]; then
+    jq -nc --arg p "$path" '{status: "missing", reasons: ["unreadable_record"], record: null, path: $p}'
+    return 0
+  fi
+  reason() { reasons_json="$(printf '%s' "$reasons_json" | jq -c --arg r "$1" '. + [$r]')"; }
+  [ "$(printf '%s' "$record" | jq -r '.status // empty')" = "ok" ] || reason "status"
+  [ "$(printf '%s' "$record" | jq -r '.confirmed // empty')" = "$model" ] || reason "model"
+  [ "$(printf '%s' "$record" | jq -r '.model // empty')" = "$model" ] || reason "model"
+  [ "$(printf '%s' "$record" | jq -r '.effort // empty')" = "$effort" ] || reason "effort"
+  [ "$(printf '%s' "$record" | jq -r '.command // empty')" = "$command" ] || reason "command"
+  local recorded_version current_version
+  recorded_version="$(printf '%s' "$record" | jq -r '.agent_version // empty')"
+  current_version="$(model_agent_version "$command")"
+  if [ -n "$recorded_version" ] && [ -n "$current_version" ] && [ "$recorded_version" != "$current_version" ]; then
+    reason "agent_version"
+  fi
+  if [ "$(printf '%s' "$reasons_json" | jq 'length')" -eq 0 ]; then
+    jq -nc --argjson rec "$record" --arg p "$path" \
+      '{status: "valid", reasons: [], record: $rec, path: $p}'
+  else
+    jq -nc --argjson rec "$record" --argjson reasons "$reasons_json" --arg p "$path" \
+      '{status: "stale", reasons: $reasons, record: $rec, path: $p}'
+  fi
+}
+
+# model_gate_dispatch <runner-json> <project> <config-json> -- the dispatch
+# gate of the model-selection capability. Prints the initial .model object as
+# compact JSON, or dies with model_unpinned, model_uncataloged,
+# model_limit_missing, provider_not_allowed, model_confirmation_late or
+# model_untried. It runs before any tab, worktree or state exists.
+model_gate_dispatch() {
+  local runner="$1" project="$2" cfg="$3"
+  local name declared effort policy strict start kind entry provider billing vendor
+  local limit_usd limit_tokens expect_json helpers_json
+  local pkey providers_json warnings_json='[]' unchecked=false status trust
+  name="$(printf '%s' "$runner" | jq -r '.name // empty')"
+  declared="$(printf '%s' "$runner" | jq -r '.model // empty')"
+  effort="$(printf '%s' "$runner" | jq -r '.effort // empty')"
+  policy="$(model_policy_json "$cfg" | jq -r '.unpinned')"
+  strict=false
+  [ "$policy" = "strict" ] && strict=true
+  start="$(runner_start_of "$runner")"
+  kind="$(printf '%s' "$runner" | jq -r '.kind // empty')"
+  warn_add() { warnings_json="$(printf '%s' "$warnings_json" | jq -c --arg w "$1" '. + [$w]')"; }
+  gate_json() {
+    jq -nc --arg declared "$declared" --arg effort "$effort" \
+      --arg status "$status" --arg trust "$trust" --arg provider "$provider" \
+      --arg billing "$billing" --arg vendor "$vendor" --argjson unchecked "$unchecked" \
+      --argjson limit_usd "${limit_usd:-null}" --argjson limit_tokens "${limit_tokens:-null}" \
+      --argjson expect "$expect_json" --argjson helpers "$helpers_json" \
+      --argjson warnings "$warnings_json" \
+      '{declared: (if $declared == "" then null else $declared end),
+        effort_declared: (if $effort == "" then null else $effort end),
+        confirmed: null, effort_confirmed: null,
+        status: $status, source: null, checked_at: null, trust: $trust,
+        provider: (if $provider == "" then null else $provider end),
+        billing: (if $billing == "" then null else $billing end),
+        vendor: (if $vendor == "" then null else $vendor end),
+        limit_usd: $limit_usd, limit_tokens: $limit_tokens,
+        expect: $expect, helpers: $helpers, seen: [],
+        cost_usd: null, tokens: null, unchecked: $unchecked,
+        warnings: $warnings}'
+  }
+
+  if ! model_runner_pinned "$runner"; then
+    if [ "$strict" = "true" ]; then
+      die_json "model_unpinned" "runner '$name' pins no model that its transport can apply; set model = \"...\" or choose a pinned runner" \
+        "$(jq -nc --arg r "$name" --argjson pinned "$(model_pinned_runners "$cfg" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+          '{runner: $r, pinned_runners: $pinned}')"
+    fi
+    warn_add "runner '$name' is unpinned; the agent's own default model may be used"
+    status="unpinned"; trust="none"; provider=""; billing=""; vendor=""
+    limit_usd=null; limit_tokens=null; expect_json='[]'; helpers_json='[]'; unchecked=true
+    gate_json
+    return 0
+  fi
+
+  entry="$(model_catalog_entry "$cfg" "$declared")"
+  provider=""; billing=""; vendor=""
+  limit_usd=null; limit_tokens=null; expect_json='[]'; helpers_json='[]'
+  if [ "$entry" = "null" ]; then
+    if [ "$strict" = "true" ]; then
+      die_json "model_uncataloged" "model '$declared' has no [models] entry; add provider, billing and a limit" \
+        "$(jq -nc --arg m "$declared" '{model: $m}')"
+    fi
+    warn_add "model '$declared' has no [models] entry; provider, billing and cost are unchecked"
+    status="pending"; trust="unchecked"; unchecked=true
+  else
+    provider="$(printf '%s' "$entry" | jq -r '.provider // empty')"
+    billing="$(printf '%s' "$entry" | jq -r '.billing // empty')"
+    vendor="$(printf '%s' "$entry" | jq -r '.vendor // empty')"
+    limit_usd="$(printf '%s' "$entry" | jq -c '.limit_usd // null')"
+    limit_tokens="$(printf '%s' "$entry" | jq -c '.limit_tokens // null')"
+    expect_json="$(printf '%s' "$entry" | jq -c '.expect // []')"
+    helpers_json="$(printf '%s' "$entry" | jq -c '.helpers // []')"
+    status="pending"; trust="declared"
+    if [ "$billing" = "metered" ] && [ "$limit_usd" = "null" ] && [ "$limit_tokens" = "null" ]; then
+      die_json "model_limit_missing" "metered model '$declared' has no limit_usd or limit_tokens; set a per-apply limit" \
+        "$(jq -nc --arg m "$declared" --arg b "$billing" '{model: $m, billing: $b}')"
+    fi
+
+    pkey="$(model_project_key "$cfg" "$project")"
+    providers_json="$(printf '%s' "$cfg" | jq -c --arg k "$pkey" '.model_providers[$k] // null')"
+    local missing_provider=""
+    if [ "$providers_json" = "null" ]; then
+      missing_provider="${provider:-unknown provider}"
+    else
+      local check_provider found
+      for check_provider in "$provider" "$vendor"; do
+        [ -n "$check_provider" ] || continue
+        found="$(printf '%s' "$providers_json" | jq -r --arg p "$check_provider" 'index($p) != null')"
+        [ "$found" = "true" ] || missing_provider="$check_provider"
+      done
+    fi
+    if [ -n "$missing_provider" ]; then
+      if [ "$strict" = "true" ]; then
+        die_json "provider_not_allowed" "provider '$missing_provider' of model '$declared' is not allowed for project '$project'" \
+          "$(jq -nc --arg p "$missing_provider" --arg pr "$project" --arg k "$pkey" --argjson allowed "$providers_json" \
+            '{provider: $p, project: $pr, project_key: $k, allowed: $allowed}')"
+      fi
+      if [ "$providers_json" = "null" ]; then
+        warn_add "project '$pkey' lists no allowed providers; provider '$missing_provider' is unchecked"
+      else
+        warn_add "provider '$missing_provider' of model '$declared' is not on the list for project '$pkey'"
+      fi
+    fi
+  fi
+
+  if [ "$billing" = "metered" ] && [ "$start" != "acp" ]; then
+    die_json "model_confirmation_late" "metered model '$declared' needs a transport that confirms before the first prompt; runner '$name' confirms only after the first turn" \
+      "$(jq -nc --arg m "$declared" --arg r "$name" --arg t "$start" '{model: $m, runner: $r, transport: $t}')"
+  fi
+
+  if [ "$billing" = "metered" ]; then
+    local trial
+    trial="$(model_trial_status "$runner" "$cfg" "$project")"
+    if [ "$(printf '%s' "$trial" | jq -r '.status')" != "valid" ]; then
+      die_json "model_untried" "metered model '$declared' has no valid trial record for runner '$name'; run 'boss model trial $name' first" \
+        "$(jq -nc --arg m "$declared" --arg r "$name" --argjson trial "$trial" \
+          '{model: $m, runner: $r, trial: $trial, command: ("boss model trial " + $r)}')"
+    fi
+  fi
+
+  gate_json
+}
+
+# model_state_json <state-file> -- the normalized .model object for display. An
+# apply state written before this capability has no .model; it reads as
+# {status:"unknown"} and the command still succeeds.
+model_state_json() {
+  local state_file="$1"
+  local model
+  model="$(jq -c '.model // null' "$state_file" 2>/dev/null || printf null)"
+  if [ "$model" = "null" ]; then
+    jq -nc '{declared: null, effort_declared: null, confirmed: null,
+      effort_confirmed: null, status: "unknown", source: null,
+      checked_at: null, provider: null, billing: null, cost_usd: null,
+      tokens: null, limit_usd: null, limit_tokens: null, seen: []}'
+    return 0
+  fi
+  printf '%s' "$model" | jq -c '
+    . + {status: (.status // "unknown"),
+         seen: (.seen // []),
+         declared: (.declared // null),
+         confirmed: (.confirmed // null)}'
+}
+
+# model_wake_suffix <state-file> -- a short model line for a wake text, or
+# nothing for an old state without .model.
+model_wake_suffix() {
+  local state_file="$1" m
+  m="$(jq -c '.model // null' "$state_file" 2>/dev/null || printf null)"
+  [ "$m" != "null" ] || return 0
+  printf '%s' "$m" | jq -r '
+    " Model: " + (.declared // "unpinned") + " (" + (.status // "unknown") + ")" +
+    (if (.effort_declared // "") != "" then ", effort " + .effort_declared else "" end) +
+    (if (.confirmed // "") != "" then ", confirmed " + .confirmed else "" end) +
+    (if (.billing // "") != "" then ", " + .billing else "" end) +
+    (if (.cost_usd // null) != null then ", cost " + (.cost_usd | tostring) + " USD" else "" end) + "."'
+}
+
+# model_native_confirm <state-file> <runner-json> [<since-iso>] -- read the
+# native agent's own session record and return the adapter result as compact
+# JSON. Read-only: it never starts or prompts an agent.
+model_native_confirm() {
+  local state_file="$1" runner="$2" since="${3:-}" py out
+  py="$(boss_model_py)"
+  [ -n "$py" ] || { jq -nc '{status:"unverifiable", source:null, message:"boss_model.py is missing"}'; return 0; }
+  out="$(python3 "$py" native-confirm --runner-json "$runner" --state "$state_file" --since "$since" 2>/dev/null || true)"
+  if ! printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
+    jq -nc '{status:"unverifiable", source:null, model:null, effort:null,
+      seen:[], cost_usd:null, tokens:null, message:"the session-record adapter failed"}'
+    return 0
+  fi
+  printf '%s' "$out"
+}
+
+# model_merge_confirm <state-file> <adapter-json> -- record an adapter result in
+# .model without overwriting an existing confirmed value, and return the merged
+# object.
+model_merge_confirm() {
+  local state_file="$1" result="$2"
+  acp_update_state "$state_file" '
+    .model = ((.model // {}) + {
+      confirmed: (if ($r.status == "confirmed") then ($r.model // .model.declared) else (.model.confirmed // null) end),
+      effort_confirmed: (if ($r.status == "confirmed") then ($r.effort // .model.effort_declared) else (.model.effort_confirmed // null) end),
+      status: $r.status,
+      source: ($r.source // .model.source),
+      checked_at: (now | strftime("%Y-%m-%dT%H:%M:%S%z")),
+      seen: ((.model.seen // []) + ($r.seen // []) | unique),
+      cost_usd: (if ($r.cost_usd // null) != null then $r.cost_usd else (.model.cost_usd // null) end),
+      tokens: (if ($r.tokens // null) != null then $r.tokens else (.model.tokens // null) end)
+    })' --argjson r "$result"
+  model_state_json "$state_file"
+}
+
+# model_state_update <state-file> <fields-json> -- merge a JSON object into
+# .model atomically.
+model_state_update() {
+  acp_update_state "$1" '.model = ((.model // {}) + $f)' --argjson f "$2"
+}
+
+# model_usage_fields <usage-json> -- {cost_usd, tokens} from an ACP usage object
+# or a session-record usage object. An absent value stays null, never zero.
+model_usage_fields() {
+  printf '%s' "${1:-null}" | jq -c '
+    if type != "object" then {cost_usd: null, tokens: null} else
+      {cost_usd: ([.cost, .cost_usd, .costUSD, .total_cost] | map(select(type == "number")) | .[0] // null),
+       tokens: ([.inputTokens, .outputTokens, .input_tokens, .output_tokens,
+                 .cache_creation_input_tokens, .cache_read_input_tokens]
+                | map(select(type == "number")) | if length == 0 then null else add end)}
+    end'
+}
+
+# model_configured_helpers <runner-json> <config-json> <project> -- helper model
+# ids the runner's catalog entry lists, plus any model-looking value in the
+# agent's own effective configuration. Read-only; an unreadable config adds
+# nothing. Prints a compact JSON array.
+model_configured_helpers() {
+  local runner="$1" cfg="$2" project="$3" model kind helpers="[]" extra="[]"
+  local settings out
+  model="$(printf '%s' "$runner" | jq -r '.model // empty')"
+  kind="$(printf '%s' "$runner" | jq -r '.kind // empty')"
+  if [ -n "$model" ]; then
+    helpers="$(model_catalog_entry "$cfg" "$model" | jq -c '.helpers // []')"
+  fi
+  case "$kind" in
+    claude)
+      settings="${BOSS_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
+      if [ -f "$settings" ]; then
+        extra="$(jq -c '
+          [ .. | objects | to_entries[]
+            | select(.key | test("(?i)model"))
+            | .value | select(type == "string" and length > 0) ]
+          | unique' "$settings" 2>/dev/null || printf '[]')"
+      fi
+      ;;
+    opencode)
+      if [ -n "${BOSS_OPENCODE_SETTINGS:-}" ] && [ -f "$BOSS_OPENCODE_SETTINGS" ]; then
+        extra="$(jq -c '
+          [ .. | objects | to_entries[]
+            | select(.key | test("(?i)(small|helper|fast|commit).*model|^model$"))
+            | .value | select(type == "string" and length > 0) ]
+          | unique' "$BOSS_OPENCODE_SETTINGS" 2>/dev/null || printf '[]')"
+      fi
+      ;;
+  esac
+  printf '%s' "$helpers" | jq -c --argjson extra "$extra" '. + $extra | unique'
+}
+
+
 # --- Inbox: durable wake items -------------------------------------------
 # One JSON file per wake under $BOSS_INBOX_DIR. The waiter writes an item
 # before it prompts, so a lost prompt can be recovered by draining the inbox
@@ -2939,6 +3386,8 @@ boss_deliver() {
   local state_file="$1" text="$2" st="$3"
   local change project events_file
   local candidates candidate attempt backoff start now out rc code prompt_text plan
+  # The wake text names the model state as recorded; an old state adds nothing.
+  text="$text$(model_wake_suffix "$state_file")"
   change="$(jq -r '.change // empty' "$state_file" 2>/dev/null || true)"
   project="$(jq -r '.project // empty' "$state_file" 2>/dev/null || true)"
   events_file="$(events_file_for "$project" "$change")"

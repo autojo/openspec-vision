@@ -256,6 +256,77 @@ settle_gate() {
   return 0
 }
 
+# model_confirm_native -- after the first answer of a native apply, read the
+# agent's own session record and record confirmed/mismatch/unverifiable. A
+# mismatch, or an unverifiable metered model, interrupts the agent and wakes
+# once; the caller then skips the normal settle delivery. Read-only towards the
+# agent: it only reads the record and sends the runner's interrupt keys.
+# Returns 1 when it sent the model wake itself.
+model_confirm_native() {
+  local status reported runner_json timeout interval deadline result rstatus billing
+  local decl_conf actual stop_reason text keys key
+  status="$(jq -r '.model.status // empty' "$state_file" 2>/dev/null || true)"
+  reported="$(jq -r '.model.mismatch_reported // false' "$state_file" 2>/dev/null || printf false)"
+  if [ "$reported" = "true" ] && [ "$status" != "pending" ]; then
+    return 1
+  fi
+  [ "$status" = "pending" ] || return 0
+  [ "$(jq -r '.transport // "herdr"' "$state_file" 2>/dev/null || printf herdr)" = "acp" ] && return 0
+  timeout="$(config_json 2>/dev/null | jq -r '.model_policy.confirm_timeout_s // 120' 2>/dev/null || printf 120)"
+  [ -n "${BOSS_MODEL_CONFIRM_TIMEOUT_S:-}" ] && timeout="$BOSS_MODEL_CONFIRM_TIMEOUT_S"
+  case "$timeout" in ''|*[!0-9]*) timeout=120 ;; esac
+  interval=2
+  [ "$timeout" -lt 10 ] && interval=1
+  runner_json="$(jq -c '{name:(.runner//"?"), kind:(.kind//""), start:(.transport//"herdr"),
+    model:(.model.declared//""), effort:(.model.effort_declared//"")}' "$state_file")"
+  deadline=$(( $(date +%s) + timeout ))
+  result='{"status":"unverifiable","source":null,"message":"no record read"}'
+  while :; do
+    result="$(model_native_confirm "$state_file" "$runner_json")"
+    rstatus="$(printf '%s' "$result" | jq -r '.status // "unverifiable"')"
+    case "$rstatus" in confirmed|mismatch) break ;; esac
+    [ "$(date +%s)" -lt "$deadline" ] || break
+    sleep "$interval"
+  done
+  model_merge_confirm "$state_file" "$result" >/dev/null 2>&1 || true
+  billing="$(jq -r '.model.billing // empty' "$state_file" 2>/dev/null || true)"
+  decl_conf="$(jq -r '.model.declared // "unpinned"' "$state_file" 2>/dev/null || printf unpinned)"
+  actual="$(printf '%s' "$result" | jq -r '(.model // "unknown") + (if (.effort // "") != "" then " (effort " + .effort + ")" else "" end)')"
+  if [ "$rstatus" = "mismatch" ] || { [ "$rstatus" != "confirmed" ] && [ "$billing" = "metered" ]; }; then
+    # Interrupt the turn with the runner's own keys. The worktree and state
+    # stay; the boss decides what to do next.
+    keys=()
+    while IFS= read -r key; do [ -n "$key" ] && keys+=("$key"); done < <(
+      jq -r '.interrupt_keys[]? // empty' "$state_file" 2>/dev/null || true
+    )
+    if [ "${#keys[@]}" -eq 0 ]; then
+      if [ "$(jq -r '.kind // empty' "$state_file" 2>/dev/null || true)" = "opencode" ]; then
+        keys=(esc esc)
+      else
+        keys=(esc)
+      fi
+    fi
+    herdr agent send-keys "$agent" "${keys[@]}" >/dev/null 2>&1 || true
+    if [ "$rstatus" = "mismatch" ]; then
+      stop_reason="model_mismatch"
+      text="Apply $change in $project: model mismatch after the first answer (declared '$decl_conf', the session record names '$actual'); the turn was interrupted and the work is kept. Next step: boss status $change"
+    else
+      stop_reason="model_unverifiable"
+      text="Apply $change in $project: the model of a metered runner is unverifiable (declared '$decl_conf'); the turn was interrupted and the work is kept. Next step: boss status $change"
+    fi
+    model_state_update "$state_file" "$(jq -nc --arg r "$stop_reason" --arg a "$actual" \
+      '{mismatch_reported: true, stop_reason: $r} + (if $a != "unknown" then {actual: $a} else {} end)')"
+    update_state "mismatch"
+    append_event "$events_file" "$stop_reason" \
+      "$(jq -nc --arg c "$change" --arg p "$project" --arg d "$decl_conf" --arg a "$actual" \
+        '{change: $c, project: $p, declared: $d, actual: $a}')" \
+      || log "warning: could not record the model mismatch"
+    deliver "$text" "mismatch"
+    return 1
+  fi
+  return 0
+}
+
 main() {
   local out st text dialog summary start_json report_state interrupted=false
   local -a next_wait=()
@@ -300,6 +371,12 @@ main() {
     esac
 
     log "settled state: $st"
+    if ! model_confirm_native; then
+      # The model wake was sent (or already sent once). Do not repeat the
+      # normal settle wake; stay armed for a later turn.
+      next_wait=(--until working --until idle --until blocked)
+      continue
+    fi
     report_state="$st"
     interrupted=false
     if jq -e '.interrupted == true' "$state_file" >/dev/null 2>&1; then

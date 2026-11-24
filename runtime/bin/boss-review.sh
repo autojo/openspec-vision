@@ -250,6 +250,7 @@ cmd_review() {
 
   local worktree="$located_worktree" branch="" worktree_workspace="" merge_state="none" merged=false
   local merge_test="not_run" kept=false review_root="$project"
+  local model_json='{"status":"unknown","declared":null,"confirmed":null,"billing":null,"cost_usd":null,"tokens":null}'
   if [ -n "$state_file" ] && [ -f "$state_file" ]; then
     [ -n "$worktree" ] || worktree="$(jq -r '.worktree // empty' "$state_file" 2>/dev/null || true)"
     branch="$(jq -r '.branch // empty' "$state_file" 2>/dev/null || true)"
@@ -259,6 +260,7 @@ cmd_review() {
     merge_test="$(jq -r '.merge_test // "not_run"' "$state_file" 2>/dev/null || true)"
     kept="$(jq -r '.kept // false' "$state_file" 2>/dev/null || printf false)"
     [ -n "$worktree" ] && review_root="$worktree"
+    model_json="$(model_state_json "$state_file")"
   fi
 
   local boss_workspace="" boss_dispatcher=""
@@ -435,8 +437,9 @@ cmd_review() {
     --argjson wake_target "$wake_target" --argjson last_wake "$last_wake" \
     --arg worktree "$worktree" --arg branch "$branch" --arg worktree_workspace "$worktree_workspace" \
     --arg merge_state "$merge_state" --argjson merged "$merged" --arg merge_test "$merge_test" \
-    --argjson kept "$kept" --argjson overlaps "$overlaps" \
+    --argjson kept "$kept" --argjson overlaps "$overlaps" --argjson model "$model_json" \
     '{change: $change, project: $project, summary: (if $summary == "" then null else $summary end),
+      model: $model,
       worktree: (if $worktree == "" then null else $worktree end),
       branch: (if $branch == "" then null else $branch end),
       worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end),
@@ -469,6 +472,18 @@ cmd_review() {
 
   printf 'change: %s\n' "$change"
   printf 'project: %s\n' "$project"
+  printf '%s\n' "$model_json" | jq -r '
+    if .status == "unknown" then "model: unknown (older state)"
+    else "model: " + (.declared // "unpinned") + " (" + .status + ")"
+      + (if (.effort_declared // "") != "" then ", effort " + .effort_declared else "" end)
+      + (if (.billing // "") != "" then ", " + .billing else "" end)
+      + " -- confirmed: " + (.confirmed // "none")
+      + (if (.effort_confirmed // "") != "" then " (effort " + .effort_confirmed + ")" else "" end)
+      + ", source " + (.source // "none")
+      + (if (.cost_usd // null) != null then ", cost " + (.cost_usd | tostring) + " USD"
+         elif (.billing // "") == "quota" then ", quota"
+         else ", cost unknown" end)
+    end'
   if [ -n "$worktree" ]; then
     printf 'worktree: %s\n' "$worktree"
     printf 'branch: %s\n' "${branch:-unknown}"
