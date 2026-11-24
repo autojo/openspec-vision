@@ -7,3 +7,5 @@
 - 2026-11-02T19:23:14+0100 [interrupt] interrupted acp-runner-smoke (ACP session/cancel: cancelled)
 
 - 2026-11-24T21:59:34+0100 [interrupt] interrupted runner-model-selection with keys: esc esc 
+
+- 2026-11-24T22:40:43+0100 [interrupt] interrupted runner-model-selection (ACP session/cancel: cancel_unconfirmed)
