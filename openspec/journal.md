@@ -9,3 +9,5 @@
 - 2026-11-24T21:59:34+0100 [interrupt] interrupted runner-model-selection with keys: esc esc 
 
 - 2026-11-24T22:40:43+0100 [interrupt] interrupted runner-model-selection (ACP session/cancel: cancel_unconfirmed)
+
+- 2026-11-24T23:17:00+0100 [interrupt] interrupted runner-model-selection (ACP session/cancel: cancel_unconfirmed)
