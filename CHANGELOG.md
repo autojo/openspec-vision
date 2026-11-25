@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.4.0
+
+### Added
+
+- ACP protocol lines are bounded by `BOSS_ACP_LINE_LIMIT` (default
+  `67108864`, 64 MiB) at the supervisor and in the doctor probe. A longer line
+  is skipped, reported once with its size and reading continues; a skipped
+  response ends the turn as `transport_lost` instead of waiting for the timeout.
+- A reader that stops now fails the open request, runs its close handler once
+  and ends the turn as `transport_lost` with `acp.transport_lost_reason`, even
+  while the child keeps running. The wake says whether the child and the reader
+  are alive and names `boss retrigger` as the recovery.
+- `boss retrigger` after a lost end stops a child that still runs, resumes the
+  recorded session when the agent offers `session/load`, otherwise opens a new
+  session in the same worktree. Uncommitted files are kept and the command is
+  never refused with `turn_active`.
+- `boss status` and the stall wake report `acp.child_alive`,
+  `acp.reader_alive`, the last activity and its age. `stalled` alone no longer
+  reads as a failed apply.
+- Doctor: an OpenCode memory plugin in the effective configuration is a warning
+  that names the plugin and the per-runner way to leave it out.
+- `boss review` prints the executed test count when the output carries one and
+  flags `0 tests executed` as an empty gate. The count is `quality.tests.executed`
+  with `quality.tests.zero` in JSON.
+- The shared run block of the boss and vision skills carries evidence,
+  coordination and reporting rules: a gate without an executed count is not run,
+  a "nothing changed" claim needs a control that can fail, every test that opens
+  a changed screen runs, an undocumented destructive option needs a disposable
+  trial, nobody is sent into a resource a running operation uses, and reports
+  separate measurement from inference.
+
+### Changed
+
+- `boss finish` cancels the open prompt first, then closes the session and the
+  child within `BOSS_ACP_SHUTDOWN_BUDGET_S` (default `15` seconds). It works
+  with an unanswered prompt, tolerates an already removed state file and leaves
+  no supervisor, socket or heartbeat file behind.
+
 ## 1.3.0
 
 ### Added

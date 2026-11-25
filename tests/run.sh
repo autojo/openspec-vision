@@ -332,6 +332,13 @@ import os
 import sys
 
 MODE = os.environ.get("FAKE_ACP_MODE", "allow")
+MODE_FILE = os.environ.get("FAKE_ACP_MODE_FILE")
+if MODE_FILE:
+    try:
+        with open(MODE_FILE, encoding="utf-8") as handle:
+            MODE = handle.read().strip() or MODE
+    except OSError:
+        pass
 SESSION = "sess-fake"
 MODELS = ["model-a", "model-b"]
 MODES = ["auto", "approve", "smart_approve", "chat"]
@@ -456,7 +463,8 @@ def main():
                 with open(init_log, "w", encoding="utf-8") as handle:
                     json.dump(params, handle)
             result(req_id, {"protocolVersion": 1,
-                            "agentCapabilities": {"loadSession": MODE != "no_load"},
+                            "agentCapabilities": {
+                                "loadSession": MODE not in ("no_load", "no_load_close_stdout")},
                             "agentInfo": {"name": "fake-acp",
                                           "version": os.environ.get("FAKE_ACP_VERSION", "1")}})
         elif method == "session/new":
@@ -522,6 +530,17 @@ def main():
             prompt = req_id
             prompt_kind = MODE
             pending.clear()
+            if MODE in ("close_stdout", "no_load_close_stdout"):
+                # The child keeps running but can no longer answer: the reader
+                # sees EOF while the process is still alive.
+                sys.stdout.flush()
+                os.close(sys.stdout.fileno())
+                import time as _time
+                _time.sleep(60)
+                return 0
+            if MODE == "exit_on_prompt":
+                sys.stdout.flush()
+                return 0
             if MODE == "stream":
                 # One message streamed in chunks, then a whitespace-only chunk
                 # (another message id) and a usage update: last_update must
@@ -3066,12 +3085,14 @@ P_TG="$TMP/project-test-gate"
 make_git_project "$P_TG"
 printf 'test:\n\t@printf "detected\\n"\n' >"$P_TG/Makefile"
 git -C "$P_TG" add Makefile; git -C "$P_TG" commit -qm makefile
-for tg_change in tg-legacy tg-table tg-detected tg-env tg-default tg-fail tg-missing tg-invalid; do
+for tg_change in tg-legacy tg-table tg-detected tg-env tg-default tg-fail tg-missing tg-invalid \
+  tg-count tg-zero tg-nocount; do
   make_change "$P_TG" "$tg_change" '- [ ] 1.1 Code.'
 done
 TG_CONF="$TMP/test-gate.toml"
 TGST="$TMP/test-gate-state"
-for tg_change in tg-legacy tg-table tg-detected tg-env tg-default tg-fail tg-missing tg-invalid; do
+for tg_change in tg-legacy tg-table tg-detected tg-env tg-default tg-fail tg-missing tg-invalid \
+  tg-count tg-zero tg-nocount; do
   make_review_state "$TGST" "$P_TG" "$tg_change"
 done
 tg_config() {
@@ -3121,6 +3142,33 @@ tg_config '[tests]
 tg = "printf default"'
 out="$(tg_review tg-default)"
 check_eq "test gate: default budget" "300" "$(printf '%s' "$out" | jq -r '.quality.tests.timeout_s')"
+
+# 65b. The executed test count is reported when the output carries one; zero is
+# flagged as an empty gate instead of reading as green evidence.
+tg_config '[tests.tg]
+command = "printf \"42 passed in 1.2s\\n\""
+timeout_s = 5'
+out="$(tg_review tg-count)"
+check_eq "test count: parsed" "42" "$(printf '%s' "$out" | jq -r '.quality.tests.executed')"
+check_eq "test count: not zero" "false" "$(printf '%s' "$out" | jq -r '.quality.tests.zero')"
+check_contains "test count: shown in text" "42 executed" \
+  "$(BOSS_CONFIG="$TG_CONF" run_boss_state "$TGST" review tg-count --project "$P_TG" 2>/dev/null)"
+
+tg_config '[tests.tg]
+command = "printf \"Ran 0 tests in 0.001s\\n\""
+timeout_s = 5'
+out="$(tg_review tg-zero)"
+check_eq "test count: zero parsed" "0" "$(printf '%s' "$out" | jq -r '.quality.tests.executed')"
+check_eq "test count: zero flagged" "true" "$(printf '%s' "$out" | jq -r '.quality.tests.zero')"
+check_contains "test count: zero flagged in text" "0 tests executed" \
+  "$(BOSS_CONFIG="$TG_CONF" run_boss_state "$TGST" review tg-zero --project "$P_TG" 2>/dev/null)"
+
+tg_config '[tests.tg]
+command = "printf \"all good\\n\""
+timeout_s = 5'
+out="$(tg_review tg-nocount)"
+check_eq "test count: absent is null" "null" "$(printf '%s' "$out" | jq -r '.quality.tests.executed')"
+check_eq "test count: absent is not zero" "false" "$(printf '%s' "$out" | jq -r '.quality.tests.zero')"
 
 tg_config '[tests.tg]
 command = "exit 1"
@@ -4004,6 +4052,149 @@ acp_boss_fail() {
   HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$ACP_CONF" run_boss_fail_state "$st" "$@"
 }
 
+# 59a. Reader regression: the real AcpClient must read 1 KiB, 60 KiB, 70 KiB and
+# 300 KiB protocol lines, skip one above the configured limit with its size, and
+# still receive the prompt response. The child only writes; no model or network
+# is involved. On the old 64 KiB stream limit the 70 KiB line kills the reader.
+cat >"$TMP/acp_line_child.py" <<'PYEOF'
+#!/usr/bin/env python3
+import json
+import sys
+
+sizes = [int(value) for value in sys.argv[1:]]
+request = json.loads(sys.stdin.readline())
+request_id = request["id"]
+
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+for size in sizes:
+    padding = "x" * max(1, size - 220)
+    out({"jsonrpc": "2.0", "method": "session/update",
+         "params": {"sessionId": "s", "update": {
+             "sessionUpdate": "agent_message_chunk",
+             "content": {"type": "text", "text": padding}}}})
+out({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
+PYEOF
+
+READER_LOG="$TMP/acp-reader.log"; : >"$READER_LOG"
+if BOSS_ACP_LINE_LIMIT=400000 BOSS_LOG_FILE="$READER_LOG" \
+  python3 - "$ROOT" "$TMP/acp_line_child.py" <<'PYEOF'
+import asyncio
+import importlib.util
+import os
+import sys
+
+root, child = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location(
+    "boss_acp", os.path.join(root, "runtime/lib/boss_acp.py"))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+
+async def main():
+    argv = [sys.executable, child, "1024", "61440", "71680", "307200", "500000"]
+    spawn = getattr(mod, "spawn_agent_process", None)
+    if spawn is not None:
+        proc = await spawn(*argv)
+    else:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    seen = []
+    client = mod.AcpClient(proc)
+
+    async def on_notification(message):
+        seen.append(message)
+
+    client.on_notification = on_notification
+    reader = asyncio.create_task(client.reader_loop())
+    try:
+        result = await client.request("session/prompt", {}, timeout=20)
+    finally:
+        reader.cancel()
+        try:
+            await reader
+        except BaseException:
+            pass
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), 5)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+
+    assert result.get("stopReason") == "end_turn", result
+    assert len(seen) == 4, "expected 4 notifications under the limit, saw %d" % len(seen)
+    print("ok")
+
+
+asyncio.run(main())
+PYEOF
+then ok; else bad "acp reader: lines up to 300 KiB must be readable"; fi
+check_contains "acp reader: oversized line reported" "skipped a line of" "$(cat "$READER_LOG")"
+if grep -Eq 'skipped a line of [0-9]{6,} bytes' "$READER_LOG" \
+  && [ "$(sed -n 's/.*skipped a line of \([0-9][0-9]*\) bytes.*/\1/p' "$READER_LOG" | head -n 1)" -gt 400000 ]; then
+  ok
+else
+  bad "acp reader: oversized line does not report its size above the limit"
+fi
+
+# 59b. An error injected into the reader fails the open request with
+# transport_lost and runs the close handler exactly once.
+if python3 - "$ROOT" <<'PYEOF'
+import asyncio
+import importlib.util
+import os
+import sys
+
+root = sys.argv[1]
+spec = importlib.util.spec_from_file_location(
+    "boss_acp", os.path.join(root, "runtime/lib/boss_acp.py"))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+
+class BrokenStream:
+    async def read(self, size):
+        raise RuntimeError("injected reader failure")
+
+
+class FakeProc:
+    stdin = None
+    stdout = BrokenStream()
+    returncode = None
+
+
+async def main():
+    client = mod.AcpClient(FakeProc())
+    future = asyncio.get_running_loop().create_future()
+    client.pending[1] = future
+    closed = []
+
+    async def on_closed():
+        closed.append(1)
+
+    client.on_closed = on_closed
+    await client.reader_loop()
+    assert client.closed, "the reader did not set closed"
+    try:
+        await future
+        raise AssertionError("the pending request did not fail")
+    except mod.AcpError as exc:
+        assert exc.code == "transport_lost", exc.code
+    assert len(closed) == 1, "the close handler ran %d times" % len(closed)
+    print("ok")
+
+
+asyncio.run(main())
+PYEOF
+then ok; else bad "acp reader: a reader error must fail the request as transport_lost"; fi
+
 # 60. ACP dispatch: session, model/mode, prompt, transcript, native start not used.
 make_change "$AP" acp-allow '- [ ] 1.1 Do the work.'
 AS1="$TMP/acp-state-1"; mkdir -p "$AS1"
@@ -4381,6 +4572,38 @@ check_contains "acp doctor: isolation reported" "isolated: true" "$(printf '%s' 
 check_contains "acp doctor: store reported" "per-apply profile" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .hint')"
 if [ -z "$(ls -A "$DTMP" 2>/dev/null)" ]; then ok; else bad "acp doctor: probe left temporary state"; fi
 
+# 64f.1 A known memory plugin in the effective OpenCode config is a warning
+# that names the plugin and the way to leave it out; without one there is no
+# warning, and the doctor changes no file.
+PLUGIN_CONF="$TMP/acp-doctor-plugin.toml"
+cat >"$PLUGIN_CONF" <<EOF
+default = "native"
+
+[projects]
+acp-test = "$AP"
+
+[runners.native]
+kind = "opencode"
+args = []
+apply = "/opsx-apply {change}"
+
+[missions]
+EOF
+PLUGIN_BASE='{"type":"document","path":"/stub/opencode.jsonc","info":{"permissions":[{"action":"*","resource":"*","effect":"allow"}]}}'
+PLUGIN_ON='[{"type":"document","path":"/stub/opencode.jsonc","info":{"permissions":[{"action":"*","resource":"*","effect":"allow"}],"plugins":["opencode-supermemory"]}}]'
+out="$(OPENCODE_STUB_DEBUG_CONFIG="$PLUGIN_ON" BOSS_CONFIG="$PLUGIN_CONF" \
+  run_boss_state "$DAS" doctor --project acp-test --json 2>/dev/null)"
+check_eq "acp doctor: memory plugin warns" "warn" \
+  "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="opencode_memory_plugins") | .status')"
+check_contains "acp doctor: names the plugin" "opencode-supermemory" \
+  "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="opencode_memory_plugins") | .hint')"
+check_contains "acp doctor: names the exclusion" "OPENCODE_CONFIG_CONTENT" \
+  "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="opencode_memory_plugins") | .hint')"
+out="$(OPENCODE_STUB_DEBUG_CONFIG="[$PLUGIN_BASE]" BOSS_CONFIG="$PLUGIN_CONF" \
+  run_boss_state "$DAS" doctor --project acp-test --json 2>/dev/null)"
+check_eq "acp doctor: no memory plugin is quiet" "ok" \
+  "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="opencode_memory_plugins") | .status')"
+
 # 64g. A global always_allow for shell weakens a non-isolated runner.
 WCONF="$TMP/acp-weakened.toml"
 cat >"$WCONF" <<EOF
@@ -4696,12 +4919,22 @@ check_eq "acp stall: wake state" "stalled" \
   "$(jq -r 'select(.event=="stalled") | .state' "$EV16" | head -n 1)"
 check_contains "acp stall: names the last activity" "tool shell" \
   "$(jq -r 'select(.event=="stalled") | .text' "$EV16" | head -n 1)"
+check_contains "acp stall: child and reader alive" "child: alive, reader: alive" \
+  "$(jq -r 'select(.event=="stalled") | .text' "$EV16" | head -n 1)"
+check_contains "acp stall: reports the age" "age " \
+  "$(jq -r 'select(.event=="stalled") | .text' "$EV16" | head -n 1)"
+check_eq "acp stall: last activity time recorded" "true" \
+  "$(jq -r '.acp.last_activity_at != null' "$S16")"
 check_eq "acp stall: state flag" "true" "$(jq -r '.acp.stalled' "$S16")"
 check_eq "acp stall: phase stays working" "working" "$(jq -r '.acp.phase' "$S16")"
-check_eq "acp stall: status shows it" "1" \
-  "$(acp_boss "$AS16" status acp-stall --project acp-test 2>/dev/null | grep -c 'acp stalled: yes' || true)"
+stall_text="$(acp_boss "$AS16" status acp-stall --project acp-test 2>/dev/null)"
+check_contains "acp stall: status shows it" "acp stalled: yes" "$stall_text"
+check_contains "acp stall: status names child and reader" "acp child: true, reader: true" "$stall_text"
+check_contains "acp stall: status names the last activity" "acp last activity:" "$stall_text"
 out="$(acp_boss "$AS16" status acp-stall --project acp-test --json 2>/dev/null)"
 check_eq "acp stall: json flag" "true" "$(printf '%s' "$out" | jq -r '.acp_stalled')"
+check_eq "acp stall: json child" "true" "$(printf '%s' "$out" | jq -r '.acp_child_alive')"
+check_eq "acp stall: json reader" "true" "$(printf '%s' "$out" | jq -r '.acp_reader_alive')"
 sleep 1.5
 check_eq "acp stall: still one wake" "1" "$(acp_count "$EV16" stalled)"
 acp_boss "$AS16" finish acp-stall --project acp-test --force >/dev/null 2>&1
@@ -4746,6 +4979,158 @@ acp_boss "$AS19" answer acp-stall-blocked allow_once --project acp-test >/dev/nu
 acp_wait_phase "$S19" idle || bad "acp stall blocked: did not finish the turn"
 check_eq "acp stall blocked: still no stall" "0" "$(acp_count "$EV19" stalled)"
 acp_boss "$AS19" finish acp-stall-blocked --project acp-test >/dev/null 2>&1
+
+# 76d. A reader that stops while the child still runs ends the turn as
+# transport_lost, wakes once, reports child/reader/last activity in status, and
+# a retrigger resumes the session without losing uncommitted files.
+make_change "$AP" acp-transport-lost '- [ ] 1.1 Do the work.'
+AS21="$TMP/acp-state-21"; mkdir -p "$AS21"
+S21="$(acp_state "$AS21" "$AP" acp-transport-lost)"
+EV21="$(acp_events_file "$AS21" "$AP" acp-transport-lost)"
+MODE21="$TMP/acp-mode-21"; printf 'close_stdout\n' >"$MODE21"
+FAKE_ACP_MODE_FILE="$MODE21" BOSS_ACP_STALL_S=0 BOSS_ACP_TURN_TIMEOUT_S=0 \
+  acp_boss "$AS21" dispatch acp-transport-lost --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S21" 200 || bad "acp transport lost: no stop reason"
+check_eq "acp transport lost: stop reason" "transport_lost" "$(jq -r '.acp.last_stop_reason' "$S21")"
+check_eq "acp transport lost: phase idle" "idle" "$(jq -r '.acp.phase' "$S21")"
+check_contains "acp transport lost: reason recorded" "output stream closed" \
+  "$(jq -r '.acp.transport_lost_reason' "$S21")"
+check_eq "acp transport lost: child alive" "true" "$(jq -r '.acp.child_alive' "$S21")"
+check_eq "acp transport lost: reader gone" "false" "$(jq -r '.acp.reader_alive' "$S21")"
+check_contains "acp transport lost: transcript reason" '"stop_reason":"transport_lost"' \
+  "$(cat "$(jq -r '.acp.transcript' "$S21")")"
+acp_wait_event "$EV21" settled || bad "acp transport lost: no wake"
+acp_wait_event "$EV21" wake || bad "acp transport lost: no delivered wake"
+check_eq "acp transport lost: one transport_lost wake" "1" \
+  "$(jq -Rrc 'select(length > 0) | (fromjson? | select(type=="object")) | select(.event=="settled" and .state=="transport_lost")' "$EV21" | wc -l | tr -d ' ')"
+check_contains "acp transport lost: wake says may still work" "may still be working" \
+  "$(jq -r 'select(.event=="settled" and .state=="transport_lost") | .text' "$EV21" | head -n 1)"
+check_contains "acp transport lost: wake names the dead reader" "reader: gone" \
+  "$(jq -r 'select(.event=="settled" and .state=="transport_lost") | .text' "$EV21" | head -n 1)"
+check_contains "acp transport lost: wake names retrigger" "boss retrigger acp-transport-lost" \
+  "$(jq -r 'select(.event=="settled" and .state=="transport_lost") | .text' "$EV21" | head -n 1)"
+check_eq "acp transport lost: one wake event" "1" "$(acp_count "$EV21" wake)"
+out="$(acp_boss "$AS21" status acp-transport-lost --project acp-test --json 2>/dev/null)"
+check_eq "acp transport lost: status stop" "transport_lost" "$(printf '%s' "$out" | jq -r '.last_stop_reason')"
+check_eq "acp transport lost: status child" "true" "$(printf '%s' "$out" | jq -r '.acp_child_alive')"
+check_eq "acp transport lost: status reader" "false" "$(printf '%s' "$out" | jq -r '.acp_reader_alive')"
+check_contains "acp transport lost: status reason" "output stream closed" \
+  "$(printf '%s' "$out" | jq -r '.acp_transport_lost_reason')"
+transport_text="$(acp_boss "$AS21" status acp-transport-lost --project acp-test 2>/dev/null)"
+check_contains "acp transport lost: status names last stop" "last stop: transport_lost" "$transport_text"
+check_contains "acp transport lost: status shows child and reader" "acp child: true, reader: false" "$transport_text"
+OLDPID21="$(jq -r '.acp.child_pid // empty' "$S21")"
+printf 'uncommitted work\n' >"$AP/keep-me.txt"
+printf 'allow\n' >"$MODE21"
+out="$(acp_boss "$AS21" retrigger acp-transport-lost --project acp-test --note "Continue.")"
+check_eq "acp transport lost: retrigger accepted" "retriggered" "$(printf '%s' "$out" | jq -r '.status')"
+i=0
+while [ "$i" -lt 200 ]; do
+  [ "$(jq -r '.acp.last_stop_reason // empty' "$S21" 2>/dev/null || true)" = "end_turn" ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
+check_eq "acp transport lost: resumed turn ends" "end_turn" "$(jq -r '.acp.last_stop_reason' "$S21")"
+check_eq "acp transport lost: session resumed" "1" "$(acp_count "$EV21" acp_load)"
+check_contains "acp transport lost: replay marker" "after reload" \
+  "$(cat "$(jq -r '.acp.transcript' "$S21")")"
+check_eq "acp transport lost: uncommitted file kept" "uncommitted work" "$(cat "$AP/keep-me.txt")"
+if [ -n "$OLDPID21" ] && kill -0 "$OLDPID21" 2>/dev/null; then
+  bad "acp transport lost: the old child still runs after the retrigger"
+else
+  ok
+fi
+rm -f "$AP/keep-me.txt"
+acp_boss "$AS21" finish acp-transport-lost --project acp-test >/dev/null 2>&1
+
+# 76e. An agent that cannot resume gets a new session in the same worktree.
+make_change "$AP" acp-transport-new '- [ ] 1.1 Do the work.'
+AS22="$TMP/acp-state-22"; mkdir -p "$AS22"
+S22="$(acp_state "$AS22" "$AP" acp-transport-new)"
+EV22="$(acp_events_file "$AS22" "$AP" acp-transport-new)"
+MODE22="$TMP/acp-mode-22"; printf 'no_load_close_stdout\n' >"$MODE22"
+FAKE_ACP_MODE_FILE="$MODE22" BOSS_ACP_STALL_S=0 BOSS_ACP_TURN_TIMEOUT_S=0 \
+  acp_boss "$AS22" dispatch acp-transport-new --project acp-test --runner goose >/dev/null
+acp_wait_stop "$S22" 200 || bad "acp transport new: no stop reason"
+check_eq "acp transport new: stop reason" "transport_lost" "$(jq -r '.acp.last_stop_reason' "$S22")"
+printf 'no_load\n' >"$MODE22"
+out="$(acp_boss "$AS22" retrigger acp-transport-new --project acp-test --note "Start over.")"
+check_eq "acp transport new: retrigger accepted" "retriggered" "$(printf '%s' "$out" | jq -r '.status')"
+i=0
+while [ "$i" -lt 200 ]; do
+  [ "$(jq -r '.acp.last_stop_reason // empty' "$S22" 2>/dev/null || true)" = "end_turn" ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
+check_eq "acp transport new: new turn ends" "end_turn" "$(jq -r '.acp.last_stop_reason' "$S22")"
+check_eq "acp transport new: no session/load" "0" "$(acp_count "$EV22" acp_load)"
+i=0
+while [ "$i" -lt 100 ]; do
+  [ "$(acp_count "$EV22" acp_session)" -ge 2 ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
+check_eq "acp transport new: new session opened" "2" "$(acp_count "$EV22" acp_session)"
+check_not_contains "acp transport new: no replay marker" "after reload" \
+  "$(cat "$(jq -r '.acp.transcript' "$S22")")"
+acp_boss "$AS22" finish acp-transport-new --project acp-test >/dev/null 2>&1
+
+# 76f. Finishing an apply whose prompt is unanswered cancels the turn and ends
+# the supervisor within the shared shutdown budget, leaving no socket or
+# heartbeat file and no traceback in the log.
+make_change "$AP" acp-shutdown-live '- [ ] 1.1 Do the work.'
+AS23="$TMP/acp-state-23"; mkdir -p "$AS23"
+S23="$(acp_state "$AS23" "$AP" acp-shutdown-live)"
+FAKE_ACP_MODE=slow BOSS_ACP_STALL_S=0 BOSS_ACP_TURN_TIMEOUT_S=0 \
+  acp_boss "$AS23" dispatch acp-shutdown-live --project acp-test --runner goose >/dev/null
+i=0
+while [ "$i" -lt 100 ]; do
+  [ "$(jq -r '.acp.phase // empty' "$S23" 2>/dev/null || true)" = "working" ] && \
+    [ -n "$(jq -r '.acp.supervisor_pid // empty' "$S23" 2>/dev/null || true)" ] && break
+  sleep 0.1
+  i=$((i + 1))
+done
+check_eq "acp shutdown live: working" "working" "$(jq -r '.acp.phase' "$S23")"
+LIVEPID="$(jq -r '.acp.supervisor_pid // empty' "$S23")"
+LIVESOCK="$(jq -r '.acp.control_socket // empty' "$S23")"
+LIVEHB="$(jq -r '.acp.heartbeat_file // empty' "$S23")"
+LIVELOG="$AS23/logs/acp-shutdown-live-acp.log"
+out="$(BOSS_ACP_SHUTDOWN_BUDGET_S=5 acp_boss "$AS23" finish acp-shutdown-live --project acp-test --force)"
+check_eq "acp shutdown live: finished" "finished" "$(printf '%s' "$out" | jq -r '.status')"
+if [ -f "$S23" ]; then bad "acp shutdown live: state left behind"; else ok; fi
+if [ -n "$LIVEPID" ] && kill -0 "$LIVEPID" 2>/dev/null; then
+  bad "acp shutdown live: supervisor still alive"
+else
+  ok
+fi
+if [ -n "$LIVESOCK" ] && [ -S "$LIVESOCK" ]; then bad "acp shutdown live: socket left behind"; else ok; fi
+if [ -n "$LIVEHB" ] && [ -f "$LIVEHB" ]; then bad "acp shutdown live: heartbeat left behind"; else ok; fi
+check_not_contains "acp shutdown live: no traceback" "Traceback" "$(cat "$LIVELOG" 2>/dev/null)"
+check_not_contains "acp shutdown live: no missing state crash" "FileNotFoundError" "$(cat "$LIVELOG" 2>/dev/null)"
+
+# 76g. A child that exits before the turn timeout ends the supervisor without a
+# crash and without waiting for the timeout.
+make_change "$AP" acp-child-exit '- [ ] 1.1 Do the work.'
+AS24="$TMP/acp-state-24"; mkdir -p "$AS24"
+S24="$(acp_state "$AS24" "$AP" acp-child-exit)"
+FAKE_ACP_MODE=exit_on_prompt BOSS_ACP_STALL_S=0 BOSS_ACP_TURN_TIMEOUT_S=3 \
+  acp_boss "$AS24" dispatch acp-child-exit --project acp-test --runner goose >/dev/null
+i=0
+while [ "$i" -lt 100 ]; do
+  pid="$(jq -r '.acp.supervisor_pid // empty' "$S24" 2>/dev/null || true)"
+  [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null && break
+  sleep 0.1
+  i=$((i + 1))
+done
+EXITPID="$(jq -r '.acp.supervisor_pid // empty' "$S24" 2>/dev/null || true)"
+if [ -n "$EXITPID" ] && kill -0 "$EXITPID" 2>/dev/null; then
+  bad "acp child exit: supervisor still alive"
+else
+  ok
+fi
+check_not_contains "acp child exit: no timeout" "turn_timeout" "$(jq -r '.acp.last_stop_reason // ""' "$S24")"
+check_not_contains "acp child exit: no traceback" "Traceback" "$(cat "$AS24/logs/acp-child-exit-acp.log" 2>/dev/null)"
+rm -f "$S24"
 
 # 77. Two concurrent permission requests produce one blocked wake that names
 # the count; status lists both and the aggregate shows the count and the ids.
