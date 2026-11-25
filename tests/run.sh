@@ -462,6 +462,11 @@ def main():
             if init_log:
                 with open(init_log, "w", encoding="utf-8") as handle:
                     json.dump(params, handle)
+            env_log = os.environ.get("FAKE_ACP_ENV_LOG")
+            if env_log:
+                with open(env_log, "w", encoding="utf-8") as handle:
+                    json.dump({"XDG_CONFIG_HOME": os.environ.get("XDG_CONFIG_HOME", ""),
+                               "XDG_DATA_HOME": os.environ.get("XDG_DATA_HOME", "")}, handle)
             result(req_id, {"protocolVersion": 1,
                             "agentCapabilities": {
                                 "loadSession": MODE not in ("no_load", "no_load_close_stdout")},
@@ -634,7 +639,7 @@ if __name__ == "__main__":
     sys.exit(main())
 PYEOF
 
-cat >"$BIN/fake-goose" <<'EOF'
+cat >"$BIN/fake-opencode" <<'EOF'
 #!/usr/bin/env bash
 exec python3 "$(dirname "$0")/fake_acp_agent.py" "$@"
 EOF
@@ -655,7 +660,7 @@ run_with_deadline "\$@"
 EOF
 
 chmod +x "$BIN/openspec" "$BIN/herdr" "$BIN/opencode" "$BIN/setsid" "$BIN/deadline" \
-  "$BIN/fake-goose" "$BIN/fake_acp_agent.py"
+  "$BIN/fake-opencode" "$BIN/fake_acp_agent.py"
 
 # A tiny Herdr socket server for the pane.report_metadata call.
 python3 - "$SOCKET" <<'PY' &
@@ -931,16 +936,16 @@ plan_commit() {
 acp_config() {
   local file="$1" project="$2" policy="${3:-allow}" extra="${4:-}"
   cat >"$file" <<EOF
-default = "goose"
+default = "opencode-acp"
 
 [projects]
 acp-test = "$project"
 
-[runners.goose]
+[runners.opencode-acp]
 start = "acp"
-command = "fake-goose"
+command = "fake-opencode"
 model = "model-a"
-mode = "smart_approve"
+mode = ""
 policy = "$policy"
 apply = "Follow the returned tasks."
 
@@ -4013,19 +4018,12 @@ fi
 # network is involved. Each scenario uses its own state root so a forgotten
 # supervisor cannot consume another scenario's slot.
 
-# A minimal user Goose profile: the per-apply profile links these read-through,
-# while its permission store stays boss-owned. Both XDG roots are pinned here:
-# a suite started from inside an ACP apply inherits that apply's profile roots
-# and would otherwise link the profile into itself.
+# An OpenCode ACP runner uses the user's global OpenCode configuration. Both
+# XDG roots are pinned here so the suite never reads the real user profile and
+# can prove that no Goose profile or permission file is created.
 export XDG_CONFIG_HOME="$TMP/.config"
 export XDG_DATA_HOME="$TMP/.local/share"
-mkdir -p "$TMP/.config/goose" "$TMP/.local/share/goose/apps"
-printf 'provider: fake\n' >"$TMP/.config/goose/config.yaml"
-printf 'secret: fake\n' >"$TMP/.config/goose/secrets.yaml"
-printf 'user:\n  always_allow: []\n  never_allow: []\n' >"$TMP/.config/goose/permission.yaml"
-: >"$TMP/.config/goose/permission.yaml.lock"
-GLOBAL_PERMISSION="$TMP/.config/goose/permission.yaml"
-GLOBAL_PERMISSION_CONTENT="$(cat "$GLOBAL_PERMISSION")"
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
 
 AP="$TMP/acp-project"
 make_project "$AP"
@@ -4033,11 +4031,11 @@ ACP_CONF="$TMP/acp-boss.toml"
 acp_config "$ACP_CONF" "$AP"
 cat >>"$ACP_CONF" <<'EOF'
 
-[runners.goose-ask]
+[runners.opencode-ask]
 start = "acp"
-command = "fake-goose"
+command = "fake-opencode"
 model = "model-a"
-mode = "smart_approve"
+mode = ""
 policy = "ask"
 EOF
 ACP_AGENTS='[{"name":"boss-ws-1","pane_id":"p-boss","workspace_id":"ws-1"}]'
@@ -4203,9 +4201,10 @@ START_LOG="$TMP/acp-agent-start.log"; : >"$START_LOG"
 KEYS_LOG="$TMP/acp-keys.log"; : >"$KEYS_LOG"
 PANE_RUN_LOG="$TMP/acp-pane-run.log"; : >"$PANE_RUN_LOG"
 ACP_INIT_LOG="$TMP/acp-init.log"; : >"$ACP_INIT_LOG"
-out="$(FAKE_ACP_MODE=allow FAKE_ACP_INIT_LOG="$ACP_INIT_LOG" \
+ACP_ENV_LOG="$TMP/acp-env.log"; rm -f "$ACP_ENV_LOG"
+out="$(FAKE_ACP_MODE=allow FAKE_ACP_INIT_LOG="$ACP_INIT_LOG" FAKE_ACP_ENV_LOG="$ACP_ENV_LOG" \
   HERDR_AGENT_START_LOG="$START_LOG" HERDR_SEND_KEYS_LOG="$KEYS_LOG" HERDR_PANE_RUN_LOG="$PANE_RUN_LOG" \
-  acp_boss "$AS1" dispatch acp-allow --project acp-test --runner goose)"
+  acp_boss "$AS1" dispatch acp-allow --project acp-test --runner opencode-acp)"
 check_eq "acp dispatch: status" "started" "$(printf '%s' "$out" | jq -r '.status')"
 check_eq "acp dispatch: result transport" "acp" "$(printf '%s' "$out" | jq -r '.transport')"
 check_eq "acp dispatch: state transport" "acp" "$(jq -r '.transport' "$S1")"
@@ -4213,7 +4212,7 @@ check_eq "acp dispatch: no herdr agent start" "" "$(cat "$START_LOG")"
 acp_wait_stop "$S1" || bad "acp dispatch: no stop reason recorded"
 check_eq "acp dispatch: session" "sess-fake" "$(jq -r '.acp.session_id' "$S1")"
 check_eq "acp dispatch: model" "model-a" "$(jq -r '.acp.model' "$S1")"
-check_eq "acp dispatch: mode" "smart_approve" "$(jq -r '.acp.mode' "$S1")"
+check_eq "acp dispatch: no session mode" "null" "$(jq -r '.acp.mode // "null"' "$S1")"
 check_eq "acp dispatch: stop reason" "end_turn" "$(jq -r '.acp.last_stop_reason' "$S1")"
 check_eq "acp dispatch: usage recorded" "2" "$(jq -r '.acp.usage.inputTokens' "$S1")"
 check_eq "acp dispatch: heartbeat" "true" "$(jq -r '.acp.heartbeat != null' "$S1")"
@@ -4230,6 +4229,7 @@ check_contains "acp transcript: tool update" '"type":"tool_call"' "$(cat "$TR1")
 check_contains "acp transcript: usage update" '"type":"usage"' "$(cat "$TR1")"
 check_contains "acp transcript: stop reason" '"stop_reason":"end_turn"' "$(cat "$TR1")"
 check_eq "acp transcript: private mode" "600" "$(file_mode "$TR1")"
+printf 'DEBUG-LOGS: %s\n' "$(ls -la "$AS1" "$AS1/logs" 2>&1 | tr '\n' '|')" >&2
 check_eq "acp supervisor log: private mode" "600" "$(file_mode "$AS1/logs/acp-allow-acp.log")"
 EV1="$(acp_events_file "$AS1" "$AP" acp-allow)"
 acp_wait_event "$EV1" wake || bad "acp dispatch: no wake event"
@@ -4241,35 +4241,35 @@ check_contains "acp tab: transcript tail" "tail -n +1 -f" "$(cat "$PANE_RUN_LOG"
 check_eq "acp init: no fs capability" "none" "$(jq -r '.clientCapabilities.fs // "none"' "$ACP_INIT_LOG")"
 check_eq "acp init: no terminal capability" "none" "$(jq -r '.clientCapabilities.terminal // "none"' "$ACP_INIT_LOG")"
 
-# The apply runs from a per-apply profile. Provider files are links, the
-# permission store is boss-owned, and the user's global store is untouched.
-P1="$(jq -r '.acp.profile_root' "$S1")"
-check_eq "acp profile: recorded" "true" "$([ -n "$P1" ] && [ -d "$P1" ] && echo true || echo false)"
-check_eq "acp profile: config link" "$TMP/.config/goose/config.yaml" \
-  "$(readlink "$P1/config/goose/config.yaml" 2>/dev/null || true)"
-check_eq "acp profile: secrets link" "$TMP/.config/goose/secrets.yaml" \
-  "$(readlink "$P1/config/goose/secrets.yaml" 2>/dev/null || true)"
-check_eq "acp profile: apps link" "$TMP/.local/share/goose/apps" \
-  "$(readlink "$P1/data/goose/apps" 2>/dev/null || true)"
-check_eq "acp profile: private sessions" "true" \
-  "$([ -d "$P1/data/goose/sessions" ] && [ ! -L "$P1/data/goose/sessions" ] && echo true || echo false)"
-check_eq "acp profile: permission is not a link" "true" \
-  "$([ -f "$P1/config/goose/permission.yaml" ] && [ ! -L "$P1/config/goose/permission.yaml" ] && echo true || echo false)"
-check_contains "acp profile: empty always_allow" "always_allow: []" "$(cat "$P1/config/goose/permission.yaml")"
-check_contains "acp profile: shell asks first" "- shell" "$(cat "$P1/config/goose/permission.yaml")"
-check_eq "acp profile: lock file not linked" "true" \
-  "$([ ! -e "$P1/config/goose/permission.yaml.lock" ] && echo true || echo false)"
-check_eq "acp profile: global store unchanged" "$GLOBAL_PERMISSION_CONTENT" "$(cat "$GLOBAL_PERMISSION")"
+# An OpenCode ACP apply uses the global OpenCode configuration: no per-apply
+# profile, no Goose profile and no permission file are created.
+check_eq "acp profile: no profile root" "null" "$(jq -r '.acp.profile_root // "null"' "$S1")"
+check_eq "acp profile: no state profile dir" "0" \
+  "$(find "$AS1/acp" -maxdepth 1 -name 'profile-*' 2>/dev/null | wc -l | tr -d ' ')"
+check_eq "acp profile: global config home" "true" \
+  "$([ "$(jq -r '.XDG_CONFIG_HOME' "$ACP_ENV_LOG")" = "$XDG_CONFIG_HOME" ] && echo true || echo false)"
+check_eq "acp profile: global data home" "true" \
+  "$([ "$(jq -r '.XDG_DATA_HOME' "$ACP_ENV_LOG")" = "$XDG_DATA_HOME" ] && echo true || echo false)"
+check_eq "acp profile: no goose config" "true" \
+  "$([ ! -e "$XDG_CONFIG_HOME/goose" ] && echo true || echo false)"
+check_eq "acp profile: no goose data" "true" \
+  "$([ ! -e "$XDG_DATA_HOME/goose" ] && echo true || echo false)"
+check_eq "acp profile: no goose permission file" "true" \
+  "$([ ! -e "$XDG_CONFIG_HOME/goose/permission.yaml" ] && echo true || echo false)"
 acp_boss "$AS1" finish acp-allow --project acp-test >/dev/null 2>&1
 if [ -f "$S1" ]; then bad "acp finish: state file left behind"; else ok; fi
-if [ -d "$P1" ]; then bad "acp finish: profile left behind"; else ok; fi
+if [ -d "$AS1/acp" ] && [ -n "$(find "$AS1/acp" -maxdepth 1 -name 'profile-*' 2>/dev/null)" ]; then
+  bad "acp finish: profile left behind"
+else
+  ok
+fi
 
 # 60b. A retrigger sends a second prompt through the control socket.
 make_change "$AP" acp-retrigger '- [ ] 1.1 Do the work.'
 ASR="$TMP/acp-state-retrigger"; mkdir -p "$ASR"
 SR="$(acp_state "$ASR" "$AP" acp-retrigger)"
 EVR="$(acp_events_file "$ASR" "$AP" acp-retrigger)"
-FAKE_ACP_MODE=allow acp_boss "$ASR" dispatch acp-retrigger --project acp-test --runner goose >/dev/null
+FAKE_ACP_MODE=allow acp_boss "$ASR" dispatch acp-retrigger --project acp-test --runner opencode-acp >/dev/null
 acp_wait_stop "$SR" || bad "acp retrigger: first turn did not finish"
 TRR="$(jq -r '.acp.transcript' "$SR")"
 chmod 666 "$TRR"
@@ -4291,7 +4291,7 @@ cat >>"$ACP_CONF" <<'EOF'
 
 [runners.badmodel]
 start = "acp"
-command = "fake-goose"
+command = "fake-opencode"
 model = "model-x"
 mode = "smart_approve"
 
@@ -4305,18 +4305,29 @@ kind = "opencode"
 
 [runners.badmode]
 start = "acp"
-command = "fake-goose"
+command = "fake-opencode"
 mode = "nonsense"
 
 [runners.noconfig]
 start = "acp"
-command = "fake-goose"
+command = "fake-opencode"
 model = "model-a"
 
 [runners.nomodes]
 start = "acp"
-command = "fake-goose"
+command = "fake-opencode"
 mode = "smart_approve"
+
+[runners.isolated]
+start = "acp"
+command = "opencode"
+isolate = true
+
+[runners.opencode-mode]
+start = "acp"
+command = "opencode"
+isolate = false
+mode = "auto"
 EOF
 AS2="$TMP/acp-state-2"; mkdir -p "$AS2"
 make_change "$AP" acp-badmodel '- [ ] 1.1 Do the work.'
@@ -4336,6 +4347,11 @@ err="$(FAKE_ACP_MODE=no_config acp_boss_fail "$AS2" dispatch acp-badmodel --proj
 check_contains "acp no config option: rejected" "does not advertise a model config option" "$err"
 err="$(FAKE_ACP_MODE=no_modes acp_boss_fail "$AS2" dispatch acp-badmodel --project acp-test --runner nomodes)"
 check_contains "acp no modes: rejected" "mode_not_offered" "$err"
+err="$(acp_boss_fail "$AS2" dispatch acp-badmodel --project acp-test --runner isolated)"
+check_contains "acp isolate: rejected" "acp_isolate_unsupported" "$err"
+err="$(acp_boss_fail "$AS2" dispatch acp-badmodel --project acp-test --runner opencode-mode)"
+check_contains "acp opencode mode: rejected" "invalid_runner_mode" "$err"
+check_contains "acp opencode mode: names the field" "mode" "$err"
 if [ -f "$(acp_state "$AS2" "$AP" acp-badmodel)" ]; then bad "acp option failures: state left behind"; else ok; fi
 
 # 62. Old state files stay readable; the transport defaults to herdr.
@@ -4368,7 +4384,7 @@ check_contains "acp native: herdr agent start" "agent start" "$(cat "$NSTART")"
 make_change "$AP" acp-deny '- [ ] 1.1 Do the work.'
 AS3="$TMP/acp-state-3"; mkdir -p "$AS3"
 S3="$(acp_state "$AS3" "$AP" acp-deny)"
-FAKE_ACP_MODE=deny acp_boss "$AS3" dispatch acp-deny --project acp-test --runner goose >/dev/null
+FAKE_ACP_MODE=deny acp_boss "$AS3" dispatch acp-deny --project acp-test --runner opencode-acp >/dev/null
 acp_wait_stop "$S3" || bad "acp deny: no stop reason"
 EV3="$(acp_events_file "$AS3" "$AP" acp-deny)"
 check_eq "acp deny: stop reason" "end_turn" "$(jq -r '.acp.last_stop_reason' "$S3")"
@@ -4380,7 +4396,7 @@ acp_boss "$AS3" finish acp-deny --project acp-test >/dev/null 2>&1
 make_change "$AP" acp-ask '- [ ] 1.1 Do the work.'
 AS4="$TMP/acp-state-4"; mkdir -p "$AS4"
 S4="$(acp_state "$AS4" "$AP" acp-ask)"
-FAKE_ACP_MODE=ask acp_boss "$AS4" dispatch acp-ask --project acp-test --runner goose-ask >/dev/null
+FAKE_ACP_MODE=ask acp_boss "$AS4" dispatch acp-ask --project acp-test --runner opencode-ask >/dev/null
 if acp_wait_phase "$S4" blocked; then ok; else bad "acp ask: never blocked"; fi
 out="$(acp_boss "$AS4" status acp-ask --project acp-test --json 2>/dev/null)"
 check_eq "acp ask: status blocked" "blocked" "$(printf '%s' "$out" | jq -r '.agent_state')"
@@ -4400,7 +4416,7 @@ acp_boss "$AS4" finish acp-ask --project acp-test >/dev/null 2>&1
 make_change "$AP" acp-blocked-interrupt '- [ ] 1.1 Do the work.'
 AS5="$TMP/acp-state-5"; mkdir -p "$AS5"
 S5="$(acp_state "$AS5" "$AP" acp-blocked-interrupt)"
-FAKE_ACP_MODE=ask acp_boss "$AS5" dispatch acp-blocked-interrupt --project acp-test --runner goose-ask >/dev/null
+FAKE_ACP_MODE=ask acp_boss "$AS5" dispatch acp-blocked-interrupt --project acp-test --runner opencode-ask >/dev/null
 if acp_wait_phase "$S5" blocked; then ok; else bad "acp blocked interrupt: never blocked"; fi
 out="$(acp_boss "$AS5" interrupt acp-blocked-interrupt --project acp-test)"
 check_eq "acp blocked interrupt: status" "cancelled" "$(printf '%s' "$out" | jq -r '.status')"
@@ -4416,7 +4432,7 @@ make_change "$AP" acp-queue '- [ ] 1.1 Do the work.'
 ASQ="$TMP/acp-state-queue"; mkdir -p "$ASQ"
 SQ="$(acp_state "$ASQ" "$AP" acp-queue)"
 EVQ="$(acp_events_file "$ASQ" "$AP" acp-queue)"
-FAKE_ACP_MODE=ask_two acp_boss "$ASQ" dispatch acp-queue --project acp-test --runner goose-ask >/dev/null
+FAKE_ACP_MODE=ask_two acp_boss "$ASQ" dispatch acp-queue --project acp-test --runner opencode-ask >/dev/null
 if acp_wait_phase "$SQ" blocked; then ok; else bad "acp queue: never blocked"; fi
 out="$(acp_boss "$ASQ" status acp-queue --project acp-test --json 2>/dev/null)"
 check_eq "acp queue: two pending" "2" "$(printf '%s' "$out" | jq -r '.pending_permissions | length')"
@@ -4458,7 +4474,7 @@ make_change "$AP" acp-cancel-all '- [ ] 1.1 Do the work.'
 ASC="$TMP/acp-state-cancel-all"; mkdir -p "$ASC"
 SC="$(acp_state "$ASC" "$AP" acp-cancel-all)"
 EVC="$(acp_events_file "$ASC" "$AP" acp-cancel-all)"
-FAKE_ACP_MODE=ask_two acp_boss "$ASC" dispatch acp-cancel-all --project acp-test --runner goose-ask >/dev/null
+FAKE_ACP_MODE=ask_two acp_boss "$ASC" dispatch acp-cancel-all --project acp-test --runner opencode-ask >/dev/null
 if acp_wait_phase "$SC" blocked; then ok; else bad "acp cancel-all: never blocked"; fi
 out="$(acp_boss "$ASC" interrupt acp-cancel-all --project acp-test)"
 check_eq "acp cancel-all: status" "cancelled" "$(printf '%s' "$out" | jq -r '.status')"
@@ -4473,7 +4489,7 @@ acp_boss "$ASC" finish acp-cancel-all --project acp-test >/dev/null 2>&1
 make_change "$AP" acp-shutdown-pending '- [ ] 1.1 Do the work.'
 ASS="$TMP/acp-state-shutdown-pending"; mkdir -p "$ASS"
 SS="$(acp_state "$ASS" "$AP" acp-shutdown-pending)"
-FAKE_ACP_MODE=ask_two acp_boss "$ASS" dispatch acp-shutdown-pending --project acp-test --runner goose-ask >/dev/null
+FAKE_ACP_MODE=ask_two acp_boss "$ASS" dispatch acp-shutdown-pending --project acp-test --runner opencode-ask >/dev/null
 if acp_wait_phase "$SS" blocked; then ok; else bad "acp shutdown: never blocked"; fi
 SPID="$(jq -r '.acp.supervisor_pid // empty' "$SS")"
 out="$(acp_boss "$ASS" finish acp-shutdown-pending --project acp-test --force)"
@@ -4492,7 +4508,7 @@ make_change "$AP" acp-allow-once '- [ ] 1.1 Do the work.'
 ASO="$TMP/acp-state-allow-once"; mkdir -p "$ASO"
 SO="$(acp_state "$ASO" "$AP" acp-allow-once)"
 FAKE_ACP_MODE=allow FAKE_ACP_OPTION_LOG="$OPTLOG" \
-  acp_boss "$ASO" dispatch acp-allow-once --project acp-test --runner goose >/dev/null
+  acp_boss "$ASO" dispatch acp-allow-once --project acp-test --runner opencode-acp >/dev/null
 acp_wait_stop "$SO" || bad "acp allow once: no stop reason"
 check_eq "acp allow once: automatic option" "allow_once" \
   "$(jq -sr '[.[] | select(.id == 9000)][-1].response.result.outcome.optionId' "$OPTLOG")"
@@ -4504,14 +4520,15 @@ ASA="$TMP/acp-state-apply-allow"; mkdir -p "$ASA"
 SA="$(acp_state "$ASA" "$AP" acp-apply-allow)"
 EVA="$(acp_events_file "$ASA" "$AP" acp-apply-allow)"
 FAKE_ACP_MODE=ask FAKE_ACP_OPTION_LOG="$OPTLOG" \
-  acp_boss "$ASA" dispatch acp-apply-allow --project acp-test --runner goose-ask >/dev/null
+  acp_boss "$ASA" dispatch acp-apply-allow --project acp-test --runner opencode-ask >/dev/null
 if acp_wait_phase "$SA" blocked; then ok; else bad "acp apply allow: never blocked"; fi
 out="$(acp_boss "$ASA" answer acp-apply-allow allow_always --project acp-test)"
 check_eq "acp apply allow: grant recorded" "true" "$(printf '%s' "$out" | jq -r '.grant')"
 check_eq "acp apply allow: stored" "1" "$(jq -r '.acp.apply_allows | length' "$SA")"
 check_eq "acp apply allow: sent once" "allow_once" \
   "$(jq -sr '[.[] | select(.id == 9000)][-1].response.result.outcome.optionId' "$OPTLOG")"
-check_eq "acp apply allow: global untouched" "$GLOBAL_PERMISSION_CONTENT" "$(cat "$GLOBAL_PERMISSION")"
+check_eq "acp apply allow: no global grant file" "true" \
+  "$([ ! -e "$XDG_CONFIG_HOME/goose/permission.yaml" ] && echo true || echo false)"
 acp_wait_phase "$SA" idle || bad "acp apply allow: did not finish the turn"
 out="$(acp_boss "$ASA" retrigger acp-apply-allow --project acp-test)"
 check_eq "acp apply allow: retrigger" "retriggered" "$(printf '%s' "$out" | jq -r '.status')"
@@ -4540,36 +4557,28 @@ check_eq "acp apply allow: second sent once" "allow_once" \
 acp_boss "$ASA" finish acp-apply-allow --project acp-test >/dev/null 2>&1
 
 # 64e. Without an allow-once option an automatic allow fails closed; an
-# Explorer allow-always is refused on a non-isolated runner.
-cat >>"$ACP_CONF" <<'EOF'
-
-[runners.goose-noiso]
-start = "acp"
-command = "fake-goose"
-model = "model-a"
-mode = "smart_approve"
-policy = "allow"
-isolate = false
-EOF
+# Explorer allow-always is refused for an OpenCode ACP runner.
 make_change "$AP" acp-no-once '- [ ] 1.1 Do the work.'
 ASN="$TMP/acp-state-no-once"; mkdir -p "$ASN"
 SN="$(acp_state "$ASN" "$AP" acp-no-once)"
-FAKE_ACP_MODE=ask_no_once acp_boss "$ASN" dispatch acp-no-once --project acp-test --runner goose-noiso >/dev/null
+FAKE_ACP_MODE=ask_no_once acp_boss "$ASN" dispatch acp-no-once --project acp-test --runner opencode-acp >/dev/null
 if acp_wait_phase "$SN" blocked; then ok; else bad "acp no once: did not fail closed"; fi
 err="$(acp_boss_fail "$ASN" answer acp-no-once allow_always --project acp-test)"
 check_contains "acp no once: allow-always refused" "no_allow_once" "$err"
 acp_boss "$ASN" interrupt acp-no-once --project acp-test >/dev/null 2>&1
 acp_boss "$ASN" finish acp-no-once --project acp-test --force >/dev/null 2>&1
 
-# 64f. Isolation and the permission store are visible in the doctor; the probe
-# leaves no session behind.
+# 64f. The doctor reports the effective OpenCode permission configuration and
+# creates no profile; the probe leaves no session behind.
 DAS="$TMP/acp-doctor-state"; mkdir -p "$DAS"
 DTMP="$TMP/acp-doctor-tmp"; mkdir -p "$DTMP"
 out="$(TMPDIR="$DTMP" HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$ACP_CONF" \
   run_boss_state "$DAS" doctor --project acp-test --json 2>/dev/null)"
-check_eq "acp doctor: isolated policy" "ok" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .status')"
-check_contains "acp doctor: isolation reported" "isolated: true" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .hint')"
-check_contains "acp doctor: store reported" "per-apply profile" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .hint')"
+check_eq "acp doctor: runner ok" "ok" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:opencode-acp") | .status')"
+check_eq "acp doctor: policy warns without deny" "warn" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:opencode-acp") | .status')"
+check_contains "acp doctor: names OpenCode permissions" "OpenCode permissions" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:opencode-acp") | .hint')"
+check_contains "acp doctor: names the broad allow" "broad allow" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:opencode-acp") | .hint')"
+check_eq "acp doctor: no session left" "ok" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_probe_session:opencode-acp") | .status')"
 if [ -z "$(ls -A "$DTMP" 2>/dev/null)" ]; then ok; else bad "acp doctor: probe left temporary state"; fi
 
 # 64f.1 A known memory plugin in the effective OpenCode config is a warning
@@ -4604,50 +4613,49 @@ out="$(OPENCODE_STUB_DEBUG_CONFIG="[$PLUGIN_BASE]" BOSS_CONFIG="$PLUGIN_CONF" \
 check_eq "acp doctor: no memory plugin is quiet" "ok" \
   "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="opencode_memory_plugins") | .status')"
 
-# 64g. A global always_allow for shell weakens a non-isolated runner.
+# 64g. The policy check reads the effective OpenCode rules, never a permission
+# store: a broad allow is reported as the boundary, an explicit deny verifies.
 WCONF="$TMP/acp-weakened.toml"
 cat >"$WCONF" <<EOF
-default = "goose"
+default = "opencode-acp"
 
 [projects]
 acp-test = "$AP"
 
-[runners.goose]
+[runners.opencode-acp]
 start = "acp"
-command = "fake-goose"
+command = "fake-opencode"
 model = "model-a"
-mode = "smart_approve"
+mode = ""
 policy = "allow"
-isolate = false
 
 [missions]
 EOF
-printf 'user:\n  always_allow:\n    - shell\n  never_allow: []\n' >"$GLOBAL_PERMISSION"
-out="$(XDG_CONFIG_HOME="$TMP/.config" run_lib policy_check \
-  '{"name":"goose","kind":"acp","isolate":false,"deny":["git push --force*"]}' "$AP")"
-check_eq "acp policy: weakened" "weakened" "$(printf '%s' "$out" | jq -r '.status')"
-check_eq "acp policy: names the entry" "shell" "$(printf '%s' "$out" | jq -r '.entry')"
-out="$(TMPDIR="$DTMP" HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$WCONF" \
+allow_cfg='[{"type":"document","info":{"permissions":[{"action":"*","resource":"*","effect":"allow"}]}}]'
+deny_cfg='[{"type":"document","info":{"permissions":[{"action":"*","resource":"*","effect":"deny"}]}}]'
+out="$(OPENCODE_STUB_DEBUG_CONFIG="$allow_cfg" run_lib policy_check \
+  '{"name":"opencode-acp","kind":"acp","deny":["git push --force*"]}' "$AP")"
+check_eq "acp policy: broad allow is missing" "missing" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp policy: broad allow boundary" "broad allow" "$(printf '%s' "$out" | jq -r '.boundary')"
+check_contains "acp policy: names the missing pattern" "git push --force*" "$(printf '%s' "$out" | jq -r '.missing | join(",")')"
+out="$(TMPDIR="$DTMP" OPENCODE_STUB_DEBUG_CONFIG="$allow_cfg" HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$WCONF" \
   run_boss_state "$DAS" doctor --project acp-test --json 2>/dev/null)"
 check_eq "acp doctor: policy warn" "warn" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="policy") | .status')"
-check_contains "acp doctor: policy names shell" "shell" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="policy") | .hint')"
-check_eq "acp doctor: runner policy warn" "warn" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .status')"
-check_contains "acp doctor: runner policy names shell" "shell" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:goose") | .hint')"
-printf '%s\n' "$GLOBAL_PERMISSION_CONTENT" >"$GLOBAL_PERMISSION"
-out="$(XDG_CONFIG_HOME="$TMP/.config" run_lib policy_check \
-  '{"name":"goose","kind":"acp","isolate":false,"deny":["git push --force*"]}' "$AP")"
-check_eq "acp policy: clean store enforced" "enforced" "$(printf '%s' "$out" | jq -r '.status')"
-check_eq "acp policy: clean store flag" "false" "$(printf '%s' "$out" | jq -r '.isolated')"
-out="$(XDG_CONFIG_HOME="$TMP/.config" run_lib policy_check \
-  '{"name":"goose","kind":"acp","isolate":true,"deny":["git push --force*"]}' "$AP")"
-check_eq "acp policy: isolated enforced" "enforced" "$(printf '%s' "$out" | jq -r '.status')"
-check_eq "acp policy: isolated flag" "true" "$(printf '%s' "$out" | jq -r '.isolated')"
+check_eq "acp doctor: runner policy warn" "warn" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:opencode-acp") | .status')"
+check_contains "acp doctor: runner policy names OpenCode" "OpenCode permissions" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:opencode-acp") | .hint')"
+out="$(OPENCODE_STUB_DEBUG_CONFIG="$deny_cfg" run_lib policy_check \
+  '{"name":"opencode-acp","kind":"acp","deny":["git push --force*"]}' "$AP")"
+check_eq "acp policy: explicit deny verified" "verified" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "acp policy: explicit deny boundary" "effective rules" "$(printf '%s' "$out" | jq -r '.boundary')"
+out="$(TMPDIR="$DTMP" OPENCODE_STUB_DEBUG_CONFIG="$deny_cfg" HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$WCONF" \
+  run_boss_state "$DAS" doctor --project acp-test --json 2>/dev/null)"
+check_eq "acp doctor: verified policy ok" "ok" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_policy:opencode-acp") | .status')"
 
 # 65. Cancel during generation, during a tool call, and a timeout.
 make_change "$AP" acp-cancel '- [ ] 1.1 Do the work.'
 AS6="$TMP/acp-state-6"; mkdir -p "$AS6"
 S6="$(acp_state "$AS6" "$AP" acp-cancel)"
-FAKE_ACP_MODE=cancel acp_boss "$AS6" dispatch acp-cancel --project acp-test --runner goose >/dev/null
+FAKE_ACP_MODE=cancel acp_boss "$AS6" dispatch acp-cancel --project acp-test --runner opencode-acp >/dev/null
 sleep 0.3
 out="$(acp_boss "$AS6" interrupt acp-cancel --project acp-test)"
 check_eq "acp cancel: generation status" "cancelled" "$(printf '%s' "$out" | jq -r '.status')"
@@ -4657,7 +4665,7 @@ acp_boss "$AS6" finish acp-cancel --project acp-test >/dev/null 2>&1
 make_change "$AP" acp-cancel-tool '- [ ] 1.1 Do the work.'
 AS7="$TMP/acp-state-7"; mkdir -p "$AS7"
 S7="$(acp_state "$AS7" "$AP" acp-cancel-tool)"
-FAKE_ACP_MODE=cancel_tool acp_boss "$AS7" dispatch acp-cancel-tool --project acp-test --runner goose >/dev/null
+FAKE_ACP_MODE=cancel_tool acp_boss "$AS7" dispatch acp-cancel-tool --project acp-test --runner opencode-acp >/dev/null
 sleep 0.6
 out="$(acp_boss "$AS7" interrupt acp-cancel-tool --project acp-test)"
 check_eq "acp cancel tool: status" "cancelled" "$(printf '%s' "$out" | jq -r '.status')"
@@ -4667,7 +4675,7 @@ acp_boss "$AS7" finish acp-cancel-tool --project acp-test >/dev/null 2>&1
 make_change "$AP" acp-cancel-unconfirmed '- [ ] 1.1 Do the work.'
 AS8="$TMP/acp-state-8"; mkdir -p "$AS8"
 S8="$(acp_state "$AS8" "$AP" acp-cancel-unconfirmed)"
-FAKE_ACP_MODE=slow BOSS_ACP_CANCEL_TIMEOUT_S=1 acp_boss "$AS8" dispatch acp-cancel-unconfirmed --project acp-test --runner goose >/dev/null
+FAKE_ACP_MODE=slow BOSS_ACP_CANCEL_TIMEOUT_S=1 acp_boss "$AS8" dispatch acp-cancel-unconfirmed --project acp-test --runner opencode-acp >/dev/null
 sleep 0.3
 out="$(BOSS_ACP_CANCEL_TIMEOUT_S=1 acp_boss "$AS8" interrupt acp-cancel-unconfirmed --project acp-test)"
 check_eq "acp cancel unconfirmed: status" "cancel_unconfirmed" "$(printf '%s' "$out" | jq -r '.status')"
@@ -4678,15 +4686,13 @@ BOSS_ACP_CANCEL_TIMEOUT_S=1 acp_boss "$AS8" finish acp-cancel-unconfirmed --proj
 make_change "$AP" acp-resume '- [ ] 1.1 Do the work.'
 AS9="$TMP/acp-state-9"; mkdir -p "$AS9"
 S9="$(acp_state "$AS9" "$AP" acp-resume)"
-FAKE_ACP_MODE=allow acp_boss "$AS9" dispatch acp-resume --project acp-test --runner goose >/dev/null
+FAKE_ACP_MODE=allow acp_boss "$AS9" dispatch acp-resume --project acp-test --runner opencode-acp >/dev/null
 acp_wait_stop "$S9" || bad "acp resume: first turn did not finish"
-P9="$(jq -r '.acp.profile_root // empty' "$S9")"
 kill_acp_supervisor "$S9"
 sleep 0.3
 out="$(FAKE_ACP_MODE=load acp_boss "$AS9" resume acp-resume --project acp-test)"
 check_eq "acp resume: status" "resumed" "$(printf '%s' "$out" | jq -r '.status')"
-check_eq "acp resume: same profile" "$P9" "$(jq -r '.acp.profile_root // empty' "$S9")"
-check_eq "acp resume: profile survives" "true" "$([ -n "$P9" ] && [ -d "$P9" ] && echo true || echo false)"
+check_eq "acp resume: still no profile" "null" "$(jq -r '.acp.profile_root // "null"' "$S9")"
 check_eq "acp resume: load event" "1" "$(acp_count "$(acp_events_file "$AS9" "$AP" acp-resume)" acp_load)"
 TR9="$(jq -r '.acp.transcript' "$S9")"
 check_contains "acp resume: boundary" '"reason":"session_load"' "$(cat "$TR9")"
@@ -4697,7 +4703,7 @@ acp_boss "$AS9" finish acp-resume --project acp-test >/dev/null 2>&1
 make_change "$AP" acp-no-load '- [ ] 1.1 Do the work.'
 AS10="$TMP/acp-state-10"; mkdir -p "$AS10"
 S10="$(acp_state "$AS10" "$AP" acp-no-load)"
-FAKE_ACP_MODE=no_load acp_boss "$AS10" dispatch acp-no-load --project acp-test --runner goose >/dev/null
+FAKE_ACP_MODE=no_load acp_boss "$AS10" dispatch acp-no-load --project acp-test --runner opencode-acp >/dev/null
 acp_wait_stop "$S10" || true
 kill_acp_supervisor "$S10"
 sleep 0.2
@@ -4712,11 +4718,11 @@ make_change "$AP" acp-slot-a '- [ ] 1.1 Do the work.'
 make_change "$AP" acp-slot-b '- [ ] 1.1 Do the work.'
 AS11="$TMP/acp-state-11"; mkdir -p "$AS11"
 S11A="$(acp_state "$AS11" "$AP" acp-slot-a)"
-FAKE_ACP_MODE=allow acp_boss "$AS11" dispatch acp-slot-a --project acp-test --runner goose >/dev/null
+FAKE_ACP_MODE=allow acp_boss "$AS11" dispatch acp-slot-a --project acp-test --runner opencode-acp >/dev/null
 acp_wait_stop "$S11A" || bad "acp slots: first apply did not start"
 check_eq "acp slots: live supervisor counts" "1" \
   "$(HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$ACP_CONF" run_lib_state "$AS11" open_apply_count)"
-err="$(acp_boss_fail "$AS11" dispatch acp-slot-b --project acp-test --runner goose)"
+err="$(acp_boss_fail "$AS11" dispatch acp-slot-b --project acp-test --runner opencode-acp)"
 check_contains "acp slots: limit refuses" "parallel_limit" "$err"
 check_contains "acp slots: current and max" '"current":1' "$err"
 kill_acp_supervisor "$S11A"
@@ -4728,7 +4734,7 @@ acp_wait_event "$(acp_events_file "$AS11" "$AP" acp-slot-a)" lost \
 # The dead apply still holds its (exclusive) lock until it is finished; the
 # crash wake is what tells the Explorer to do that.
 acp_boss "$AS11" finish acp-slot-a --project acp-test --force >/dev/null 2>&1 || true
-out="$(acp_boss "$AS11" dispatch acp-slot-b --project acp-test --runner goose)"
+out="$(acp_boss "$AS11" dispatch acp-slot-b --project acp-test --runner opencode-acp)"
 check_eq "acp slots: dispatch after the crash" "started" "$(printf '%s' "$out" | jq -r '.status')"
 check_eq "acp slots: crash wake" "1" "$(acp_count "$(acp_events_file "$AS11" "$AP" acp-slot-a)" lost)"
 S11B="$(acp_state "$AS11" "$AP" acp-slot-b)"
@@ -4759,11 +4765,11 @@ LCONF="$TMP/acp-lock.toml"
 acp_config "$LCONF" "$WL" allow "max_parallel = 2"
 LS="$TMP/acp-lock-state"; mkdir -p "$LS"
 FAKE_ACP_MODE=allow HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$LCONF" \
-  run_boss_state "$LS" dispatch lock-a --project acp-test --runner goose --worktree --touches src/a >/dev/null
+  run_boss_state "$LS" dispatch lock-a --project acp-test --runner opencode-acp --worktree --touches src/a >/dev/null
 LSFA="$(acp_state "$LS" "$WL" lock-a)"
 acp_wait_stop "$LSFA" || true
 err="$(FAKE_ACP_MODE=allow HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$LCONF" \
-  run_boss_fail_state "$LS" dispatch lock-b --project acp-test --runner goose --worktree --touches src/a)"
+  run_boss_fail_state "$LS" dispatch lock-b --project acp-test --runner opencode-acp --worktree --touches src/a)"
 check_contains "acp locks: conflict refused" "lock_conflict" "$err"
 check_contains "acp locks: names the holder" "lock-a" "$err"
 HERDR_AGENTS_JSON="$ACP_AGENTS" BOSS_CONFIG="$LCONF" run_boss_state "$LS" finish lock-a --project acp-test >/dev/null 2>&1 || true
@@ -4775,7 +4781,7 @@ doc_acp() {
 }
 DAS="$TMP/acp-doctor-state"; mkdir -p "$DAS"
 out="$(doc_acp "$ACP_CONF" "$DAS")"
-check_eq "acp doctor: healthy runner" "ok" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:goose") | .status')"
+check_eq "acp doctor: healthy runner" "ok" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:opencode-acp") | .status')"
 DCONF="$TMP/acp-doctor-missing.toml"
 acp_config "$DCONF" "$AP"
 printf '\n[runners.missing]\nstart = "acp"\ncommand = "definitely-not-an-agent"\n' >>"$DCONF"
@@ -4783,11 +4789,11 @@ out="$(doc_acp "$DCONF" "$DAS")"
 check_eq "acp doctor: missing command fails" "fail" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:missing") | .status')"
 check_contains "acp doctor: names the binary" "definitely-not-an-agent" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:missing") | .hint')"
 out="$(FAKE_ACP_MODE=no_handshake doc_acp "$ACP_CONF" "$DAS")"
-check_eq "acp doctor: handshake failure" "fail" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:goose") | .status')"
-check_contains "acp doctor: handshake message" "fake handshake failure" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:goose") | .hint')"
+check_eq "acp doctor: handshake failure" "fail" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:opencode-acp") | .status')"
+check_contains "acp doctor: handshake message" "fake handshake failure" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:opencode-acp") | .hint')"
 MCONF="$TMP/acp-doctor-model.toml"
 acp_config "$MCONF" "$AP"
-printf '\n[runners.wrongmodel]\nstart = "acp"\ncommand = "fake-goose"\nmodel = "model-x"\n' >>"$MCONF"
+printf '\n[runners.wrongmodel]\nstart = "acp"\ncommand = "fake-opencode"\nmodel = "model-x"\n' >>"$MCONF"
 out="$(doc_acp "$MCONF" "$DAS")"
 check_eq "acp doctor: unknown model fails" "fail" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:wrongmodel") | .status')"
 check_contains "acp doctor: names offered models" "model-a, model-b" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="acp_runner:wrongmodel") | .hint')"
@@ -4826,7 +4832,7 @@ check_not_contains "acp prompt unit: slash template ignored" "/opsx" "$pprompt"
 make_change "$AP" acp-e2e '- [ ] 1.1 Do the work.'
 AS12="$TMP/acp-state-12"; mkdir -p "$AS12"
 S12="$(acp_state "$AS12" "$AP" acp-e2e)"
-FAKE_ACP_MODE=ask HERDR_SEND_KEYS_LOG="$KEYS_LOG" acp_boss "$AS12" dispatch acp-e2e --project acp-test --runner goose-ask >/dev/null
+FAKE_ACP_MODE=ask HERDR_SEND_KEYS_LOG="$KEYS_LOG" acp_boss "$AS12" dispatch acp-e2e --project acp-test --runner opencode-ask >/dev/null
 if acp_wait_phase "$S12" blocked; then ok; else bad "acp e2e: never blocked"; fi
 acp_boss "$AS12" answer acp-e2e allow_once --project acp-test >/dev/null
 acp_wait_phase "$S12" idle || bad "acp e2e: did not finish the turn"
@@ -4849,12 +4855,12 @@ check_not_contains "acp e2e: no interrupt keystrokes" "esc" "$(cat "$KEYS_LOG")"
 make_change "$AP" acp-observability '- [ ] 1.1 Do the work.'
 AS13="$TMP/acp-state-13"; mkdir -p "$AS13"
 S13="$(acp_state "$AS13" "$AP" acp-observability)"
-FAKE_ACP_MODE=allow acp_boss "$AS13" dispatch acp-observability --project acp-test --runner goose >/dev/null
+FAKE_ACP_MODE=allow acp_boss "$AS13" dispatch acp-observability --project acp-test --runner opencode-acp >/dev/null
 acp_wait_stop "$S13" || bad "acp observability: no stop reason"
 out="$(acp_boss "$AS13" status acp-observability --project acp-test --json 2>/dev/null)"
-check_eq "acp status: runner" "goose" "$(printf '%s' "$out" | jq -r '.runner')"
+check_eq "acp status: runner" "opencode-acp" "$(printf '%s' "$out" | jq -r '.runner')"
 check_eq "acp status: model" "model-a" "$(printf '%s' "$out" | jq -r '.acp.model')"
-check_eq "acp status: mode" "smart_approve" "$(printf '%s' "$out" | jq -r '.acp.mode')"
+check_eq "acp status: no mode" "null" "$(printf '%s' "$out" | jq -r '.acp.mode // "null"')"
 check_eq "acp status: no pending list" "0" "$(printf '%s' "$out" | jq -r '.pending_permissions | length')"
 check_eq "acp status: no pending alias" "null" "$(printf '%s' "$out" | jq -r '.pending_permission')"
 check_eq "acp status: not stalled" "false" "$(printf '%s' "$out" | jq -r '.acp_stalled')"
@@ -4863,11 +4869,11 @@ check_eq "acp aggregate: waiter alive" "true" \
   "$(printf '%s' "$agg" | jq -r '.[] | select(.change=="acp-observability") | .waiter_alive')"
 check_eq "acp aggregate: waiter pid is the supervisor" "$(jq -r '.acp.supervisor_pid' "$S13")" \
   "$(printf '%s' "$agg" | jq -r '.[] | select(.change=="acp-observability") | .waiter_pid')"
-check_eq "acp aggregate: runner" "goose" \
+check_eq "acp aggregate: runner" "opencode-acp" \
   "$(printf '%s' "$agg" | jq -r '.[] | select(.change=="acp-observability") | .runner')"
 agg_text="$(acp_boss "$AS13" status 2>/dev/null)"
 check_contains "acp aggregate: alive in text" "waiter: alive (pid $(jq -r '.acp.supervisor_pid' "$S13"))" "$agg_text"
-check_contains "acp aggregate: names the runner" "goose" "$agg_text"
+check_contains "acp aggregate: names the runner" "opencode-acp" "$agg_text"
 check_not_contains "acp aggregate: never reports a live supervisor as dead" "waiter: DEAD" "$agg_text"
 acp_boss "$AS13" finish acp-observability --project acp-test >/dev/null 2>&1
 
@@ -4876,7 +4882,7 @@ acp_boss "$AS13" finish acp-observability --project acp-test >/dev/null 2>&1
 make_change "$AP" acp-stream '- [ ] 1.1 Do the work.'
 AS14="$TMP/acp-state-14"; mkdir -p "$AS14"
 S14="$(acp_state "$AS14" "$AP" acp-stream)"
-FAKE_ACP_MODE=stream acp_boss "$AS14" dispatch acp-stream --project acp-test --runner goose >/dev/null
+FAKE_ACP_MODE=stream acp_boss "$AS14" dispatch acp-stream --project acp-test --runner opencode-acp >/dev/null
 acp_wait_stop "$S14" || bad "acp stream: no stop reason"
 out="$(acp_boss "$AS14" status acp-stream --project acp-test --json 2>/dev/null)"
 check_eq "acp last update: joined message" "Refactor the status JSON now." \
@@ -4895,7 +4901,7 @@ AS15="$TMP/acp-state-15"; mkdir -p "$AS15"
 S15="$(acp_state "$AS15" "$AP" acp-turn-timeout)"
 EV15="$(acp_events_file "$AS15" "$AP" acp-turn-timeout)"
 FAKE_ACP_MODE=slow BOSS_ACP_TURN_TIMEOUT_S=1 BOSS_ACP_STALL_S=0 \
-  acp_boss "$AS15" dispatch acp-turn-timeout --project acp-test --runner goose >/dev/null
+  acp_boss "$AS15" dispatch acp-turn-timeout --project acp-test --runner opencode-acp >/dev/null
 acp_wait_stop "$S15" 200 || bad "acp turn timeout: no stop reason"
 check_eq "acp turn timeout: stop reason" "turn_timeout" "$(jq -r '.acp.last_stop_reason' "$S15")"
 check_eq "acp turn timeout: phase idle" "idle" "$(jq -r '.acp.phase' "$S15")"
@@ -4912,7 +4918,7 @@ AS16="$TMP/acp-state-16"; mkdir -p "$AS16"
 S16="$(acp_state "$AS16" "$AP" acp-stall)"
 EV16="$(acp_events_file "$AS16" "$AP" acp-stall)"
 FAKE_ACP_MODE=slow BOSS_ACP_STALL_S=1 BOSS_ACP_TURN_TIMEOUT_S=0 \
-  acp_boss "$AS16" dispatch acp-stall --project acp-test --runner goose >/dev/null
+  acp_boss "$AS16" dispatch acp-stall --project acp-test --runner opencode-acp >/dev/null
 if acp_wait_event "$EV16" stalled 100; then ok; else bad "acp stall: no stalled wake"; fi
 check_eq "acp stall: one wake" "1" "$(acp_count "$EV16" stalled)"
 check_eq "acp stall: wake state" "stalled" \
@@ -4945,7 +4951,7 @@ AS17="$TMP/acp-state-17"; mkdir -p "$AS17"
 S17="$(acp_state "$AS17" "$AP" acp-progress)"
 EV17="$(acp_events_file "$AS17" "$AP" acp-progress)"
 FAKE_ACP_MODE=progress BOSS_ACP_STALL_S=1 BOSS_ACP_TURN_TIMEOUT_S=0 \
-  acp_boss "$AS17" dispatch acp-progress --project acp-test --runner goose >/dev/null
+  acp_boss "$AS17" dispatch acp-progress --project acp-test --runner opencode-acp >/dev/null
 acp_wait_stop "$S17" 200 || bad "acp progress: no stop reason"
 check_eq "acp progress: long command is not a stall" "0" "$(acp_count "$EV17" stalled)"
 check_eq "acp progress: stop reason" "end_turn" "$(jq -r '.acp.last_stop_reason' "$S17")"
@@ -4958,7 +4964,7 @@ AS18="$TMP/acp-state-18"; mkdir -p "$AS18"
 S18="$(acp_state "$AS18" "$AP" acp-stall-resume)"
 EV18="$(acp_events_file "$AS18" "$AP" acp-stall-resume)"
 FAKE_ACP_MODE=stall_resume BOSS_ACP_STALL_S=1 BOSS_ACP_TURN_TIMEOUT_S=0 \
-  acp_boss "$AS18" dispatch acp-stall-resume --project acp-test --runner goose >/dev/null
+  acp_boss "$AS18" dispatch acp-stall-resume --project acp-test --runner opencode-acp >/dev/null
 acp_wait_stop "$S18" 200 || bad "acp stall resume: no stop reason"
 check_eq "acp stall resume: one stall" "1" "$(acp_count "$EV18" stalled)"
 check_eq "acp stall resume: cleared by activity" "false" "$(jq -r '.acp.stalled' "$S18")"
@@ -4971,7 +4977,7 @@ AS19="$TMP/acp-state-19"; mkdir -p "$AS19"
 S19="$(acp_state "$AS19" "$AP" acp-stall-blocked)"
 EV19="$(acp_events_file "$AS19" "$AP" acp-stall-blocked)"
 FAKE_ACP_MODE=ask BOSS_ACP_STALL_S=1 BOSS_ACP_TURN_TIMEOUT_S=0 \
-  acp_boss "$AS19" dispatch acp-stall-blocked --project acp-test --runner goose-ask >/dev/null
+  acp_boss "$AS19" dispatch acp-stall-blocked --project acp-test --runner opencode-ask >/dev/null
 if acp_wait_phase "$S19" blocked; then ok; else bad "acp stall blocked: never blocked"; fi
 sleep 2
 check_eq "acp stall blocked: blocked phase excluded" "0" "$(acp_count "$EV19" stalled)"
@@ -5138,7 +5144,7 @@ make_change "$AP" acp-wake-dedupe '- [ ] 1.1 Do the work.'
 AS20="$TMP/acp-state-20"; mkdir -p "$AS20"
 S20="$(acp_state "$AS20" "$AP" acp-wake-dedupe)"
 EV20="$(acp_events_file "$AS20" "$AP" acp-wake-dedupe)"
-FAKE_ACP_MODE=ask_two acp_boss "$AS20" dispatch acp-wake-dedupe --project acp-test --runner goose-ask >/dev/null
+FAKE_ACP_MODE=ask_two acp_boss "$AS20" dispatch acp-wake-dedupe --project acp-test --runner opencode-ask >/dev/null
 i=0
 while [ "$i" -lt 100 ]; do
   [ "$(jq -r '.acp.pending_permissions | length' "$S20" 2>/dev/null || printf 0)" = "2" ] && break
@@ -5239,17 +5245,17 @@ make_change "$MP" model-ok '- [ ] 1.1 Do the work.'
 MSTATE="$TMP/model-state"; mkdir -p "$MSTATE"
 MCONF="$TMP/model-boss.toml"
 cat >"$MCONF" <<EOF
-default = "goose"
+default = "opencode-acp"
 
 [projects]
 model-test = "$MP"
 
-[runners.goose]
+[runners.opencode-acp]
 start = "acp"
-command = "fake-goose"
+command = "fake-opencode"
 model = "model-a"
 effort = "high"
-mode = "smart_approve"
+mode = ""
 policy = "allow"
 apply = "Follow the tasks."
 
@@ -5270,7 +5276,7 @@ EOF
 model_boss() { BOSS_CONFIG="$MCONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_state "$1" "${@:2}"; }
 model_fail() { BOSS_CONFIG="$MCONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$1" "${@:2}"; }
 
-out="$(model_boss "$MSTATE" dispatch model-ok --project model-test --runner goose)"
+out="$(model_boss "$MSTATE" dispatch model-ok --project model-test --runner opencode-acp)"
 check_eq "model dispatch: started" "started" "$(printf '%s' "$out" | jq -r '.status')"
 MSF="$(acp_state "$MSTATE" "$MP" model-ok)"
 acp_wait_stop "$MSF" || bad "model dispatch: no stop recorded"
@@ -5306,46 +5312,46 @@ UNCAT="$TMP/model-uncat.toml"
 sed 's/model = "model-a"/model = "model-z"/' "$STRICT" >"$UNCAT"
 make_change "$MP" gate-uncat '- [ ] 1.1 Do.'
 USTATE="$TMP/model-uncat-state"; mkdir -p "$USTATE"
-err="$(BOSS_CONFIG="$UNCAT" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$USTATE" dispatch gate-uncat --project model-test --runner goose)"
+err="$(BOSS_CONFIG="$UNCAT" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$USTATE" dispatch gate-uncat --project model-test --runner opencode-acp)"
 check_contains "gate: uncataloged refused" "model_uncataloged" "$err"
 
 LIMIT="$TMP/model-limit.toml"
 sed -e 's/billing = "quota"/billing = "metered"/' "$MCONF" >"$LIMIT"
 make_change "$MP" gate-limit '- [ ] 1.1 Do.'
 LIMSTATE="$TMP/model-limit-state"; mkdir -p "$LIMSTATE"
-err="$(BOSS_CONFIG="$LIMIT" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$LIMSTATE" dispatch gate-limit --project model-test --runner goose)"
+err="$(BOSS_CONFIG="$LIMIT" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$LIMSTATE" dispatch gate-limit --project model-test --runner opencode-acp)"
 check_contains "gate: limit missing refused" "model_limit_missing" "$err"
 
 NOPROV="$TMP/model-noprov.toml"
 awk 'BEGIN{mp=0} /^\[model_providers\]/{mp=1; print; next} /^\[/ {mp=0} !(mp && $0 ~ /^model-test = /){print}' "$STRICT" >"$NOPROV"
 make_change "$MP" gate-provider '- [ ] 1.1 Do.'
 PSTATE="$TMP/model-provider-state"; mkdir -p "$PSTATE"
-err="$(BOSS_CONFIG="$NOPROV" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$PSTATE" dispatch gate-provider --project model-test --runner goose)"
+err="$(BOSS_CONFIG="$NOPROV" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$PSTATE" dispatch gate-provider --project model-test --runner opencode-acp)"
 check_contains "gate: provider refused" "provider_not_allowed" "$err"
 
 BADBILL="$TMP/model-badbill.toml"
 sed 's/billing = "quota"/billing = "paid"/' "$MCONF" >"$BADBILL"
-err="$(BOSS_CONFIG="$BADBILL" run_boss_fail_state "$LIMSTATE" dispatch gate-limit --project model-test --runner goose)"
+err="$(BOSS_CONFIG="$BADBILL" run_boss_fail_state "$LIMSTATE" dispatch gate-limit --project model-test --runner opencode-acp)"
 check_contains "config: invalid billing" "invalid_model_billing" "$err"
 BADROLE="$TMP/model-badrole.toml"
 { cat "$MCONF"; printf '\n[model_roles]\ncode = "nope"\n'; } >"$BADROLE"
-err="$(BOSS_CONFIG="$BADROLE" run_boss_fail_state "$LIMSTATE" dispatch gate-limit --project model-test --runner goose)"
+err="$(BOSS_CONFIG="$BADROLE" run_boss_fail_state "$LIMSTATE" dispatch gate-limit --project model-test --runner opencode-acp)"
 check_contains "config: invalid role" "invalid_model_role" "$err"
 
 # 72. ACP accepts and reports another value, and an effort that resets.
 MSTATE2="$TMP/model-state-2"; mkdir -p "$MSTATE2"
 make_change "$MP" model-mismatch '- [ ] 1.1 Do.'
-err="$(FAKE_ACP_MODE=reports_other model_fail "$MSTATE2" dispatch model-mismatch --project model-test --runner goose)"
+err="$(FAKE_ACP_MODE=reports_other model_fail "$MSTATE2" dispatch model-mismatch --project model-test --runner opencode-acp)"
 check_contains "acp mismatch: refused" "model_mismatch" "$err"
 check_contains "acp mismatch: names both" "model-b" "$err"
 if [ -f "$(acp_state "$MSTATE2" "$MP" model-mismatch)" ]; then bad "acp mismatch: state left"; else ok; fi
-err="$(FAKE_ACP_MODE=effort_default model_fail "$MSTATE2" dispatch model-mismatch --project model-test --runner goose)"
+err="$(FAKE_ACP_MODE=effort_default model_fail "$MSTATE2" dispatch model-mismatch --project model-test --runner opencode-acp)"
 check_contains "acp effort mismatch: refused" "model_mismatch" "$err"
 
 # 73. A loaded session with no config options is a mismatch and sends no prompt.
 make_change "$MP" model-load '- [ ] 1.1 Do.'
 LSTATE="$TMP/model-load-state"; mkdir -p "$LSTATE"
-model_boss "$LSTATE" dispatch model-load --project model-test --runner goose >/dev/null
+model_boss "$LSTATE" dispatch model-load --project model-test --runner opencode-acp >/dev/null
 LSF="$(acp_state "$LSTATE" "$MP" model-load)"
 acp_wait_stop "$LSF" || true
 LPID="$(jq -r '.acp.supervisor_pid // empty' "$LSF" 2>/dev/null || true)"
@@ -5361,7 +5367,7 @@ check_eq "acp load: no extra prompt" "$PROMPTS_BEFORE" \
 # 74. A later config_option_update that deviates is a mismatch, declared kept.
 make_change "$MP" model-deviation '- [ ] 1.1 Do.'
 DSTATE="$TMP/model-dev-state"; mkdir -p "$DSTATE"
-DEVP="$(HERDR_PROMPT_LOG="$TMP/model-dev-prompts.log" FAKE_ACP_MODE=deviation model_boss "$DSTATE" dispatch model-deviation --project model-test --runner goose)"
+DEVP="$(HERDR_PROMPT_LOG="$TMP/model-dev-prompts.log" FAKE_ACP_MODE=deviation model_boss "$DSTATE" dispatch model-deviation --project model-test --runner opencode-acp)"
 check_eq "acp deviation: dispatch starts" "started" "$(printf '%s' "$DEVP" | jq -r '.status')"
 DSF="$(acp_state "$DSTATE" "$MP" model-deviation)"
 acp_wait_stop "$DSF" || true
@@ -5376,10 +5382,10 @@ COSTCONF="$TMP/model-cost.toml"
 awk '/^\[model_policy\]/{print "limit_usd = 0.40"} {print}' "$MCONF" | sed 's/billing = "quota"/billing = "metered"/' >"$COSTCONF"
 CSTATE="$TMP/model-cost-state"; mkdir -p "$CSTATE"
 CREC="$(run_lib_state "$CSTATE" model_trial_record_for model-a)"; mkdir -p "$(dirname "$CREC")"
-jq -n '{model:"model-a",runner:"goose",command:"fake-goose",effort:"high",status:"ok",confirmed:"model-a",cost_usd:null,tokens:1,limit_usd:0.4,agent_version:"1",date:"2026-11-24T00:00:00+0100",stop_reason:"end_turn"}' >"$CREC"
+jq -n '{model:"model-a",runner:"opencode-acp",command:"fake-opencode",effort:"high",status:"ok",confirmed:"model-a",cost_usd:null,tokens:1,limit_usd:0.4,agent_version:"1",date:"2026-11-24T00:00:00+0100",stop_reason:"end_turn"}' >"$CREC"
 make_change "$MP" model-cost '- [ ] 1.1 Do.'
 cost_boss() { BOSS_CONFIG="$COSTCONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_state "$1" "${@:2}"; }
-FAKE_ACP_USAGE_COST=0.5 cost_boss "$CSTATE" dispatch model-cost --project model-test --runner goose >/dev/null
+FAKE_ACP_USAGE_COST=0.5 cost_boss "$CSTATE" dispatch model-cost --project model-test --runner opencode-acp >/dev/null
 CSF="$(acp_state "$CSTATE" "$MP" model-cost)"
 acp_wait_stop "$CSF" || true; sleep 0.8
 check_eq "cost: stop reason" "cost_limit" "$(jq -r '.acp.last_stop_reason' "$CSF")"
@@ -5396,23 +5402,23 @@ check_eq "cost: still one live wake" "1" "$(acp_count "$(acp_events_file "$CSTAT
 # 76. Trial: refusal, success, record and staleness.
 TSTATE="$TMP/model-trial-state"; mkdir -p "$TSTATE"
 trial_boss() { BOSS_CONFIG="$COSTCONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_state "$1" "${@:2}"; }
-err="$(trial_boss "$TSTATE" model trial goose --project model-test 2>&1)"
+err="$(trial_boss "$TSTATE" model trial opencode-acp --project model-test 2>&1)"
 check_contains "trial: authorization refused" "trial_not_authorized" "$err"
-out="$(trial_boss "$TSTATE" model trial goose --project model-test --confirm-spend 0.4 --json 2>/dev/null)"
+out="$(trial_boss "$TSTATE" model trial opencode-acp --project model-test --confirm-spend 0.4 --json 2>/dev/null)"
 check_eq "trial: ok" "ok" "$(printf '%s' "$out" | jq -r '.status')"
 check_eq "trial: confirmed model" "model-a" "$(printf '%s' "$out" | jq -r '.confirmed')"
 TREC="$(run_lib_state "$TSTATE" model_trial_record_for model-a)"
 check_eq "trial: record status" "ok" "$(jq -r '.status' "$TREC")"
 check_eq "trial: record effort" "high" "$(jq -r '.effort' "$TREC")"
 out="$(trial_boss "$TSTATE" model list --project model-test --json)"
-check_eq "model list: trial valid" "valid" "$(printf '%s' "$out" | jq -r '.runners[] | select(.runner=="goose") | .trial.status')"
-check_eq "model check: no prompt field" "ok" "$(trial_boss "$TSTATE" model check goose --project model-test --json | jq -r .status)"
+check_eq "model list: trial valid" "valid" "$(printf '%s' "$out" | jq -r '.runners[] | select(.runner=="opencode-acp") | .trial.status')"
+check_eq "model check: no prompt field" "ok" "$(trial_boss "$TSTATE" model check opencode-acp --project model-test --json | jq -r .status)"
 # A changed effort makes the record stale.
 STALECONF="$TMP/model-stale.toml"
 sed 's/effort = "high"/effort = "xhigh"/' "$COSTCONF" >"$STALECONF"
 out="$(BOSS_CONFIG="$STALECONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_state "$TSTATE" model list --project model-test --json)"
-check_eq "trial: changed effort is stale" "stale" "$(printf '%s' "$out" | jq -r '.runners[] | select(.runner=="goose") | .trial.status')"
-err="$(make_change "$MP" model-untried '- [ ] 1.1 Do.'; BOSS_CONFIG="$STALECONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$TSTATE" dispatch model-untried --project model-test --runner goose)"
+check_eq "trial: changed effort is stale" "stale" "$(printf '%s' "$out" | jq -r '.runners[] | select(.runner=="opencode-acp") | .trial.status')"
+err="$(make_change "$MP" model-untried '- [ ] 1.1 Do.'; BOSS_CONFIG="$STALECONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$TSTATE" dispatch model-untried --project model-test --runner opencode-acp)"
 check_contains "gate: untried refused" "model_untried" "$err"
 
 # 77. Native session-record adapter: confirmed, mismatch, helper listing and an
@@ -5514,7 +5520,7 @@ cat >"$CHP/openspec/missions/v1.md" <<'EOF'
 
 | Runner | Model | Effort | Provider | Billing | Per-apply limit | Data classes |
 | --- | --- | --- | --- | --- | --- | --- |
-| goose | model-a | high | fake | metered | 0.40 USD | code |
+| opencode-acp | model-a | high | fake | metered | 0.40 USD | code |
 
 ## Authorization
 
@@ -5550,9 +5556,9 @@ MISCONF="$TMP/model-mission.toml"
 cp "$COSTCONF" "$MISCONF"
 cat >>"$MISCONF" <<EOF
 
-[runners.goose-bad]
+[runners.opencode-bad]
 start = "acp"
-command = "fake-goose"
+command = "fake-opencode"
 model = "model-z"
 
 [models."model-z"]
@@ -5583,7 +5589,7 @@ reconcile: explore
 
 ## Changes
 
-- mission-model (runner: goose-bad)
+- mission-model (runner: opencode-bad)
 EOF
 MSTATE2="$TMP/model-mission-state"; mkdir -p "$MSTATE2"
 out="$(BOSS_CONFIG="$MISCONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_state "$MSTATE2" mission next v1 --project "$MIP" --skip-reconcile 2>&1)"
