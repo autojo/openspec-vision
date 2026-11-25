@@ -113,8 +113,14 @@ printed as `waiter: DEAD`.
 An ACP runner is apply-only: `boss session` rejects it with
 `acp_session_unsupported`. There is no hidden native path, and a change that
 needs an interactive session belongs to a native runner. The supported knobs
-are `command`, `model`, `mode`, `policy`, `deny` and `apply`; `args` and `env`
-are native-only and have no effect on an ACP child.
+are `command`, `model`, `effort`, `mode`, `policy`, `deny` and `apply`; `args`
+and `env` are native-only and have no effect on an ACP child. The supervisor
+sets the model first and the effort (ACP category `thought_level`) after it,
+reads both back from the returned configuration and sends no prompt until they
+match the declared values. It repeats that confirmation before every prompt and
+after `session/load`, so a retrigger or resume cannot drift silently.
+`boss model check <runner>` probes the same profile a dispatch uses and sends no
+prompt.
 
 Permissions follow the runner policy. `policy = "ask"` leaves an unmatched
 request pending and wakes you with `blocked`; every pending request is queued by
@@ -181,6 +187,29 @@ removes it: `boss finish` deletes the state and the profile but keeps the
 transcript as the evidence for the apply. Cleanup is an operator decision; no
 retention policy is implemented.
 
+### Model errors
+
+The runtime refuses or stops an apply when the model cannot be guaranteed. Never
+override the runner, substitute the default runner or another model, raise a
+limit, or retrigger into a different model. Journal the failure, leave the
+change undispatched (or park the stopped apply), continue with changes that do
+not depend on it, and hand the decision to the operator at the end.
+
+| Error or stop | Reaction |
+| --- | --- |
+| `model_unpinned` | Add `model` to the runner or use a pinned runner; journal which one |
+| `model_uncataloged` | Add a `[models]` entry (provider, billing, limit) before dispatching again |
+| `model_not_offered` | The agent does not offer the declared model; pick a runner whose model it offers, or fix the catalog |
+| `effort_not_offered` | The agent offers no such effort for that model; fix the runner or catalog |
+| `model_mismatch` | The agent reports another model or effort. Review the kept work; do not retrigger with another model without the operator |
+| `model_confirmation_late` | A metered model needs a transport that confirms first; use an ACP runner |
+| `model_fallback_configured` | Remove the agent-side fallback flag; a missing model must fail |
+| `model_limit_missing` | Set `limit_usd` or `limit_tokens` for a metered model |
+| `model_untried` | Run the authorized `boss model trial <runner>` first |
+| `provider_not_allowed` | The project does not allow the model's provider; a provider change is a charter decision |
+| `invalid_runner_model` | The runner selects a model twice or names an invalid effort; fix `boss.toml` |
+| wake `mismatch` / `cost_limit` | Review the kept worktree; retrigger only after an explicit decision, never with another model and never by raising the limit without authorization |
+
 ### The mission loop
 
 1. **Reconcile before each dispatch.** After a change finished or was parked
@@ -237,6 +266,12 @@ retention policy is implemented.
      runner denies the destructive commands an apply never needs, `missing`,
      `unavailable` or `off` means it does not. Journal that once per run and
      continue - never stop for it, and never treat it as a charter decision.
+   - The dispatch result also carries `model`. Read its `status` before you
+     report anything: `confirmed` may be named as fact together with runner,
+     model, effort and billing class; `pending`, `unpinned`, `unverifiable` and
+     `unknown` must be labelled as such (for example "declared, not yet
+     confirmed"). For a native runner the confirmation happens after the first
+     answer: end your turn and rely on the wake, do not poll.
    - dispatched -> end your turn. The waiter wakes you when the apply settles;
      never poll `boss status`.
 

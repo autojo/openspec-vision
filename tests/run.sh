@@ -101,6 +101,15 @@ case "${1:-} ${2:-}" in
     ;;
   "api get")
     [ "${OPENCODE_STUB_API_FAIL:-0}" = "1" ] && exit 1
+    case "${3:-}" in
+      /api/session/*)
+        if [ -n "${OPENCODE_STUB_SESSION_JSON:-}" ]; then
+          printf '%s\n' "$OPENCODE_STUB_SESSION_JSON"
+          exit 0
+        fi
+        exit 1
+        ;;
+    esac
     if [ -n "${OPENCODE_STUB_API_CONFIG:-}" ]; then
       printf '%s\n' "$OPENCODE_STUB_API_CONFIG"
     else
@@ -326,6 +335,7 @@ MODE = os.environ.get("FAKE_ACP_MODE", "allow")
 SESSION = "sess-fake"
 MODELS = ["model-a", "model-b"]
 MODES = ["auto", "approve", "smart_approve", "chat"]
+EFFORTS = ["low", "medium", "high", "xhigh"]
 
 
 def out(obj):
@@ -346,10 +356,13 @@ def error(req_id, message):
     out({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": message}})
 
 
-def config_options(model="model-a"):
+def config_options(model="model-a", effort="medium"):
     return [
         {"id": "model", "name": "Model", "type": "select", "currentValue": model,
          "options": [{"value": m, "name": m} for m in MODELS]},
+        {"id": "effort", "name": "Effort", "type": "select", "category": "thought_level",
+         "currentValue": effort,
+         "options": [{"value": e, "name": e} for e in EFFORTS]},
         {"id": "provider", "name": "Provider", "type": "select", "currentValue": "fake",
          "options": [{"value": "fake", "name": "fake"}]},
     ]
@@ -364,7 +377,11 @@ def emit_updates():
                                  "content": {"type": "text", "text": "Hello from fake"}})
     note("tool_call", {"toolCallId": "tc1", "title": "shell", "kind": "other",
                        "status": "pending", "rawInput": {"command": "ls"}})
-    note("usage_update", {"usage": {"inputTokens": 3, "outputTokens": 5}})
+    usage = {"inputTokens": 3, "outputTokens": 5}
+    cost = os.environ.get("FAKE_ACP_USAGE_COST")
+    if cost:
+        usage["cost"] = float(cost)
+    note("usage_update", {"usage": usage})
 
 
 def ask_permission(command, title, tool_id="tc1", req_id=9000, options=None):
@@ -396,6 +413,7 @@ def main():
     prompt = None
     prompt_kind = None
     pending = set()
+    state = {"model": "model-a", "effort": "medium"}
     for line in sys.stdin:
         if not line.strip():
             continue
@@ -439,7 +457,8 @@ def main():
                     json.dump(params, handle)
             result(req_id, {"protocolVersion": 1,
                             "agentCapabilities": {"loadSession": MODE != "no_load"},
-                            "agentInfo": {"name": "fake-acp", "version": "1"}})
+                            "agentInfo": {"name": "fake-acp",
+                                          "version": os.environ.get("FAKE_ACP_VERSION", "1")}})
         elif method == "session/new":
             if MODE == "bad_session":
                 error(req_id, "fake session/new failure")
@@ -448,14 +467,32 @@ def main():
             if MODE != "no_modes":
                 new["modes"] = modes()
             if MODE != "no_config":
-                new["configOptions"] = config_options()
+                new["configOptions"] = config_options(state["model"], state["effort"])
             result(req_id, new)
         elif method == "session/set_config_option":
+            cid = params.get("configId")
             value = params.get("value")
-            if params.get("configId") == "model" and value not in MODELS:
-                error(req_id, "unknown model %s" % value)
+            if cid == "model":
+                if value not in MODELS:
+                    error(req_id, "unknown model %s" % value)
+                    continue
+                state["model"] = value
+                state["effort"] = "medium"
+                if MODE == "reports_other":
+                    state["model"] = "model-b"
+                shown = state["model"]
+                shown_effort = "high" if MODE == "effort_default" else state["effort"]
+                result(req_id, {"configOptions": config_options(shown, shown_effort)})
                 continue
-            result(req_id, {"configOptions": config_options(value or "model-a")})
+            if cid == "effort":
+                if value not in EFFORTS:
+                    error(req_id, "unknown effort %s" % value)
+                    continue
+                state["effort"] = value
+                shown_effort = "default" if MODE == "effort_default" else value
+                result(req_id, {"configOptions": config_options(state["model"], shown_effort)})
+                continue
+            result(req_id, {})
         elif method == "session/set_mode":
             if params.get("modeId") not in MODES:
                 error(req_id, "unknown mode %s" % params.get("modeId"))
@@ -468,7 +505,16 @@ def main():
                                "status": "completed", "rawInput": {"command": "ls"}})
             note("agent_message_chunk", {"messageId": "m9",
                                           "content": {"type": "text", "text": "after reload"}})
-            result(req_id, {"modes": modes(), "configOptions": config_options()})
+            if MODE == "load_no_config":
+                result(req_id, {"modes": modes()})
+            else:
+                result(req_id, {"modes": modes(),
+                                "configOptions": config_options(state["model"], state["effort"])})
+        elif method == "session/delete":
+            if MODE == "no_delete":
+                error(req_id, "delete not supported")
+                continue
+            result(req_id, {})
         elif method == "session/close":
             result(req_id, {})
             return 0
@@ -491,7 +537,11 @@ def main():
                 prompt_kind = None
                 continue
             emit_updates()
-            if MODE == "progress":
+            if MODE == "deviation":
+                # A later config_option_update that deviates must be treated as
+                # a mismatch: the supervisor cancels the turn.
+                note("config_option_update", {"configOptions": config_options("model-b", state["effort"])})
+            elif MODE == "progress":
                 # A tool call that runs longer than a short stall interval but
                 # keeps emitting updates: progress, not a stall.
                 import threading
@@ -549,7 +599,7 @@ def main():
                 ask_permission("ls -la", "shell")
                 pending.add(9000)
         elif method == "session/cancel":
-            if prompt is not None and MODE in ("cancel", "cancel_tool"):
+            if prompt is not None and MODE in ("cancel", "cancel_tool", "deviation"):
                 note("agent_message_chunk", {"messageId": "m4",
                                               "content": {"type": "text", "text": "cancelled"}})
                 result(prompt, {"stopReason": "cancelled"})
@@ -1616,8 +1666,8 @@ check_eq "retarget project: next wake uses target" "boss-otherproj" \
   "$(HERDR_AGENTS_JSON="$AGENTS_PROJ" run_lib boss_resolve_agent \
     "$RET4/applies/$(run_lib sha1_hex "$PT")-cross-project-retarget.json" | sed -n '1p')"
 
-check_eq "retarget wrapper count" "17" "$(ls "$ROOT/commands/opencode"/boss-*.md | wc -l | tr -d ' ')"
-check_eq "retarget claude wrapper count" "17" "$(ls "$ROOT/commands/claude/boss"/*.md | wc -l | tr -d ' ')"
+check_eq "retarget wrapper count" "18" "$(ls "$ROOT/commands/opencode"/boss-*.md | wc -l | tr -d ' ')"
+check_eq "retarget claude wrapper count" "18" "$(ls "$ROOT/commands/claude/boss"/*.md | wc -l | tr -d ' ')"
 help_out="$(run_boss_fail --help)"
 check_contains "retarget: help" "boss retarget" "$help_out"
 
@@ -4080,7 +4130,7 @@ EOF
 AS2="$TMP/acp-state-2"; mkdir -p "$AS2"
 make_change "$AP" acp-badmodel '- [ ] 1.1 Do the work.'
 err="$(acp_boss_fail "$AS2" dispatch acp-badmodel --project acp-test --runner badmodel)"
-check_contains "acp bad model: rejected" "acp_start_failed" "$err"
+check_contains "acp bad model: rejected" "model_not_offered" "$err"
 check_contains "acp bad model: names offered" "model-a, model-b" "$err"
 if [ -f "$(acp_state "$AS2" "$AP" acp-badmodel)" ]; then bad "acp bad model: state left behind"; else ok; fi
 err="$(acp_boss_fail "$AS2" dispatch acp-badmodel --project acp-test --runner missingcommand)"
@@ -4089,12 +4139,12 @@ if [ -f "$(acp_state "$AS2" "$AP" acp-badmodel)" ]; then bad "acp missing comman
 err="$(acp_boss_fail "$AS2" dispatch acp-badmodel --project acp-test --runner badstart)"
 check_contains "acp unknown start: rejected" "invalid_runner_start" "$err"
 err="$(acp_boss_fail "$AS2" dispatch acp-badmodel --project acp-test --runner badmode)"
-check_contains "acp bad mode: rejected" "acp_start_failed" "$err"
+check_contains "acp bad mode: rejected" "mode_not_offered" "$err"
 check_contains "acp bad mode: names offered" "auto, approve, smart_approve, chat" "$err"
 err="$(FAKE_ACP_MODE=no_config acp_boss_fail "$AS2" dispatch acp-badmodel --project acp-test --runner noconfig)"
 check_contains "acp no config option: rejected" "does not advertise a model config option" "$err"
 err="$(FAKE_ACP_MODE=no_modes acp_boss_fail "$AS2" dispatch acp-badmodel --project acp-test --runner nomodes)"
-check_contains "acp no modes: rejected" "does not advertise session modes" "$err"
+check_contains "acp no modes: rejected" "mode_not_offered" "$err"
 if [ -f "$(acp_state "$AS2" "$AP" acp-badmodel)" ]; then bad "acp option failures: state left behind"; else ok; fi
 
 # 62. Old state files stay readable; the transport defaults to herdr.
@@ -4794,6 +4844,366 @@ PH="$TMP/hygiene"; mkdir -p "$PH/project/openspec/changes" "$PH/state"
 printf 'default = "c"\n\n[runners.c]\nkind = "claude"\nargs = []\napply = "/opsx:apply {change}"\n' >"$PH/boss.toml"
 out="$(BOSS_CONFIG="$PH/boss.toml" run_boss_state "$PH/state" doctor --project "$PH/project" --json 2>/dev/null)"
 check_eq "doctor: policy check runs" "ok" "$(printf '%s' "$out" | jq -r '.checks[] | select(.id=="policy") | .status')"
+
+# ------------------------------------------------- model selection -------
+
+# 70. Configuration validation and the dispatch gate.
+MP="$TMP/model-project"
+make_project "$MP"
+make_change "$MP" model-ok '- [ ] 1.1 Do the work.'
+MSTATE="$TMP/model-state"; mkdir -p "$MSTATE"
+MCONF="$TMP/model-boss.toml"
+cat >"$MCONF" <<EOF
+default = "goose"
+
+[projects]
+model-test = "$MP"
+
+[runners.goose]
+start = "acp"
+command = "fake-goose"
+model = "model-a"
+effort = "high"
+mode = "smart_approve"
+policy = "allow"
+apply = "Follow the tasks."
+
+[runners.native]
+kind = "opencode"
+args = []
+
+[models."model-a"]
+provider = "fake"
+billing = "quota"
+
+[model_policy]
+unpinned = "warn"
+
+[model_providers]
+model-test = ["fake"]
+EOF
+model_boss() { BOSS_CONFIG="$MCONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_state "$1" "${@:2}"; }
+model_fail() { BOSS_CONFIG="$MCONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$1" "${@:2}"; }
+
+out="$(model_boss "$MSTATE" dispatch model-ok --project model-test --runner goose)"
+check_eq "model dispatch: started" "started" "$(printf '%s' "$out" | jq -r '.status')"
+MSF="$(acp_state "$MSTATE" "$MP" model-ok)"
+acp_wait_stop "$MSF" || bad "model dispatch: no stop recorded"
+check_eq "model dispatch: declared" "model-a" "$(jq -r '.model.declared' "$MSF")"
+check_eq "model dispatch: confirmed" "model-a" "$(jq -r '.model.confirmed' "$MSF")"
+check_eq "model dispatch: effort confirmed" "high" "$(jq -r '.model.effort_confirmed' "$MSF")"
+check_eq "model dispatch: source" "acp_config" "$(jq -r '.model.source' "$MSF")"
+check_eq "model dispatch: billing" "quota" "$(jq -r '.model.billing' "$MSF")"
+check_eq "acp effort declared" "high" "$(jq -r '.acp.effort' "$MSF")"
+out="$(model_boss "$MSTATE" status model-ok --project model-test --json)"
+check_eq "model status json: confirmed" "confirmed" "$(printf '%s' "$out" | jq -r '.model.status')"
+check_contains "model status text: confirmed line" "confirmed: model-a" \
+  "$(model_boss "$MSTATE" status model-ok --project model-test | grep -A2 '^model:')"
+
+# 71. Strict gates refuse and leave nothing behind.
+STRICT="$TMP/model-strict.toml"
+sed 's/unpinned = "warn"/unpinned = "strict"/' "$MCONF" >"$STRICT"
+strict_fail() { BOSS_CONFIG="$STRICT" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$1" "${@:2}"; }
+GSTATE="$TMP/model-gate-state"; mkdir -p "$GSTATE"
+make_change "$MP" gate-unpinned '- [ ] 1.1 Do.'
+err="$(strict_fail "$GSTATE" dispatch gate-unpinned --project model-test --runner native)"
+check_contains "gate: unpinned refused" "model_unpinned" "$err"
+if [ -f "$(acp_state "$GSTATE" "$MP" gate-unpinned)" ]; then bad "gate: unpinned left state"; else ok; fi
+# unpinned under warn starts and is marked unpinned
+NSTATE="$TMP/model-native-state"; mkdir -p "$NSTATE"
+out="$(model_boss "$NSTATE" dispatch gate-unpinned --project model-test --runner native)"
+check_eq "gate: unpinned warn starts" "started" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "gate: unpinned status" "unpinned" "$(printf '%s' "$out" | jq -r '.model.status')"
+NSF="$(acp_state "$NSTATE" "$MP" gate-unpinned)"
+check_eq "gate: unpinned state" "unpinned" "$(jq -r '.model.status' "$NSF")"
+
+UNCAT="$TMP/model-uncat.toml"
+sed 's/model = "model-a"/model = "model-z"/' "$STRICT" >"$UNCAT"
+make_change "$MP" gate-uncat '- [ ] 1.1 Do.'
+USTATE="$TMP/model-uncat-state"; mkdir -p "$USTATE"
+err="$(BOSS_CONFIG="$UNCAT" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$USTATE" dispatch gate-uncat --project model-test --runner goose)"
+check_contains "gate: uncataloged refused" "model_uncataloged" "$err"
+
+LIMIT="$TMP/model-limit.toml"
+sed -e 's/billing = "quota"/billing = "metered"/' "$MCONF" >"$LIMIT"
+make_change "$MP" gate-limit '- [ ] 1.1 Do.'
+LIMSTATE="$TMP/model-limit-state"; mkdir -p "$LIMSTATE"
+err="$(BOSS_CONFIG="$LIMIT" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$LIMSTATE" dispatch gate-limit --project model-test --runner goose)"
+check_contains "gate: limit missing refused" "model_limit_missing" "$err"
+
+NOPROV="$TMP/model-noprov.toml"
+awk 'BEGIN{mp=0} /^\[model_providers\]/{mp=1; print; next} /^\[/ {mp=0} !(mp && $0 ~ /^model-test = /){print}' "$STRICT" >"$NOPROV"
+make_change "$MP" gate-provider '- [ ] 1.1 Do.'
+PSTATE="$TMP/model-provider-state"; mkdir -p "$PSTATE"
+err="$(BOSS_CONFIG="$NOPROV" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$PSTATE" dispatch gate-provider --project model-test --runner goose)"
+check_contains "gate: provider refused" "provider_not_allowed" "$err"
+
+BADBILL="$TMP/model-badbill.toml"
+sed 's/billing = "quota"/billing = "paid"/' "$MCONF" >"$BADBILL"
+err="$(BOSS_CONFIG="$BADBILL" run_boss_fail_state "$LIMSTATE" dispatch gate-limit --project model-test --runner goose)"
+check_contains "config: invalid billing" "invalid_model_billing" "$err"
+BADROLE="$TMP/model-badrole.toml"
+{ cat "$MCONF"; printf '\n[model_roles]\ncode = "nope"\n'; } >"$BADROLE"
+err="$(BOSS_CONFIG="$BADROLE" run_boss_fail_state "$LIMSTATE" dispatch gate-limit --project model-test --runner goose)"
+check_contains "config: invalid role" "invalid_model_role" "$err"
+
+# 72. ACP accepts and reports another value, and an effort that resets.
+MSTATE2="$TMP/model-state-2"; mkdir -p "$MSTATE2"
+make_change "$MP" model-mismatch '- [ ] 1.1 Do.'
+err="$(FAKE_ACP_MODE=reports_other model_fail "$MSTATE2" dispatch model-mismatch --project model-test --runner goose)"
+check_contains "acp mismatch: refused" "model_mismatch" "$err"
+check_contains "acp mismatch: names both" "model-b" "$err"
+if [ -f "$(acp_state "$MSTATE2" "$MP" model-mismatch)" ]; then bad "acp mismatch: state left"; else ok; fi
+err="$(FAKE_ACP_MODE=effort_default model_fail "$MSTATE2" dispatch model-mismatch --project model-test --runner goose)"
+check_contains "acp effort mismatch: refused" "model_mismatch" "$err"
+
+# 73. A loaded session with no config options is a mismatch and sends no prompt.
+make_change "$MP" model-load '- [ ] 1.1 Do.'
+LSTATE="$TMP/model-load-state"; mkdir -p "$LSTATE"
+model_boss "$LSTATE" dispatch model-load --project model-test --runner goose >/dev/null
+LSF="$(acp_state "$LSTATE" "$MP" model-load)"
+acp_wait_stop "$LSF" || true
+LPID="$(jq -r '.acp.supervisor_pid // empty' "$LSF" 2>/dev/null || true)"
+[ -n "$LPID" ] && kill "$LPID" 2>/dev/null || true
+sleep 0.5
+PROMPTS_BEFORE="$(grep -c '"type":"prompt"' "$(jq -r '.acp.transcript' "$LSF")" 2>/dev/null || printf 0)"
+err="$(FAKE_ACP_MODE=load_no_config model_fail "$LSTATE" resume model-load --project model-test)"
+check_contains "acp load: mismatch" "model_mismatch" "$err"
+check_eq "acp load: status mismatch" "mismatch" "$(jq -r '.model.status' "$LSF")"
+check_eq "acp load: no extra prompt" "$PROMPTS_BEFORE" \
+  "$(grep -c '"type":"prompt"' "$(jq -r '.acp.transcript' "$LSF")" 2>/dev/null || printf 0)"
+
+# 74. A later config_option_update that deviates is a mismatch, declared kept.
+make_change "$MP" model-deviation '- [ ] 1.1 Do.'
+DSTATE="$TMP/model-dev-state"; mkdir -p "$DSTATE"
+DEVP="$(HERDR_PROMPT_LOG="$TMP/model-dev-prompts.log" FAKE_ACP_MODE=deviation model_boss "$DSTATE" dispatch model-deviation --project model-test --runner goose)"
+check_eq "acp deviation: dispatch starts" "started" "$(printf '%s' "$DEVP" | jq -r '.status')"
+DSF="$(acp_state "$DSTATE" "$MP" model-deviation)"
+acp_wait_stop "$DSF" || true
+sleep 0.8
+check_eq "acp deviation: mismatch" "mismatch" "$(jq -r '.model.status' "$DSF")"
+check_eq "acp deviation: actual" "model-b" "$(jq -r '.model.actual' "$DSF")"
+check_eq "acp deviation: declared kept" "model-a" "$(jq -r '.acp.model' "$DSF")"
+check_eq "acp deviation: one wake" "1" "$(acp_count "$(acp_events_file "$DSTATE" "$MP" model-deviation)" wake)"
+
+# 75. Cost limit: 80 percent warning, then cost_limit with one wake.
+COSTCONF="$TMP/model-cost.toml"
+awk '/^\[model_policy\]/{print "limit_usd = 0.40"} {print}' "$MCONF" | sed 's/billing = "quota"/billing = "metered"/' >"$COSTCONF"
+CSTATE="$TMP/model-cost-state"; mkdir -p "$CSTATE"
+CREC="$(run_lib_state "$CSTATE" model_trial_record_for model-a)"; mkdir -p "$(dirname "$CREC")"
+jq -n '{model:"model-a",runner:"goose",command:"fake-goose",effort:"high",status:"ok",confirmed:"model-a",cost_usd:null,tokens:1,limit_usd:0.4,agent_version:"1",date:"2026-11-24T00:00:00+0100",stop_reason:"end_turn"}' >"$CREC"
+make_change "$MP" model-cost '- [ ] 1.1 Do.'
+cost_boss() { BOSS_CONFIG="$COSTCONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_state "$1" "${@:2}"; }
+FAKE_ACP_USAGE_COST=0.5 cost_boss "$CSTATE" dispatch model-cost --project model-test --runner goose >/dev/null
+CSF="$(acp_state "$CSTATE" "$MP" model-cost)"
+acp_wait_stop "$CSF" || true; sleep 0.8
+check_eq "cost: stop reason" "cost_limit" "$(jq -r '.acp.last_stop_reason' "$CSF")"
+check_eq "cost: recorded" "0.5" "$(jq -r '.model.cost_usd' "$CSF")"
+check_eq "cost: limit" "0.4" "$(jq -r '.model.limit_usd' "$CSF")"
+check_eq "cost: warning" "true" "$(jq -r '.model.warning_80' "$CSF")"
+check_eq "cost: one wake" "1" "$(acp_count "$(acp_events_file "$CSTATE" "$MP" model-cost)" wake)"
+# A second turn in the same apply counts against the same limit: retrigger is
+# refused before a new prompt once the limit is reached (no extra wake).
+cost_boss "$CSTATE" retrigger model-cost --project model-test >/dev/null 2>&1 || true
+sleep 0.5
+check_eq "cost: still one live wake" "1" "$(acp_count "$(acp_events_file "$CSTATE" "$MP" model-cost)" wake)"
+
+# 76. Trial: refusal, success, record and staleness.
+TSTATE="$TMP/model-trial-state"; mkdir -p "$TSTATE"
+trial_boss() { BOSS_CONFIG="$COSTCONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_state "$1" "${@:2}"; }
+err="$(trial_boss "$TSTATE" model trial goose --project model-test 2>&1)"
+check_contains "trial: authorization refused" "trial_not_authorized" "$err"
+out="$(trial_boss "$TSTATE" model trial goose --project model-test --confirm-spend 0.4 --json 2>/dev/null)"
+check_eq "trial: ok" "ok" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "trial: confirmed model" "model-a" "$(printf '%s' "$out" | jq -r '.confirmed')"
+TREC="$(run_lib_state "$TSTATE" model_trial_record_for model-a)"
+check_eq "trial: record status" "ok" "$(jq -r '.status' "$TREC")"
+check_eq "trial: record effort" "high" "$(jq -r '.effort' "$TREC")"
+out="$(trial_boss "$TSTATE" model list --project model-test --json)"
+check_eq "model list: trial valid" "valid" "$(printf '%s' "$out" | jq -r '.runners[] | select(.runner=="goose") | .trial.status')"
+check_eq "model check: no prompt field" "ok" "$(trial_boss "$TSTATE" model check goose --project model-test --json | jq -r .status)"
+# A changed effort makes the record stale.
+STALECONF="$TMP/model-stale.toml"
+sed 's/effort = "high"/effort = "xhigh"/' "$COSTCONF" >"$STALECONF"
+out="$(BOSS_CONFIG="$STALECONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_state "$TSTATE" model list --project model-test --json)"
+check_eq "trial: changed effort is stale" "stale" "$(printf '%s' "$out" | jq -r '.runners[] | select(.runner=="goose") | .trial.status')"
+err="$(make_change "$MP" model-untried '- [ ] 1.1 Do.'; BOSS_CONFIG="$STALECONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$TSTATE" dispatch model-untried --project model-test --runner goose)"
+check_contains "gate: untried refused" "model_untried" "$err"
+
+# 77. Native session-record adapter: confirmed, mismatch, helper listing and an
+# unknown format.
+NPROJ="$TMP/model-claude-projects"; mkdir -p "$NPROJ/-p-demo"
+cat >"$NPROJ/-p-demo/s1.jsonl" <<'EOF'
+{"type":"assistant","message":{"model":"claude-opus-4-1","content":[{"type":"text","text":"one"}],"usage":{"input_tokens":10,"output_tokens":5}}}
+{"type":"assistant","message":{"model":"claude-haiku-4","content":[{"type":"text","text":"helper"}],"usage":{"input_tokens":2,"output_tokens":1}}}
+{"type":"assistant","message":{"model":"<synthetic>"}}
+{"type":"assistant","message":{"model":"claude-opus-4-1","usage":{"input_tokens":3,"output_tokens":2}}}
+EOF
+NSTATE_FILE="$TMP/model-native-state.json"
+jq -n '{model:{declared:"claude-opus-4-1",status:"pending"}}' >"$NSTATE_FILE"
+out="$(python3 "$ROOT/runtime/lib/boss_model.py" native-confirm --runner-json '{"kind":"claude","model":"claude-opus-4-1"}' --state "$NSTATE_FILE" --claude-dir "$NPROJ")"
+check_eq "native adapter: confirmed" "confirmed" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "native adapter: tokens" "23" "$(printf '%s' "$out" | jq -r '.tokens')"
+check_eq "native adapter: helper seen" "claude-haiku-4" "$(printf '%s' "$out" | jq -r '.seen[1]')"
+jq -n '{model:{declared:"claude-sonnet-4",status:"pending"}}' >"$NSTATE_FILE"
+out="$(python3 "$ROOT/runtime/lib/boss_model.py" native-confirm --runner-json '{"kind":"claude","model":"claude-sonnet-4"}' --state "$NSTATE_FILE" --claude-dir "$NPROJ")"
+check_eq "native adapter: mismatch" "mismatch" "$(printf '%s' "$out" | jq -r '.status')"
+out="$(python3 "$ROOT/runtime/lib/boss_model.py" native-confirm --runner-json '{"kind":"gemini"}' --state "$NSTATE_FILE" --claude-dir "$NPROJ")"
+check_eq "native adapter: unknown kind" "unverifiable" "$(printf '%s' "$out" | jq -r '.status')"
+
+# 78. The native waiter confirms after the first answer and wakes once on a
+# mismatch (the apply is interrupted, work kept).
+WSTATE="$TMP/model-waiter-state"; mkdir -p "$WSTATE/applies" "$WSTATE/cycles"
+WP="$TMP/model-waiter-project"; make_project "$WP"
+WSF="$WSTATE/applies/$(run_lib sha1_hex "$WP")-native-confirm.json"
+jq -n --arg p "$WP" '{change:"native-confirm",project:$p,agent:"apply-native-confirm",
+  pane_id:"p-apply",tab_id:"tab-apply",workspace_id:"ws-1",transport:"herdr",kind:"claude",
+  runner:"native",boss:"boss-ws-1",boss_pane:"p-boss",boss_workspace:"ws-1",parked:false,
+  started_at:(now|strftime("%Y-%m-%dT%H:%M:%S%z")),
+  model:{declared:"claude-opus-4-1",effort_declared:null,status:"pending",source:null,
+    confirmed:null,seen:[],cost_usd:null,tokens:null,billing:"quota",provider:"anthropic"}}' >"$WSF"
+mkdir -p "$TMP/.claude/projects/x"
+cat >"$TMP/.claude/projects/x/s1.jsonl" <<'EOF'
+{"type":"assistant","message":{"model":"claude-opus-4-1","usage":{"input_tokens":4,"output_tokens":2}}}
+EOF
+env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="$CONFIG" BOSS_STATE_DIR="$WSTATE" \
+  HERDR_ENV=1 HERDR_PANE_ID=p-apply HERDR_WORKSPACE_ID=ws-1 HERDR_LIVE_PANES="p-apply p-boss" \
+  HERDR_AGENTS_JSON='[{"name":"boss-ws-1","pane_id":"p-boss","workspace_id":"ws-1"}]' \
+  BOSS_WAITER_SETTLE_GRACE_MS=0 BOSS_MODEL_CONFIRM_TIMEOUT_S=2 \
+  "$BIN/deadline" 3 bash "$ROOT/runtime/bin/boss-waiter" "$WSF" >/dev/null 2>&1 || true
+check_eq "native waiter: confirmed" "confirmed" "$(jq -r '.model.status' "$WSF" 2>/dev/null)"
+check_eq "native waiter: confirmed value" "claude-opus-4-1" "$(jq -r '.model.confirmed' "$WSF" 2>/dev/null)"
+check_eq "native waiter: tokens" "6" "$(jq -r '.model.tokens' "$WSF" 2>/dev/null)"
+
+WSF2="$WSTATE/applies/$(run_lib sha1_hex "$WP")-native-mismatch.json"
+WEV2="$WSTATE/cycles/$(run_lib sha1_hex "$WP")-native-mismatch.events.jsonl"
+jq -n --arg p "$WP" '{change:"native-mismatch",project:$p,agent:"apply-native-mismatch",
+  pane_id:"p-apply",tab_id:"tab-apply",workspace_id:"ws-1",transport:"herdr",kind:"claude",
+  runner:"native",boss:"boss-ws-1",boss_pane:"p-boss",boss_workspace:"ws-1",parked:false,
+  started_at:(now|strftime("%Y-%m-%dT%H:%M:%S%z")),
+  model:{declared:"claude-sonnet-4",effort_declared:null,status:"pending",source:null,
+    confirmed:null,seen:[],cost_usd:null,tokens:null,billing:"quota",provider:"anthropic"}}' >"$WSF2"
+SKLOG="$TMP/model-send-keys.log"; : >"$SKLOG"
+env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="$CONFIG" BOSS_STATE_DIR="$WSTATE" \
+  HERDR_ENV=1 HERDR_PANE_ID=p-apply HERDR_WORKSPACE_ID=ws-1 HERDR_LIVE_PANES="p-apply p-boss" \
+  HERDR_AGENTS_JSON='[{"name":"boss-ws-1","pane_id":"p-boss","workspace_id":"ws-1"}]' \
+  HERDR_SEND_KEYS_LOG="$SKLOG" \
+  BOSS_WAITER_SETTLE_GRACE_MS=0 BOSS_MODEL_CONFIRM_TIMEOUT_S=2 \
+  "$BIN/deadline" 3 bash "$ROOT/runtime/bin/boss-waiter" "$WSF2" >/dev/null 2>&1 || true
+check_eq "native waiter: mismatch" "mismatch" "$(jq -r '.model.status' "$WSF2" 2>/dev/null)"
+check_eq "native waiter: declared kept" "claude-sonnet-4" "$(jq -r '.model.declared' "$WSF2" 2>/dev/null)"
+check_eq "native waiter: interrupted" "1" "$(grep -c 'esc' "$SKLOG" 2>/dev/null || printf 0)"
+check_eq "native waiter: one wake" "1" "$(acp_count "$WEV2" wake)"
+
+# 79. Status shows all six model statuses; an old state is unknown.
+SIX="$TMP/model-six"; mkdir -p "$SIX/applies"
+for st in pending confirmed mismatch unpinned unverifiable; do
+  jq -n --arg p "$WP" --arg c "six-$st" --arg s "$st" \
+    '{change:$c,project:$p,agent:"apply",pane_id:null,tab_id:null,workspace_id:"ws-1",
+      transport:"herdr",last_state:"idle",model:{declared:"m",status:$s}}' \
+    >"$SIX/applies/$(run_lib sha1_hex "$WP")-six-$st.json"
+done
+jq -n --arg p "$WP" '{change:"six-unknown",project:$p,agent:"apply",pane_id:null,tab_id:null,
+  workspace_id:"ws-1",transport:"herdr",last_state:"idle"}' \
+  >"$SIX/applies/$(run_lib sha1_hex "$WP")-six-unknown.json"
+for st in pending confirmed mismatch unpinned unverifiable unknown; do
+  out="$(BOSS_CONFIG="$MCONF" run_boss_state "$SIX" status "six-$st" --project "$WP" --json 2>/dev/null)"
+  case "$st" in
+    unknown) check_eq "status six: old is unknown" "unknown" "$(printf '%s' "$out" | jq -r '.model.status')" ;;
+    *) check_eq "status six: $st" "$st" "$(printf '%s' "$out" | jq -r '.model.status')" ;;
+  esac
+done
+
+# 80. The charter gate stays closed for a metered runner without an amount and
+# a legacy charter without the table stays open.
+CHP="$TMP/model-charter"; make_project "$CHP"; mkdir -p "$CHP/openspec/missions"
+run_mission_lib() {
+  env PATH="$BIN:$PATH" HOME="$TMP" BOSS_CONFIG="$CONFIG" BOSS_STATE_DIR="$STATE" \
+    bash -c '. "$1/runtime/bin/boss-lib.sh"; . "$1/runtime/bin/boss-mission.sh"; shift; "$@"' \
+    _ "$ROOT" "$@"
+}
+cat >"$CHP/openspec/missions/v1.md" <<'EOF'
+# Mission: v1
+
+## Runner Policy
+
+| Runner | Model | Effort | Provider | Billing | Per-apply limit | Data classes |
+| --- | --- | --- | --- | --- | --- | --- |
+| goose | model-a | high | fake | metered | 0.40 USD | code |
+
+## Authorization
+
+| Category | Decision | Bound |
+| --- | --- | --- |
+| Remote push | denied | - |
+| Spending / API cost |  |  |
+
+## Open Questions
+EOF
+out="$(run_mission_lib mission_charter_state "$CHP/openspec/missions/v1.md")"
+check_eq "charter: metered without amount closed" "charter_open" "$(printf '%s' "$out" | jq -r '.gate')"
+check_eq "charter: metered counted" "1" "$(printf '%s' "$out" | jq -r '.runner_policy_metered')"
+sed -i.bak 's/| Spending \/ API cost |  |  |/| Spending \/ API cost | bounded 0.40 USD | per apply |/' "$CHP/openspec/missions/v1.md"
+out="$(run_mission_lib mission_charter_state "$CHP/openspec/missions/v1.md")"
+check_eq "charter: metered with amount opens" "open" "$(printf '%s' "$out" | jq -r '.gate')"
+cat >"$CHP/openspec/missions/v2.md" <<'EOF'
+# Mission: v2
+
+## Authorization
+
+| Category | Decision | Bound |
+| --- | --- | --- |
+| Remote push | denied | - |
+
+## Open Questions
+EOF
+out="$(run_mission_lib mission_charter_state "$CHP/openspec/missions/v2.md")"
+check_eq "charter: legacy charter opens" "open" "$(printf '%s' "$out" | jq -r '.gate')"
+
+# 81. A mission does not swap the runner when the model is not offered.
+MISCONF="$TMP/model-mission.toml"
+cp "$COSTCONF" "$MISCONF"
+cat >>"$MISCONF" <<EOF
+
+[runners.goose-bad]
+start = "acp"
+command = "fake-goose"
+model = "model-z"
+
+[models."model-z"]
+provider = "fake"
+billing = "quota"
+EOF
+MIP="$TMP/model-mission-project"; make_project "$MIP"; mkdir -p "$MIP/openspec/missions"
+make_change "$MIP" mission-model '- [ ] 1.1 Do.'
+cat >"$MIP/openspec/missions/v1.md" <<'EOF'
+# Mission: v1
+
+## Goal
+
+Test.
+
+## Authorization
+
+| Category | Decision | Bound |
+| --- | --- | --- |
+| Remote push | denied | - |
+
+## Open Questions
+
+## Plan
+
+planning: planned
+reconcile: explore
+
+## Changes
+
+- mission-model (runner: goose-bad)
+EOF
+MSTATE2="$TMP/model-mission-state"; mkdir -p "$MSTATE2"
+out="$(BOSS_CONFIG="$MISCONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_state "$MSTATE2" mission next v1 --project "$MIP" --skip-reconcile 2>&1)"
+check_contains "mission: model error reported" "model_not_offered" "$out"
+check_eq "mission: no fallback state" "no" "$([ -f "$(acp_state "$MSTATE2" "$MIP" mission-model)" ] && echo yes || echo no)"
 
 # --------------------------------------------------------------- result ---
 

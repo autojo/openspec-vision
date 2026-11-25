@@ -351,6 +351,56 @@ def offered_modes(modes):
     return result
 
 
+def config_option(config_options, config_id: str = "", category: str = ""):
+    """Find a config option by id or by its ACP category."""
+    for option in config_options or []:
+        if not isinstance(option, dict):
+            continue
+        if config_id and str(option.get("id")) == config_id:
+            return option
+        if category and str(option.get("category") or "").lower() == category.lower():
+            return option
+    return None
+
+
+def values_of(option):
+    values = []
+    for entry in (option or {}).get("options") or []:
+        if isinstance(entry, dict):
+            values.append(str(entry.get("value") or entry.get("name") or ""))
+        else:
+            values.append(str(entry))
+    return values
+
+
+def usage_fields(usage):
+    """Cost and token counts of one usage snapshot; absent values stay None."""
+    if not isinstance(usage, dict):
+        return None, None
+    cost = None
+    for key in ("cost", "cost_usd", "costUSD", "total_cost"):
+        value = usage.get(key)
+        if isinstance(value, (int, float)):
+            cost = float(value)
+            break
+    total = 0
+    found = False
+    for key in (
+        "inputTokens",
+        "outputTokens",
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "total",
+    ):
+        value = usage.get(key)
+        if isinstance(value, (int, float)):
+            total += int(value)
+            found = True
+    return cost, (total if found else None)
+
+
 LAST_UPDATE_MAX_CHARS = 200
 
 
@@ -481,7 +531,26 @@ class Supervisor:
         self.session_id = self.acp.get("session_id") or None
         self.config_options = []
         self.modes = {}
-        self.model_wanted = self.acp.get("model") or None
+        model_obj = data.get("model") if isinstance(data.get("model"), dict) else {}
+        self.model_state = dict(model_obj)
+        self.model_wanted = self.acp.get("model") or self.model_state.get("declared") or None
+        self.effort_wanted = self.acp.get("effort") or self.model_state.get("effort_declared") or None
+        self.billing = self.model_state.get("billing")
+        self.limit_usd = self.model_state.get("limit_usd")
+        self.limit_tokens = self.model_state.get("limit_tokens")
+        self.cost_total = self.model_state.get("cost_usd")
+        self.tokens_total = self.model_state.get("tokens")
+        if not isinstance(self.cost_total, (int, float)):
+            self.cost_total = None
+        if not isinstance(self.tokens_total, (int, float)):
+            self.tokens_total = None
+        self.turn_usage = None
+        self.force_cost_limit = False
+        self.limit_stopped = False
+        self.limit_warning_sent = bool(self.model_state.get("warning_80"))
+        self.model_deviation_reported = False
+        self.deviation_this_turn = False
+        self.cost_limit_wake_sent = False
         self.mode_wanted = self.acp.get("mode") or None
         self.policy = str(self.acp.get("policy") or "allow")
         self.deny = [str(rule) for rule in (self.acp.get("deny") or [])]
@@ -659,7 +728,13 @@ class Supervisor:
         self.load_session = bool(
             (result.get("agentCapabilities") or {}).get("loadSession")
         )
-        self.acp_set(load_session=self.load_session, protocol=result.get("protocolVersion"))
+        agent_info = result.get("agentInfo") or {}
+        self.acp_set(
+            load_session=self.load_session,
+            protocol=result.get("protocolVersion"),
+            agent_name=agent_info.get("name"),
+            agent_version=agent_info.get("version"),
+        )
         self.event(
             "acp_started",
             {
@@ -670,7 +745,157 @@ class Supervisor:
         )
         return result
 
-    async def apply_config(self, payload: dict, strict: bool = True) -> None:
+    def model_update(self, **fields) -> None:
+        """Merge fields into the apply state's .model object."""
+        def mutate(data):
+            model = data.setdefault("model", {})
+            model.update(fields)
+        self.state.update(mutate)
+        self.model_state.update(fields)
+
+    def remember_seen(self, *names) -> list:
+        seen = list(self.model_state.get("seen") or [])
+        for name in names:
+            if name and name not in seen:
+                seen.append(name)
+        return seen
+
+    async def set_config_option(self, config_id: str, value: str) -> dict:
+        result = await self.client.request(
+            "session/set_config_option",
+            {"sessionId": self.session_id, "configId": config_id, "value": value},
+            timeout=30,
+        )
+        options = result.get("configOptions")
+        if options is not None:
+            self.config_options = options or []
+        return result
+
+    def current_value(self, config_id: str = "", category: str = ""):
+        option = config_option(self.config_options, config_id, category)
+        if option is None:
+            return None
+        return option.get("currentValue")
+
+    async def confirm_config(self, after_load: bool = False) -> None:
+        """Set model, then effort, then read both back before any prompt.
+
+        An unpinned runner has no declared model; the agent's own default is
+        recorded as the session's current value but never as a confirmed
+        choice. A pinned runner gets an error when the agent does not offer the
+        value or reports another one after accepting it.
+        """
+        model = self.model_wanted
+        # The mode is independent of the model and is checked for an unpinned
+        # runner too, so a wrong mode cannot slip through on a default model.
+        if self.mode_wanted:
+            ids = offered_modes(self.modes)
+            if not ids:
+                raise AcpError(
+                    "mode_not_offered",
+                    f"the agent does not advertise session modes; requested '{self.mode_wanted}'",
+                )
+            if self.mode_wanted not in ids:
+                raise AcpError(
+                    "mode_not_offered",
+                    f"mode '{self.mode_wanted}' is not offered; available: {', '.join(ids) or '(none)'}",
+                )
+            await self.client.request(
+                "session/set_mode",
+                {"sessionId": self.session_id, "modeId": self.mode_wanted},
+                timeout=30,
+            )
+
+        if not model:
+            current = self.current_value("model")
+            self.acp_set(model=current or None)
+            seen = self.remember_seen(current)
+            self.model_update(
+                status="unpinned", confirmed=None, effort_confirmed=None,
+                source="acp_config", checked_at=now_iso(), seen=seen,
+            )
+            return
+
+        model_option = config_option(self.config_options, "model")
+        values = values_of(model_option) if model_option is not None else None
+        if model_option is None:
+            code = "model_mismatch" if after_load else "model_not_offered"
+            reason = (
+                "the loaded session advertises no model config option"
+                if after_load
+                else "the agent does not advertise a model config option"
+            )
+            self.model_update(status="mismatch", checked_at=now_iso())
+            raise AcpError(code, f"{reason}; requested '{model}'", {"declared": model})
+        if model not in values:
+            self.model_update(status="mismatch", checked_at=now_iso())
+            raise AcpError(
+                "model_not_offered",
+                f"model '{model}' is not offered; available: {', '.join(values) or '(none)'}",
+                {"declared": model, "available": values},
+            )
+        await self.set_config_option("model", model)
+
+        # Effort goes after the model because the offered levels depend on the
+        # selected model. OpenCode advertises it under the category
+        # 'thought_level'; the option id itself may differ.
+        effort_option = config_option(self.config_options, category="thought_level")
+        if effort_option is None:
+            effort_option = config_option(self.config_options, "effort")
+        if self.effort_wanted:
+            if effort_option is None:
+                self.model_update(status="mismatch", checked_at=now_iso())
+                raise AcpError(
+                    "effort_not_offered",
+                    f"the agent advertises no thought-level config option; requested '{self.effort_wanted}'",
+                    {"declared": self.effort_wanted},
+                )
+            effort_values = values_of(effort_option)
+            if self.effort_wanted not in effort_values:
+                self.model_update(status="mismatch", checked_at=now_iso())
+                raise AcpError(
+                    "effort_not_offered",
+                    f"effort '{self.effort_wanted}' is not offered for model '{model}'; available: {', '.join(effort_values) or '(none)'}",
+                    {"declared": self.effort_wanted, "available": effort_values},
+                )
+            await self.set_config_option(str(effort_option.get("id")), self.effort_wanted)
+
+        model_confirmed = self.current_value("model")
+        effort_option = config_option(self.config_options, category="thought_level")
+        if effort_option is None:
+            effort_option = config_option(self.config_options, "effort")
+        effort_confirmed = None
+        if self.effort_wanted and effort_option is not None:
+            effort_confirmed = effort_option.get("currentValue")
+        if model_confirmed != model:
+            self.model_update(status="mismatch", checked_at=now_iso())
+            raise AcpError(
+                "model_mismatch",
+                f"declared model '{model}' but the configuration reports '{model_confirmed}'",
+                {"declared": model, "confirmed": model_confirmed},
+            )
+        if self.effort_wanted and effort_confirmed != self.effort_wanted:
+            self.model_update(status="mismatch", checked_at=now_iso())
+            raise AcpError(
+                "model_mismatch",
+                f"declared effort '{self.effort_wanted}' but the configuration reports '{effort_confirmed}'",
+                {"declared": self.effort_wanted, "confirmed": effort_confirmed},
+            )
+
+        self.acp_set(model=model)
+        seen = self.remember_seen(model)
+        self.model_update(
+            declared=model,
+            effort_declared=self.effort_wanted,
+            confirmed=model_confirmed,
+            effort_confirmed=effort_confirmed,
+            status="confirmed",
+            source="acp_config",
+            checked_at=now_iso(),
+            seen=seen,
+        )
+
+    async def apply_config(self, payload: dict, strict: bool = True, after_load: bool = False) -> None:
         config_options = payload.get("configOptions")
         if config_options is not None:
             self.config_options = config_options or []
@@ -678,73 +903,48 @@ class Supervisor:
         if modes is not None:
             self.modes = modes or {}
 
-        if self.model_wanted:
-            values = offered_values(self.config_options, "model")
-            if values is None:
-                if strict:
-                    raise AcpError(
-                        "model_not_offered",
-                        f"the agent does not advertise a model config option; requested '{self.model_wanted}'",
-                    )
-            elif self.model_wanted not in values:
-                raise AcpError(
-                    "model_not_offered",
-                    f"model '{self.model_wanted}' is not offered; available: {', '.join(values) or '(none)'}",
-                )
-            try:
-                result = await self.client.request(
-                    "session/set_config_option",
-                    {
-                        "sessionId": self.session_id,
-                        "configId": "model",
-                        "value": self.model_wanted,
-                    },
-                    timeout=30,
-                )
-                self.config_options = result.get("configOptions") or self.config_options
-            except AcpError as exc:
-                if strict:
-                    raise
-                log(f"warning: could not re-apply the model after load: {exc}")
+        await self.confirm_config(after_load=after_load)
 
-        if self.mode_wanted:
-            ids = offered_modes(self.modes)
-            if not ids:
-                if strict:
-                    raise AcpError(
-                        "mode_not_offered",
-                        f"the agent does not advertise session modes; requested '{self.mode_wanted}'",
-                    )
-            elif self.mode_wanted not in ids:
-                raise AcpError(
-                    "mode_not_offered",
-                    f"mode '{self.mode_wanted}' is not offered; available: {', '.join(ids) or '(none)'}",
-                )
-            try:
-                await self.client.request(
-                    "session/set_mode",
-                    {"sessionId": self.session_id, "modeId": self.mode_wanted},
-                    timeout=30,
-                )
-            except AcpError as exc:
-                if strict:
-                    raise
-                log(f"warning: could not re-apply the mode after load: {exc}")
-
-        model = self.model_wanted
-        if not model:
-            for option in self.config_options:
-                if str(option.get("id")) == "model":
-                    model = option.get("currentValue")
-                    break
         mode = self.mode_wanted
         if not mode and isinstance(self.modes, dict):
             mode = self.modes.get("currentModeId")
-        self.acp_set(model=model or None, mode=mode or None)
+        self.acp_set(mode=mode or None)
         self.event(
             "acp_config",
-            {"model": model or None, "mode": mode or None, "policy": self.policy},
+            {
+                "model": self.model_wanted or None,
+                "effort": self.effort_wanted or None,
+                "confirmed": self.model_state.get("confirmed"),
+                "mode": mode or None,
+                "policy": self.policy,
+            },
         )
+
+    async def guard_model(self) -> None:
+        """Repeat the confirmation before every further prompt.
+
+        A deviation is recorded and woken once; the prompt is not sent.
+        """
+        try:
+            await self.confirm_config()
+        except AcpError as exc:
+            if exc.code in ("model_mismatch", "model_not_offered", "effort_not_offered"):
+                self.model_update(
+                    status="mismatch",
+                    checked_at=now_iso(),
+                    error=exc.message,
+                )
+                self.event("acp_model_mismatch", {"code": exc.code, "message": exc.message})
+                if not self.model_deviation_reported:
+                    self.model_deviation_reported = True
+                    await self.wake(
+                        "settled",
+                        "mismatch",
+                        f"Apply {self.change} in {self.project}: model mismatch before the next prompt "
+                        f"({exc.message}). The declared model is kept and no prompt was sent. "
+                        f"Next step: boss status {self.change}",
+                    )
+            raise
 
     async def new_session(self) -> None:
         result = await self.client.request(
@@ -776,8 +976,10 @@ class Supervisor:
         finally:
             self.replaying = False
         self.event("acp_load", {"session_id": self.session_id})
-        strict = bool(result.get("configOptions") or result.get("modes"))
-        await self.apply_config(result, strict=strict)
+        # A resumed session is checked as strictly as a new one, even when the
+        # load returns no config options: a model that cannot be confirmed must
+        # never be prompted.
+        await self.apply_config(result, after_load=True)
 
     # ------------------------------------------------------- notifications ---
     def seed_seen_from_transcript(self) -> None:
@@ -863,18 +1065,18 @@ class Supervisor:
                 key: value for key, value in update.items() if key != "sessionUpdate"
             }
             self.usage = usage
+            self.turn_usage = usage
             self.acp_set(usage=usage)
             self.transcript_append({"type": "usage", "usage": usage})
             # Usage is reported separately; keep last_update for the last
             # message or tool activity.
             summary = None
+            await self.maybe_enforce_limit()
         elif kind in ("current_mode_update", "config_option_update"):
             if kind == "current_mode_update":
                 self.acp_set(mode=update.get("currentModeId") or update.get("modeId"))
             else:
-                for option in update.get("configOptions") or []:
-                    if str(option.get("id")) == "model":
-                        self.acp_set(model=option.get("currentValue"))
+                await self.check_config_deviation(update.get("configOptions") or [])
             self.transcript_append({"type": kind, "update": update})
             summary = None
         else:
@@ -1274,11 +1476,219 @@ class Supervisor:
                 count += 1
         return count
 
+    # ------------------------------------------------------ model and cost ---
+    def usage_totals(self) -> tuple:
+        """Committed totals plus the current turn's latest usage snapshot."""
+        cost = self.cost_total
+        tokens = self.tokens_total
+        if self.turn_usage is not None:
+            snapshot_cost, snapshot_tokens = usage_fields(self.turn_usage)
+            if snapshot_cost is not None:
+                cost = (cost or 0.0) + snapshot_cost
+            if snapshot_tokens is not None:
+                tokens = (tokens or 0) + snapshot_tokens
+        return cost, tokens
+
+    def limit_exceeded(self) -> bool:
+        cost, tokens = self.usage_totals()
+        if isinstance(self.limit_usd, (int, float)) and cost is not None and cost >= self.limit_usd:
+            return True
+        if isinstance(self.limit_tokens, (int, float)) and tokens is not None and tokens >= self.limit_tokens:
+            return True
+        return False
+
+    def warning_text(self) -> str:
+        cost, tokens = self.usage_totals()
+        parts = []
+        if isinstance(self.limit_usd, (int, float)) and cost is not None and cost >= 0.8 * self.limit_usd:
+            parts.append(f"cost {cost:.2f} USD of {self.limit_usd:.2f} USD")
+        if isinstance(self.limit_tokens, (int, float)) and tokens is not None and tokens >= 0.8 * self.limit_tokens:
+            parts.append(f"{tokens} tokens of {self.limit_tokens}")
+        return ", ".join(parts)
+
+    def record_usage(self, usage) -> None:
+        if usage:
+            cost, tokens = usage_fields(usage)
+            if cost is not None:
+                self.cost_total = (self.cost_total or 0.0) + cost
+            if tokens is not None:
+                self.tokens_total = (self.tokens_total or 0) + tokens
+        self.turn_usage = None
+        fields = {"cost_usd": self.cost_total, "tokens": self.tokens_total, "usage_at": now_iso()}
+        warning = self.warning_text()
+        if warning and not self.limit_warning_sent:
+            self.limit_warning_sent = True
+            fields["warning_80"] = True
+            fields["warning"] = warning
+            self.event(
+                "acp_cost_warning",
+                {
+                    "cost_usd": self.cost_total,
+                    "tokens": self.tokens_total,
+                    "limit_usd": self.limit_usd,
+                    "limit_tokens": self.limit_tokens,
+                },
+            )
+        self.model_update(**fields)
+
+    def limit_description(self) -> str:
+        cost, tokens = self.usage_totals()
+        used = []
+        if cost is not None:
+            used.append(f"cost {cost:.2f} USD")
+        if tokens is not None:
+            used.append(f"{tokens} tokens")
+        limits = []
+        if isinstance(self.limit_usd, (int, float)):
+            limits.append(f"{self.limit_usd:.2f} USD")
+        if isinstance(self.limit_tokens, (int, float)):
+            limits.append(f"{self.limit_tokens} tokens")
+        return (
+            f"used {', '.join(used) or 'unknown'}; limit {', '.join(limits) or 'none'}"
+        )
+
+    async def maybe_enforce_limit(self) -> None:
+        warning = self.warning_text()
+        if warning and not self.limit_warning_sent:
+            self.limit_warning_sent = True
+            self.model_update(warning_80=True, warning=warning)
+            self.event(
+                "acp_cost_warning",
+                {
+                    "cost_usd": self.cost_total,
+                    "tokens": self.tokens_total,
+                    "limit_usd": self.limit_usd,
+                    "limit_tokens": self.limit_tokens,
+                },
+            )
+        if not self.limit_exceeded() or self.limit_stopped:
+            return
+        self.limit_stopped = True
+        self.force_cost_limit = True
+        self.model_update(stop_reason="cost_limit", stop_at=now_iso())
+        self.event(
+            "acp_cost_limit",
+            {
+                "cost_usd": self.cost_total,
+                "tokens": self.tokens_total,
+                "limit_usd": self.limit_usd,
+                "limit_tokens": self.limit_tokens,
+            },
+        )
+        self.transcript_append({"type": "cost_limit", "usage": self.turn_usage or {}})
+        if self.turn_task is not None and not self.turn_task.done() and self.session_id:
+            try:
+                await self.client.notify("session/cancel", {"sessionId": self.session_id})
+            except Exception as exc:  # best effort; the turn timeout still bounds it
+                log(f"warning: cannot cancel a turn past its cost limit: {exc!r}")
+
+    async def check_config_deviation(self, config_options) -> None:
+        """A later config_option_update that deviates is a mismatch, not a fix.
+
+        The declared values stay in the state; the actual values are recorded
+        separately and the turn is cancelled. One wake per apply.
+        """
+        if self.model_state.get("status") != "confirmed":
+            return
+        actual_model = None
+        actual_effort = None
+        for option in config_options or []:
+            if not isinstance(option, dict):
+                continue
+            oid = str(option.get("id") or "")
+            category = str(option.get("category") or "").lower()
+            value = option.get("currentValue")
+            if oid == "model":
+                actual_model = value
+            elif category == "thought_level" or oid == "effort":
+                actual_effort = value
+        model_dev = bool(
+            self.model_wanted and actual_model is not None and actual_model != self.model_wanted
+        )
+        effort_dev = bool(
+            self.effort_wanted
+            and actual_effort is not None
+            and actual_effort != self.effort_wanted
+        )
+        if not model_dev and not effort_dev:
+            return
+        seen = self.remember_seen(actual_model, actual_effort)
+        self.model_update(
+            status="mismatch",
+            checked_at=now_iso(),
+            actual=actual_model,
+            actual_effort=actual_effort,
+            seen=seen,
+        )
+        self.event(
+            "acp_model_mismatch",
+            {
+                "declared": self.model_wanted,
+                "confirmed": actual_model,
+                "effort_declared": self.effort_wanted,
+                "effort_confirmed": actual_effort,
+            },
+        )
+        if self.model_deviation_reported:
+            return
+        self.model_deviation_reported = True
+        self.deviation_this_turn = True
+        detail = []
+        if model_dev:
+            detail.append(f"declared model '{self.model_wanted}' but the agent reports '{actual_model}'")
+        if effort_dev:
+            detail.append(f"declared effort '{self.effort_wanted}' but the agent reports '{actual_effort}'")
+        self.wake_background(
+            "settled",
+            "mismatch",
+            f"Apply {self.change} in {self.project}: model mismatch during the run "
+            f"({'; '.join(detail)}). The turn was cancelled, the declared model is kept. "
+            f"Next step: boss status {self.change}",
+        )
+        task = asyncio.create_task(self.cancel_turn())
+        self.wake_tasks.add(task)
+        task.add_done_callback(self.wake_tasks.discard)
+
     # --------------------------------------------------------------- turns ---
     async def run_turn(self, text: str) -> str:
         self.message_texts.clear()
         self.stall_wake_sent = False
+        self.turn_usage = None
+        self.force_cost_limit = False
+        self.deviation_this_turn = False
         self.set_phase("working", "working")
+
+        # No prompt is sent until model and effort are confirmed again. A
+        # retrigger or resume therefore cannot drift silently.
+        try:
+            await self.guard_model()
+        except AcpError as exc:
+            self.acp_set(last_stop_reason="model_mismatch")
+            self.set_phase("idle", "mismatch")
+            self.event("acp_stop", {"stop_reason": "model_mismatch", "code": exc.code})
+            self.transcript_append(
+                {"type": "stop", "stop_reason": "model_mismatch", "message": exc.message}
+            )
+            return "model_mismatch"
+
+        # A limit that was already reached (a resumed apply) is a hard stop:
+        # no further prompt is sent. The first stop wakes once.
+        if self.limit_exceeded():
+            self.limit_stopped = True
+            self.force_cost_limit = True
+            self.model_update(stop_reason="cost_limit", stop_at=now_iso())
+            if not self.cost_limit_wake_sent:
+                self.cost_limit_wake_sent = True
+                await self.wake(
+                    "settled",
+                    "cost_limit",
+                    f"Apply {self.change} in {self.project}: cost_limit ({self.limit_description()}). "
+                    f"Next step: boss status {self.change}",
+                )
+            self.acp_set(last_stop_reason="cost_limit")
+            self.set_phase("idle", "cost_limit")
+            return "cost_limit"
+
         self.event("acp_prompt", {"text": text[:2000]})
         self.transcript_append({"type": "prompt", "text": text[:4000]})
         timeout = turn_timeout()
@@ -1290,10 +1700,15 @@ class Supervisor:
             )
         )
         stop_reason = "unknown"
+        usage = None
         try:
             result = await self.turn_task
             stop_reason = str(result.get("stopReason") or "unknown")
-            usage = result.get("usage")
+            # The turn's usage_update may carry cost that the prompt result
+            # omits; merge both, with the final result fields winning.
+            merged = dict(self.turn_usage or {})
+            merged.update(result.get("usage") or {})
+            usage = merged or None
             if usage:
                 self.usage = usage
                 self.acp_set(usage=usage)
@@ -1315,11 +1730,31 @@ class Supervisor:
             log(f"acp: prompt failed: {exc.message}")
         finally:
             self.turn_task = None
+
+        if usage is None:
+            usage = self.turn_usage
+        self.record_usage(usage)
+        await self.maybe_enforce_limit()
+        if self.force_cost_limit:
+            stop_reason = "cost_limit"
         self.acp_set(last_stop_reason=stop_reason)
-        self.event("acp_stop", {"stop_reason": stop_reason, "usage": self.usage})
+        self.event(
+            "acp_stop",
+            {
+                "stop_reason": stop_reason,
+                "usage": self.usage,
+                "cost_usd": self.cost_total,
+                "tokens": self.tokens_total,
+            },
+        )
         self.transcript_append({"type": "stop", "stop_reason": stop_reason, "usage": self.usage})
         last_state = "idle" if stop_reason in ("end_turn", "unknown") else stop_reason
         self.set_phase("idle", last_state)
+        if self.deviation_this_turn:
+            # The deviation handler already cancelled the turn and woke once.
+            self.acp_set(last_stop_reason="model_mismatch")
+            self.set_phase("idle", "mismatch")
+            return "model_mismatch"
         if self.stop_event.is_set():
             # Finish or a stop signal: the Explorer initiated the end, so no
             # wake is needed (and none should delay shutdown).
@@ -1328,6 +1763,8 @@ class Supervisor:
             message = "idle (ACP turn ended, stopReason end_turn)"
         elif stop_reason == "cancelled":
             message = "cancelled (ACP turn ended, stopReason cancelled)"
+        elif stop_reason == "cost_limit":
+            message = f"cost_limit ({self.limit_description()})"
         elif stop_reason == "turn_timeout":
             message = (
                 "turn_timeout (ACP turn did not answer within "
@@ -1335,6 +1772,8 @@ class Supervisor:
             )
         else:
             message = f"{stop_reason} (ACP turn ended, stopReason {stop_reason})"
+        if stop_reason == "cost_limit":
+            self.cost_limit_wake_sent = True
         await self.wake(
             "settled",
             last_state,
@@ -1754,7 +2193,7 @@ class Supervisor:
             detail = exc.message
             if self.stderr_tail:
                 detail = f"{detail} (stderr: {' | '.join(self.stderr_tail[-3:])[:800]})"
-            self.acp_set(error=detail)
+            self.acp_set(error=detail, error_code=exc.code)
             self.set_phase("failed", "failed")
             if self.acp.get("ready"):
                 await self.wake(
@@ -1842,15 +2281,18 @@ class Supervisor:
 
 # ------------------------------------------------------------------ probe ---
 
-async def probe(command: str, cwd: str, model, mode, timeout: float, profile_temp: bool = False) -> dict:
+async def probe(command: str, cwd: str, model, effort, mode, timeout: float, profile_temp: bool = False) -> dict:
     result = {
         "status": "ok",
         "command": command,
         "cwd": cwd,
         "protocol": None,
         "load_session": None,
+        "agent_version": None,
         "models": [],
+        "efforts": [],
         "modes": [],
+        "session_left": False,
         "message": "",
     }
     argv = shlex.split(command) + ["acp"]
@@ -1901,6 +2343,7 @@ async def probe(command: str, cwd: str, model, mode, timeout: float, profile_tem
     reader = asyncio.create_task(client.reader_loop())
     err = asyncio.create_task(drain())
     session_id = None
+    closed = False
     try:
         init = await client.request(
             "initialize",
@@ -1912,6 +2355,7 @@ async def probe(command: str, cwd: str, model, mode, timeout: float, profile_tem
         )
         result["protocol"] = init.get("protocolVersion")
         result["load_session"] = bool((init.get("agentCapabilities") or {}).get("loadSession"))
+        result["agent_version"] = (init.get("agentInfo") or {}).get("version")
         session = await client.request(
             "session/new", {"cwd": cwd or os.getcwd(), "mcpServers": []}, timeout=timeout
         )
@@ -1931,6 +2375,35 @@ async def probe(command: str, cwd: str, model, mode, timeout: float, profile_tem
                 result.update(
                     status="fail",
                     message=f"model '{model}' is not offered; available: {', '.join(models) or '(none)'}",
+                )
+            else:
+                set_result = await client.request(
+                    "session/set_config_option",
+                    {"sessionId": session_id, "configId": "model", "value": model},
+                    timeout=timeout,
+                )
+                config_options = set_result.get("configOptions") or config_options
+        effort_option = config_option(config_options, category="thought_level")
+        if effort_option is None:
+            effort_option = config_option(config_options, "effort")
+        efforts = values_of(effort_option) if effort_option is not None else []
+        result["efforts"] = efforts
+        if result["status"] == "ok" and effort:
+            if effort_option is None:
+                result.update(
+                    status="fail",
+                    message=f"effort '{effort}' is not offered: the agent advertises no thought-level config option for model '{model or 'default'}'",
+                )
+            elif effort not in efforts:
+                result.update(
+                    status="fail",
+                    message=f"effort '{effort}' is not offered for model '{model or 'default'}'; available: {', '.join(efforts) or '(none)'}",
+                )
+            else:
+                await client.request(
+                    "session/set_config_option",
+                    {"sessionId": session_id, "configId": str(effort_option.get("id")), "value": effort},
+                    timeout=timeout,
                 )
         if result["status"] == "ok" and mode:
             if not modes:
@@ -1954,8 +2427,20 @@ async def probe(command: str, cwd: str, model, mode, timeout: float, profile_tem
         if session_id:
             try:
                 await client.request("session/close", {"sessionId": session_id}, timeout=3)
+                closed = True
             except Exception:
                 pass
+        # A non-isolated probe uses the user's own agent store. Close the
+        # session and delete it when the agent supports deletion; otherwise
+        # report the empty session instead of hiding it.
+        if session_id and not profile_temp:
+            try:
+                await client.request("session/delete", {"sessionId": session_id}, timeout=3)
+            except Exception as exc:
+                result["session_left"] = True
+                note = f"an empty probe session {session_id} remains in the user's agent store"
+                result["message"] = (result["message"] + "; " + note).strip("; ")
+                log(f"acp probe: {note} ({exc})")
         try:
             proc.terminate()
         except ProcessLookupError:
@@ -1980,6 +2465,7 @@ def main() -> int:
     parser.add_argument("--probe")
     parser.add_argument("--cwd", default="")
     parser.add_argument("--model", default="")
+    parser.add_argument("--effort", default="")
     parser.add_argument("--mode", default="")
     parser.add_argument("--timeout", type=float, default=20.0)
     parser.add_argument("--profile-temp", action="store_true")
@@ -1991,6 +2477,7 @@ def main() -> int:
                 args.probe,
                 args.cwd,
                 args.model or None,
+                args.effort or None,
                 args.mode or None,
                 args.timeout,
                 profile_temp=args.profile_temp,
