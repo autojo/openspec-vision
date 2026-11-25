@@ -20,6 +20,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -91,10 +92,57 @@ def env_seconds(name: str, default: float) -> float:
         return float(default)
 
 
+DEFAULT_LINE_LIMIT = 64 * 1024 * 1024
+MIN_LINE_LIMIT = 64 * 1024
+
+
+def line_limit() -> int:
+    """Bytes one protocol line may use before the reader drops it.
+
+    The limit bounds memory for a broken child without truncating realistic
+    tool updates: a whole-file edit is serialized in one line.
+    """
+    raw = os.environ.get("BOSS_ACP_LINE_LIMIT")
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_LINE_LIMIT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        log(f"warning: BOSS_ACP_LINE_LIMIT={raw!r} is not a number; using {DEFAULT_LINE_LIMIT}")
+        return DEFAULT_LINE_LIMIT
+    if value < MIN_LINE_LIMIT:
+        log(f"warning: BOSS_ACP_LINE_LIMIT={value} is below {MIN_LINE_LIMIT}; using {MIN_LINE_LIMIT}")
+        return MIN_LINE_LIMIT
+    return value
+
+
+async def spawn_agent_process(*argv, cwd=None, env=None):
+    """Start an ACP child with the configured stream limit.
+
+    The supervisor and the doctor probe use this one entry point so both read
+    the protocol with the same bound.
+    """
+    return await asyncio.create_subprocess_exec(
+        *argv,
+        cwd=cwd or None,
+        env=env,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=line_limit(),
+    )
+
+
 def turn_timeout():
     """Seconds a turn may wait for the prompt response; None disables it."""
     value = env_seconds("BOSS_ACP_TURN_TIMEOUT_S", 7200)
     return value if value > 0 else None
+
+
+def shutdown_budget() -> float:
+    """One shared bound for cancel, session close and child termination."""
+    value = env_seconds("BOSS_ACP_SHUTDOWN_BUDGET_S", 15)
+    return value if value > 0 else 1.0
 
 
 def stall_interval() -> float:
@@ -261,9 +309,17 @@ class StateFile:
         if not acquired:
             log("warning: state lock busy; updating without it")
         try:
-            data = self.read()
+            try:
+                data = self.read()
+            except FileNotFoundError:
+                # 'boss finish' removes the apply state while the supervisor is
+                # still closing. That is a normal shutdown, never a crash.
+                log(f"acp: state file {self.path} is gone; not writing")
+                return
             mutate(data)
-            tmp = self.path + ".acp.tmp"
+            # A unique name keeps two supervisors that briefly overlap during
+            # a restart from renaming each other's temporary file away.
+            tmp = f"{self.path}.acp.{os.getpid()}.tmp"
             with open(tmp, "w", encoding="utf-8") as handle:
                 json.dump(data, handle, separators=(",", ":"))
                 handle.write("\n")
@@ -435,6 +491,10 @@ class AcpClient:
         self.pending = {}
         self.next_id = 0
         self.closed = False
+        self.close_reason = None
+        self.close_error = None
+        self.buffer = b""
+        self.line_limit = line_limit()
         self.on_request = None
         self.on_notification = None
         self.on_closed = None
@@ -446,33 +506,128 @@ class AcpClient:
         self.proc.stdin.write(data.encode("utf-8"))
         await self.proc.stdin.drain()
 
-    async def reader_loop(self) -> None:
+    def _note_skipped_line(self, head: bytes, size: int, limit: int) -> None:
+        """Drop one oversized line without losing the lines after it.
+
+        A response that was skipped can never reach its request; failing that
+        request now ends the turn as transport_lost instead of waiting for the
+        turn timeout. The small prefix is enough to recognise a JSON-RPC
+        response and its id.
+        """
+        log(f"acp: skipped a line of {size} bytes (BOSS_ACP_LINE_LIMIT={limit})")
+        if b'"result"' not in head and b'"error"' not in head:
+            return
+        match = re.search(rb'"id"\s*:\s*(\d+)', head)
+        if match is None:
+            return
+        future = self.pending.pop(int(match.group(1)), None)
+        if future is not None and not future.done():
+            future.set_exception(
+                AcpError(
+                    "transport_lost",
+                    f"the response was skipped (line of {size} bytes above BOSS_ACP_LINE_LIMIT={limit})",
+                )
+            )
+
+    async def read_protocol_line(self):
+        """Read one line with a bounded buffer.
+
+        The StreamReader limit alone raises on a long line and loses the rest
+        of the stream to the caller; here a complete or partial oversized line
+        is consumed up to its newline, reported once and skipped.
+        """
+        limit = self.line_limit
         while True:
-            line = await self.proc.stdout.readline()
-            if not line:
-                break
-            text = line.decode("utf-8", errors="replace").strip()
-            if not text:
+            newline = self.buffer.find(b"\n")
+            if newline >= 0:
+                if newline <= limit:
+                    line = self.buffer[:newline]
+                    self.buffer = self.buffer[newline + 1:]
+                    return line
+                raw = self.buffer[:newline]
+                self.buffer = self.buffer[newline + 1:]
+                self._note_skipped_line(raw[:4096], len(raw), limit)
                 continue
-            try:
-                message = json.loads(text)
-            except json.JSONDecodeError:
-                log(f"acp: malformed line from child: {text[:300]}")
+            if len(self.buffer) > limit:
+                head = self.buffer[:4096]
+                discarded = len(self.buffer)
+                self.buffer = b""
+                while True:
+                    chunk = await self.proc.stdout.read(65536)
+                    if not chunk:
+                        self._note_skipped_line(head, discarded, limit)
+                        return None
+                    cut = chunk.find(b"\n")
+                    if cut >= 0:
+                        discarded += cut
+                        self.buffer = chunk[cut + 1:]
+                        break
+                    discarded += len(chunk)
+                self._note_skipped_line(head, discarded, limit)
                 continue
-            try:
-                await self._dispatch(message)
-            except Exception as exc:  # never let one message kill the reader
-                log(f"acp: message handling failed: {exc!r}")
+            chunk = await self.proc.stdout.read(65536)
+            if not chunk:
+                if self.buffer:
+                    line = self.buffer
+                    self.buffer = b""
+                    return line
+                return None
+            self.buffer += chunk
+
+    async def _reader_exit(self, reason: str, error) -> None:
+        if self.closed:
+            return
         self.closed = True
+        self.close_reason = reason
+        self.close_error = error
+        if error is not None:
+            message = f"the protocol reader stopped: {error}"
+        elif reason == "eof":
+            message = "the child's output stream closed"
+        else:
+            message = "the protocol reader was cancelled"
         for future in list(self.pending.values()):
             if not future.done():
-                future.set_exception(AcpError("child_exit", "the ACP child exited"))
+                future.set_exception(AcpError("transport_lost", message))
         self.pending.clear()
         if self.on_closed is not None:
             try:
                 await self.on_closed()
             except Exception as exc:
                 log(f"acp: close handler failed: {exc!r}")
+
+    async def reader_loop(self) -> None:
+        reason = "eof"
+        error = None
+        cancelled = False
+        try:
+            while True:
+                line = await self.read_protocol_line()
+                if line is None:
+                    break
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                try:
+                    message = json.loads(text)
+                except json.JSONDecodeError:
+                    log(f"acp: malformed line from child: {text[:300]}")
+                    continue
+                try:
+                    await self._dispatch(message)
+                except Exception as exc:  # never let one message kill the reader
+                    log(f"acp: message handling failed: {exc!r}")
+        except asyncio.CancelledError:
+            reason = "cancelled"
+            cancelled = True
+        except Exception as exc:
+            reason = "error"
+            error = exc
+            log(f"acp: protocol reader stopped: {exc!r}")
+        finally:
+            await self._reader_exit(reason, error)
+        if cancelled:
+            raise asyncio.CancelledError()
 
     async def _dispatch(self, message) -> None:
         if "id" in message and ("result" in message or "error" in message):
@@ -506,6 +661,13 @@ class AcpClient:
                 error,
             )
         return response.get("result") or {}
+
+    def fail_pending(self, error) -> None:
+        """Fail every open request; used when the supervisor closes."""
+        for future in list(self.pending.values()):
+            if not future.done():
+                future.set_exception(error)
+        self.pending.clear()
 
     async def notify(self, method: str, params: dict) -> None:
         await self._write({"jsonrpc": "2.0", "method": method, "params": params})
@@ -592,9 +754,18 @@ class Supervisor:
         # text that entry carried, and whether the current working phase has
         # already woken the boss about a stall.
         self.last_activity = time.monotonic()
+        self.last_activity_at = now_iso()
         self.last_activity_text = ""
         self.stall_wake_sent = False
         self.stalled = bool(self.acp.get("stalled"))
+        # A protocol reader that stopped leaves the child possibly alive. The
+        # turn then ends as transport_lost and a later prompt restarts the
+        # child instead of being refused as turn_active.
+        self.reader_dead = not bool(self.acp.get("reader_alive", True))
+        self.transport_lost_reason = self.acp.get("transport_lost_reason")
+        self.exit_when_idle = False
+        self.shutting_down = False
+        self.shutdown_deadline = None
         # Blocked wakes are debounced per working -> blocked transition.
         self.blocked_wake_sent = False
         # Streamed message chunks with the same message id are joined, so
@@ -638,12 +809,65 @@ class Supervisor:
         as soon as the agent is active again.
         """
         self.last_activity = time.monotonic()
+        self.last_activity_at = now_iso()
         if text:
             self.last_activity_text = summarize_text(text)
         self.stall_wake_sent = False
         if self.stalled:
             self.stalled = False
             self.acp_set(stalled=False, stalled_at=None)
+
+    def child_alive(self) -> bool:
+        return self.proc is not None and self.proc.returncode is None
+
+    def reader_alive(self) -> bool:
+        return self.client is not None and not self.client.closed
+
+    def transport_reason(self) -> str:
+        if self.client is None:
+            return "no protocol reader is attached"
+        if self.client.close_error is not None:
+            return f"the protocol reader stopped: {self.client.close_error}"
+        if self.client.close_reason == "cancelled":
+            return "the protocol reader was cancelled"
+        return "the child's output stream closed"
+
+    def transport_lost_text(self, reason: str) -> str:
+        age = max(0, int(time.monotonic() - self.last_activity))
+        last = self.last_activity_text or "no transcript activity"
+        child = "alive" if self.child_alive() else "gone"
+        advice = (
+            "The agent may still be working."
+            if self.child_alive()
+            else "The agent cannot answer any more."
+        )
+        return (
+            f"Apply {self.change} in {self.project}: transport_lost ({reason}). "
+            f"Child: {child}, reader: gone, last activity: {last} ({age}s ago). "
+            f"{advice} Next step: boss status {self.change} "
+            f"(or boss retrigger {self.change} to continue in the same worktree)"
+        )
+
+    async def settle_transport_lost(self, reason: str) -> None:
+        """Record a lost reader when no turn is open and wake the boss once."""
+        self.transport_lost_reason = reason
+        # The reason lives in transport_lost_reason, not in error: 'error' is
+        # the start-failure channel that dispatch polls before the session is
+        # ready, and a lost transport during the first turn is not that.
+        self.acp_set(
+            last_stop_reason="transport_lost",
+            transport_lost_reason=reason,
+            stalled=False,
+            stalled_at=None,
+            reader_alive=False,
+        )
+        self.set_phase("idle", "transport_lost")
+        self.event("acp_transport_lost", {"reason": reason})
+        self.transcript_append(
+            {"type": "stop", "stop_reason": "transport_lost", "reason": reason},
+            progress=False,
+        )
+        await self.wake("settled", "transport_lost", self.transport_lost_text(reason))
 
     def event(self, name: str, extra: dict | None = None) -> None:
         if not self.events_file:
@@ -658,9 +882,15 @@ class Supervisor:
         except OSError as exc:
             log(f"warning: cannot append event {name}: {exc}")
 
-    def transcript_append(self, record: dict) -> None:
-        # Every transcript entry is progress for the stall watchdog.
-        self.mark_activity(transcript_activity_text(record))
+    def transcript_append(self, record: dict, progress: bool = True) -> None:
+        # Every real transcript entry is progress for the stall watchdog. A
+        # synthetic transport_lost stop is not: it must not reset the age it
+        # reports.
+        if progress:
+            self.mark_activity(transcript_activity_text(record))
+            # 'boss status' runs in another process: persist the time of the
+            # last real entry so it can show its age.
+            self.acp_set(last_activity_at=self.last_activity_at)
         if not self.transcript:
             return
         record = dict(record)
@@ -1649,6 +1879,44 @@ class Supervisor:
         self.wake_tasks.add(task)
         task.add_done_callback(self.wake_tasks.discard)
 
+    async def restart_session(self) -> None:
+        """Replace a lost transport: stop the old child, resume or reopen.
+
+        The recorded worktree (self.root) is kept, so uncommitted files and the
+        apply's state stay where they are.
+        """
+        log("acp: restarting the ACP child after a lost transport")
+        self.event(
+            "acp_restart",
+            {"reason": self.transport_lost_reason or "reader_stopped"},
+        )
+        await self.stop_child(grace=5.0)
+        self.reader_dead = False
+        self.transport_lost_reason = None
+        self.acp_set(
+            transport_lost_reason=None,
+            error=None,
+            reader_alive=True,
+            child_alive=False,
+        )
+        await self.spawn_child()
+        await self.initialize()
+        if self.session_id and self.load_session:
+            try:
+                self.seed_seen_from_transcript()
+                await self.load_session_into_client()
+                self.acp_set(ready=True)
+                return
+            except AcpError as exc:
+                log(
+                    f"acp: cannot resume session {self.session_id}: {exc.message}; "
+                    "starting a new session"
+                )
+                self.session_id = None
+                self.acp_set(session_id=None)
+        await self.new_session()
+        self.acp_set(ready=True)
+
     # --------------------------------------------------------------- turns ---
     async def run_turn(self, text: str) -> str:
         self.message_texts.clear()
@@ -1657,6 +1925,12 @@ class Supervisor:
         self.force_cost_limit = False
         self.deviation_this_turn = False
         self.set_phase("working", "working")
+
+        # After a transport loss the old child can no longer answer. A new
+        # prompt starts a fresh child and resumes the recorded session when the
+        # agent offers it; the worktree is never touched.
+        if self.client is None or self.client.closed or self.reader_dead:
+            await self.restart_session()
 
         # No prompt is sent until model and effort are confirmed again. A
         # retrigger or resume therefore cannot drift silently.
@@ -1719,15 +1993,26 @@ class Supervisor:
             stop_reason = "turn_timeout"
             log(f"acp: turn timed out after {timeout}s; sending session/cancel")
             self.event("acp_timeout", {"timeout_s": timeout})
-            if self.session_id:
+            if self.session_id and self.client is not None and not self.client.closed:
                 try:
                     await self.client.notify("session/cancel", {"sessionId": self.session_id})
                 except Exception as exc:
                     log(f"warning: cannot cancel a timed-out turn: {exc!r}")
         except AcpError as exc:
-            stop_reason = "failed"
-            self.acp_set(error=exc.message)
-            log(f"acp: prompt failed: {exc.message}")
+            if exc.code == "transport_lost":
+                stop_reason = "transport_lost"
+                self.transport_lost_reason = exc.message
+                self.acp_set(
+                    transport_lost_reason=exc.message,
+                    reader_alive=False,
+                )
+                log(f"acp: turn lost its transport: {exc.message}")
+            elif exc.code == "cancelled":
+                stop_reason = "cancelled"
+            else:
+                stop_reason = "failed"
+                self.acp_set(error=exc.message)
+                log(f"acp: prompt failed: {exc.message}")
         finally:
             self.turn_task = None
 
@@ -1737,7 +2022,6 @@ class Supervisor:
         await self.maybe_enforce_limit()
         if self.force_cost_limit:
             stop_reason = "cost_limit"
-        self.acp_set(last_stop_reason=stop_reason)
         self.event(
             "acp_stop",
             {
@@ -1747,9 +2031,16 @@ class Supervisor:
                 "tokens": self.tokens_total,
             },
         )
-        self.transcript_append({"type": "stop", "stop_reason": stop_reason, "usage": self.usage})
+        stop_record = {"type": "stop", "stop_reason": stop_reason, "usage": self.usage}
+        transport_stop = stop_reason == "transport_lost"
+        if transport_stop:
+            stop_record["reason"] = self.transport_lost_reason or self.transport_reason()
+        self.transcript_append(stop_record, progress=not transport_stop)
         last_state = "idle" if stop_reason in ("end_turn", "unknown") else stop_reason
         self.set_phase("idle", last_state)
+        # Write the stop reason last: it is the marker every waiter polls, so
+        # the phase must already be settled when it appears.
+        self.acp_set(last_stop_reason=stop_reason)
         if self.deviation_this_turn:
             # The deviation handler already cancelled the turn and woke once.
             self.acp_set(last_stop_reason="model_mismatch")
@@ -1770,15 +2061,26 @@ class Supervisor:
                 "turn_timeout (ACP turn did not answer within "
                 f"BOSS_ACP_TURN_TIMEOUT_S={int(timeout or 0)}s)"
             )
+        elif stop_reason == "transport_lost":
+            message = ""
         else:
             message = f"{stop_reason} (ACP turn ended, stopReason {stop_reason})"
         if stop_reason == "cost_limit":
             self.cost_limit_wake_sent = True
-        await self.wake(
-            "settled",
-            last_state,
-            f"Apply {self.change} in {self.project}: {message}. Next step: boss status {self.change}",
-        )
+        if stop_reason == "transport_lost":
+            wake_text = self.transport_lost_text(
+                self.transport_lost_reason or self.transport_reason()
+            )
+        else:
+            wake_text = (
+                f"Apply {self.change} in {self.project}: {message}. "
+                f"Next step: boss status {self.change}"
+            )
+        await self.wake("settled", last_state, wake_text)
+        if self.exit_when_idle:
+            self.exit_when_idle = False
+            self.stop_event.set()
+            self.control_event.set()
         return stop_reason
 
     async def cancel_turn(self) -> str:
@@ -1839,6 +2141,10 @@ class Supervisor:
                     "last_stop_reason": self.acp.get("last_stop_reason"),
                     "last_update": self.acp.get("last_update"),
                     "stalled": bool(self.stalled),
+                    "child_alive": self.child_alive(),
+                    "reader_alive": self.reader_alive(),
+                    "transport_lost_reason": self.transport_lost_reason,
+                    "last_activity_at": self.last_activity_at,
                     "usage": self.usage,
                 }
             elif action == "answer":
@@ -1943,20 +2249,50 @@ class Supervisor:
 
     async def shutdown_from_control(self) -> None:
         log("acp: finish requested by the control socket")
+        await self.begin_shutdown("finish")
+
+    async def begin_shutdown(self, reason: str) -> None:
+        """End the supervisor within one shared budget.
+
+        The open prompt is cancelled first, so no task waits for a response
+        that will never arrive. Then the agent is asked to cancel its turn and
+        the run loop's cleanup (session close, child termination, socket) runs
+        under the same deadline. A removed state file never raises.
+        """
+        if self.shutting_down:
+            return
+        self.shutting_down = True
+        budget = shutdown_budget()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + budget
+        self.shutdown_deadline = deadline
+        log(f"acp: shutdown ({reason}) within {budget:g}s")
         self.stop_event.set()
         self.control_event.set()
         self.resolve_all({"cancel": True})
-        if self.turn_task is not None and not self.turn_task.done() and self.session_id:
+        if self.client is not None:
+            self.client.fail_pending(
+                AcpError("cancelled", "the supervisor is closing")
+            )
+        if self.client is not None and not self.client.closed and self.session_id:
+            remaining = max(0.1, min(3.0, deadline - loop.time()))
             try:
-                await self.client.notify("session/cancel", {"sessionId": self.session_id})
-            except Exception:
-                pass
+                await asyncio.wait_for(
+                    self.client.notify(
+                        "session/cancel", {"sessionId": self.session_id}
+                    ),
+                    remaining,
+                )
+            except Exception as exc:
+                log(f"acp: cannot send session/cancel during shutdown: {exc!r}")
         try:
-            await asyncio.wait_for(self.closed_event.wait(), 10)
+            await asyncio.wait_for(
+                self.closed_event.wait(), max(0.1, deadline - loop.time())
+            )
         except asyncio.TimeoutError:
-            log("warning: supervisor did not close in time; terminating the child")
-            if self.proc is not None and self.proc.returncode is None:
-                self.proc.terminate()
+            log(f"acp: supervisor did not close within {budget:g}s; terminating the child")
+            await self.stop_child(grace=2.0)
+            self.closed_event.set()
 
     def request_stop(self) -> None:
         """Signal handler path: no turn may keep the process alive."""
@@ -1964,6 +2300,10 @@ class Supervisor:
         self.stop_event.set()
         self.control_event.set()
         self.resolve_all({"cancel": True})
+        if self.client is not None:
+            self.client.fail_pending(
+                AcpError("cancelled", "the supervisor is stopping")
+            )
         if self.proc is not None and self.proc.returncode is None:
             try:
                 self.proc.terminate()
@@ -2030,20 +2370,47 @@ class Supervisor:
             if age < stall:
                 continue
             last = self.last_activity_text or "no transcript activity"
+            child = "alive" if self.child_alive() else "gone"
+            reader = "alive" if self.reader_alive() else "gone"
+            if reader == "gone":
+                # Name the more important fact first: the turn can no longer
+                # end, so interrupt alone is not the right next step.
+                hint = (
+                    "reader: gone (the transport is lost), child: "
+                    f"{child} -- the agent may still be working. "
+                    f"Next step: boss retrigger {self.change} to continue in the same worktree"
+                )
+            else:
+                hint = (
+                    f"child: {child}, reader: {reader} -- the agent may be running a long "
+                    f"command. Next step: boss status {self.change} "
+                    f"(or boss interrupt {self.change})"
+                )
             self.stall_wake_sent = True
             self.stalled = True
-            self.acp_set(stalled=True, stalled_at=now_iso())
+            self.acp_set(
+                stalled=True,
+                stalled_at=now_iso(),
+                child_alive=self.child_alive(),
+                reader_alive=self.reader_alive(),
+                last_activity_at=self.last_activity_at,
+            )
             self.event(
                 "acp_stall",
-                {"age_s": int(age), "stall_s": int(stall), "last_activity": last},
+                {
+                    "age_s": int(age),
+                    "stall_s": int(stall),
+                    "last_activity": last,
+                    "child_alive": self.child_alive(),
+                    "reader_alive": self.reader_alive(),
+                },
             )
             log(f"acp: turn stalled ({int(age)}s without progress): {last}")
             await self.wake(
                 "stalled",
                 "stalled",
                 f"Apply {self.change} in {self.project}: stalled (no transcript progress for "
-                f"{int(age)}s, last activity: {last}). "
-                f"Next step: boss status {self.change} (or boss interrupt {self.change})",
+                f"{int(age)}s, last activity: {last}, age {int(age)}s). {hint}",
             )
 
     async def drain_stderr(self) -> None:
@@ -2078,14 +2445,7 @@ class Supervisor:
             profile_root=self.profile_root if self.isolated else None,
         )
         try:
-            self.proc = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=self.root or None,
-                env=env,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            self.proc = await spawn_agent_process(*argv, cwd=self.root or None, env=env)
         except FileNotFoundError:
             raise AcpError("command_missing", f"the ACP command '{argv[0]}' was not found")
         except OSError as exc:
@@ -2094,6 +2454,13 @@ class Supervisor:
         self.client.on_request = self.on_request
         self.client.on_notification = self.on_notification
         self.client.on_closed = self.child_closed
+        self.reader_dead = False
+        self.acp_set(
+            child_pid=self.proc.pid,
+            child_alive=True,
+            reader_alive=True,
+            transport_lost_reason=None,
+        )
         asyncio.create_task(self.client.reader_loop())
         self.stderr_task = asyncio.create_task(self.drain_stderr())
         self.event(
@@ -2116,15 +2483,70 @@ class Supervisor:
             }
         )
 
+    async def stop_child(self, grace: float = 5.0) -> None:
+        """Terminate the current child and forget its client."""
+        proc = self.proc
+        if proc is not None:
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), grace)
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(proc.wait(), grace)
+                    except asyncio.TimeoutError:
+                        pass
+            self.acp_set(child_alive=False)
+        self.proc = None
+        self.client = None
+
     async def child_closed(self) -> None:
-        # No future may survive an unexpected child exit.
+        # Pending requests were already failed with transport_lost by the
+        # reader exit. A child that keeps running may still be working and can
+        # no longer answer; that is the visible transport loss.
+        self.reader_dead = True
+        # Capture the open turn before any await: the failed prompt future can
+        # resume run_turn while the child-exit grace below is pending, and
+        # run_turn then clears turn_task. Checking it afterwards would turn a
+        # recorded transport loss into a false start failure.
+        turn_open = self.turn_task is not None and not self.turn_task.done()
+        child_alive = self.child_alive()
+        if child_alive:
+            try:
+                await asyncio.wait_for(self.proc.wait(), 0.5)
+            except asyncio.TimeoutError:
+                pass
+            child_alive = self.child_alive()
         self.resolve_all({"cancel": True})
-        if not self.stop_event.is_set():
-            self.event("acp_exit", {"reason": "child_exit"})
-            self.acp_set(error="the ACP child exited unexpectedly")
-            self.set_phase("failed", "failed")
-            self.stop_event.set()
-            self.control_event.set()
+        self.acp_set(reader_alive=False, child_alive=child_alive)
+        if self.stop_event.is_set():
+            return
+        reason = self.transport_reason()
+        self.transport_lost_reason = reason
+        self.acp_set(transport_lost_reason=reason, reader_alive=False)
+        self.event(
+            "acp_transport_lost",
+            {"reason": reason, "child_alive": child_alive},
+        )
+        if turn_open:
+            # run_turn records the result and wakes exactly once.
+            if not child_alive:
+                self.exit_when_idle = True
+            return
+        if child_alive:
+            await self.settle_transport_lost(reason)
+            return
+        self.acp_set(error="the ACP child exited unexpectedly", child_alive=False)
+        self.set_phase("failed", "failed")
+        self.stop_event.set()
+        self.control_event.set()
 
     # ----------------------------------------------------------------- run ---
     async def run(self) -> None:
@@ -2211,37 +2633,34 @@ class Supervisor:
 
     async def cleanup(self) -> None:
         log("acp: cleanup started")
-        if self.stop_event.is_set() is False:
-            self.stop_event.set()
+        loop = asyncio.get_running_loop()
+        deadline = self.shutdown_deadline
+        if deadline is None or deadline < loop.time():
+            deadline = loop.time() + shutdown_budget()
+        self.stop_event.set()
         self.resolve_all({"cancel": True})
-        # Close the ACP session explicitly when one exists.
+        if self.client is not None:
+            self.client.fail_pending(
+                AcpError("cancelled", "the supervisor is closing")
+            )
+        # Close the ACP session explicitly when the transport still works.
         if self.client is not None and self.session_id and not self.client.closed:
             try:
                 log("acp: closing the session")
-                await self.client.request(
-                    "session/close", {"sessionId": self.session_id}, timeout=3
+                await asyncio.wait_for(
+                    self.client.request(
+                        "session/close",
+                        {"sessionId": self.session_id},
+                        timeout=max(0.1, min(3.0, deadline - loop.time())),
+                    ),
+                    max(0.2, min(4.0, deadline - loop.time())),
                 )
                 log("acp: session closed")
             except Exception as exc:
                 log(f"acp: session close failed: {exc!r}")
         if self.proc is not None and self.proc.returncode is None:
             log("acp: terminating the child")
-            try:
-                self.proc.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(self.proc.wait(), 5)
-            except asyncio.TimeoutError:
-                log("acp: child did not terminate; killing it")
-                try:
-                    self.proc.kill()
-                except ProcessLookupError:
-                    pass
-                try:
-                    await asyncio.wait_for(self.proc.wait(), 5)
-                except asyncio.TimeoutError:
-                    pass
+            await self.stop_child(grace=max(0.5, min(5.0, deadline - loop.time())))
         log("acp: child stopped")
         if self.server is not None:
             self.server.close()
@@ -2267,6 +2686,13 @@ class Supervisor:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+        # Remove the heartbeat only after its writer is gone, so a last write
+        # cannot recreate the file after shutdown.
+        if self.heartbeat_file:
+            try:
+                os.unlink(self.heartbeat_file)
+            except FileNotFoundError:
+                pass
         self.event("acp_exit", {"reason": "closed", "stop_reason": self.acp.get("last_stop_reason")})
         self.acp_set(
             phase="closed",
@@ -2274,6 +2700,8 @@ class Supervisor:
             pending_permission=None,
             pending_permissions=[],
             stalled=False,
+            reader_alive=False,
+            child_alive=self.child_alive(),
         )
         self.closed_event.set()
         log("acp: supervisor stopped")
@@ -2310,14 +2738,7 @@ async def probe(command: str, cwd: str, model, effort, mode, timeout: float, pro
         env["XDG_CONFIG_HOME"] = os.path.join(profile_root, "config")
         env["XDG_DATA_HOME"] = os.path.join(profile_root, "data")
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=cwd or None,
-            env=env,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        proc = await spawn_agent_process(*argv, cwd=cwd or None, env=env)
     except FileNotFoundError:
         result.update(status="fail", message=f"command '{argv[0]}' not found")
         if profile_root:
