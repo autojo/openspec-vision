@@ -31,4 +31,4 @@
 ## 6. Verification
 
 - [x] 6.1 Run the full regression suite and `openspec validate acp-turn-end-reliability --strict`. Prüfen: both are green.
-- [ ] 6.2 [Nutzer] Install the runtime while no apply runs, then run one real OpenCode apply that edits a file above 100 KB. Prüfen: the boss is woken with `end_turn`, and no supervisor process is left after `boss finish`.
+- [x] 6.2 [Nutzer] Install the runtime while no apply runs, then run one real OpenCode apply that edits a file above 100 KB. Prüfen: the boss is woken with `end_turn`, and no supervisor process is left after `boss finish`.
