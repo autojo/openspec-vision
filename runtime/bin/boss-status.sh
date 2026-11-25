@@ -50,6 +50,7 @@ status_one() {
   local state_file project agent runner pane_id tab_id workspace_id last_state last_state_at waiter_pid waiter_alive_flag
   local opencode_version permission_mode waiter_state
   local transport acp_json acp_phase acp_stalled pending_permission pending_permissions last_stop_reason acp_usage acp_transcript acp_last_update
+  local acp_child_alive acp_reader_alive acp_last_activity_at acp_last_activity_age acp_transport_lost_reason
   local worktree branch worktree_workspace merge_state merged merge_test kept review_root touches declared model_json
   state_file="$(find_state_file "$change" "$project_name")" || exit 1
   project="$(jq -r '.project' "$state_file")"
@@ -65,6 +66,17 @@ status_one() {
   acp_usage="$(jq -c '.acp.usage // null' "$state_file" 2>/dev/null || printf null)"
   acp_transcript="$(jq -r '.acp.transcript // empty' "$state_file" 2>/dev/null || true)"
   acp_last_update="$(jq -r '.acp.last_update // empty' "$state_file" 2>/dev/null || true)"
+  # '// empty' would swallow a legitimate false; keep the boolean string.
+  acp_child_alive="$(jq -r 'if .acp.child_alive == null then empty else (.acp.child_alive | tostring) end' "$state_file" 2>/dev/null || true)"
+  acp_reader_alive="$(jq -r 'if .acp.reader_alive == null then empty else (.acp.reader_alive | tostring) end' "$state_file" 2>/dev/null || true)"
+  acp_last_activity_at="$(jq -r '.acp.last_activity_at // empty' "$state_file" 2>/dev/null || true)"
+  acp_transport_lost_reason="$(jq -r '.acp.transport_lost_reason // empty' "$state_file" 2>/dev/null || true)"
+  acp_last_activity_age=""
+  if [ -n "$acp_last_activity_at" ]; then
+    local activity_epoch
+    activity_epoch="$(epoch_of_iso "$acp_last_activity_at")"
+    [ -n "$activity_epoch" ] && acp_last_activity_age=$(( $(date +%s) - activity_epoch ))
+  fi
   worktree="$(jq -r '.worktree // empty' "$state_file" 2>/dev/null || true)"
   branch="$(jq -r '.branch // empty' "$state_file" 2>/dev/null || true)"
   worktree_workspace="$(jq -r '.worktree_workspace // empty' "$state_file" 2>/dev/null || true)"
@@ -225,10 +237,13 @@ status_one() {
     --arg transport "$transport" --argjson acp "$acp_json" --arg acp_phase "$acp_phase" --argjson acp_stalled "$acp_stalled" \
     --argjson pending_permission "$pending_permission" --argjson pending_permissions "$pending_permissions" --arg last_stop_reason "$last_stop_reason" \
     --argjson acp_usage "$acp_usage" --arg acp_transcript "$acp_transcript" --arg acp_last_update "$acp_last_update" \
+    --arg acp_child_alive "$acp_child_alive" --arg acp_reader_alive "$acp_reader_alive" \
+    --arg acp_last_activity_at "$acp_last_activity_at" --arg acp_last_activity_age "$acp_last_activity_age" \
+    --arg acp_transport_lost_reason "$acp_transport_lost_reason" \
     --arg worktree "$worktree" --arg branch "$branch" --arg worktree_workspace "$worktree_workspace" \
     --arg merge_state "$merge_state" --argjson merged "$merged" --arg merge_test "$merge_test" \
     --argjson kept "$kept" --argjson touches "$touches" --argjson declared "$declared" --argjson model "$model_json" \
-    '{change: $change, project: $project, agent: $agent, runner: (if $runner == "" then null else $runner end), model: $model, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, transport: $transport, acp: (if $transport == "acp" then $acp else null end), acp_phase: (if $transport == "acp" then $acp_phase else null end), acp_stalled: (if $transport == "acp" then $acp_stalled else null end), pending_permission: (if $transport == "acp" then $pending_permission else null end), pending_permissions: (if $transport == "acp" then $pending_permissions else [] end), last_stop_reason: (if $last_stop_reason == "" then null else $last_stop_reason end), acp_usage: (if $transport == "acp" then $acp_usage else null end), acp_transcript: (if $acp_transcript == "" then null else $acp_transcript end), acp_last_update: (if $acp_last_update == "" then null else $acp_last_update end), worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), merge_state: $merge_state, merged: $merged, merge_test: $merge_test, kept: $kept, touches: $touches, declared: $declared, pane: $pane, herdr_agent: $herdr_agent, waiter_pid: (if $waiter_pid == "" then null else ($waiter_pid | tonumber? // $waiter_pid) end), waiter_alive: $waiter_alive, waiter: $waiter, inbox_pending: $inbox_pending, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, state: $state, human_tasks: $human_tasks, external_tasks: $external_tasks, opencode_version: (if $opencode_version == "" then null else ($opencode_version | tonumber? // null) end), permission_mode: (if $permission_mode == "" then null else $permission_mode end), lessons: {global: $lessons_global, project: $lessons_project}, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end), boss: (if $boss == "" then null else $boss end), boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok, wake_plan: $wake_plan, wake_target: $wake_target, last_wake: $last_wake}')"
+    '{change: $change, project: $project, agent: $agent, runner: (if $runner == "" then null else $runner end), model: $model, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, transport: $transport, acp: (if $transport == "acp" then $acp else null end), acp_phase: (if $transport == "acp" then $acp_phase else null end), acp_stalled: (if $transport == "acp" then $acp_stalled else null end), pending_permission: (if $transport == "acp" then $pending_permission else null end), pending_permissions: (if $transport == "acp" then $pending_permissions else [] end), last_stop_reason: (if $last_stop_reason == "" then null else $last_stop_reason end), acp_usage: (if $transport == "acp" then $acp_usage else null end), acp_transcript: (if $acp_transcript == "" then null else $acp_transcript end), acp_last_update: (if $acp_last_update == "" then null else $acp_last_update end), acp_child_alive: (if $transport == "acp" then (if $acp_child_alive == "" then null else ($acp_child_alive == "true") end) else null end), acp_reader_alive: (if $transport == "acp" then (if $acp_reader_alive == "" then null else ($acp_reader_alive == "true") end) else null end), acp_last_activity_at: (if $acp_last_activity_at == "" then null else $acp_last_activity_at end), acp_last_activity_age_s: (if $acp_last_activity_age == "" then null else ($acp_last_activity_age | tonumber? // null) end), acp_transport_lost_reason: (if $acp_transport_lost_reason == "" then null else $acp_transport_lost_reason end), worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), merge_state: $merge_state, merged: $merged, merge_test: $merge_test, kept: $kept, touches: $touches, declared: $declared, pane: $pane, herdr_agent: $herdr_agent, waiter_pid: (if $waiter_pid == "" then null else ($waiter_pid | tonumber? // $waiter_pid) end), waiter_alive: $waiter_alive, waiter: $waiter, inbox_pending: $inbox_pending, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, state: $state, human_tasks: $human_tasks, external_tasks: $external_tasks, opencode_version: (if $opencode_version == "" then null else ($opencode_version | tonumber? // null) end), permission_mode: (if $permission_mode == "" then null else $permission_mode end), lessons: {global: $lessons_global, project: $lessons_project}, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end), boss: (if $boss == "" then null else $boss end), boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok, wake_plan: $wake_plan, wake_target: $wake_target, last_wake: $last_wake}')"
 
   if [ "$json_only" -eq 1 ]; then
     printf '%s\n' "$json"
@@ -283,8 +298,17 @@ status_one() {
       "$(jq -r '.acp.mode // "-"' "$state_file")"
     [ -n "$runner" ] && printf 'runner: %s\n' "$runner"
     printf 'acp phase: %s\n' "$acp_phase"
+    printf 'acp child: %s, reader: %s\n' "${acp_child_alive:-unknown}" "${acp_reader_alive:-unknown}"
+    if [ -n "$acp_last_activity_at" ]; then
+      printf 'acp last activity: %s at %s (%ss ago)\n' \
+        "${acp_last_update:-no transcript activity}" "$acp_last_activity_at" "${acp_last_activity_age:-?}"
+    fi
     if [ "$acp_stalled" = "true" ]; then
-      printf 'acp stalled: yes -- no transcript progress; last activity: %s\n' "${acp_last_update:-unknown}"
+      printf 'acp stalled: yes -- no transcript progress; last activity: %s, child: %s, reader: %s\n' \
+        "${acp_last_update:-unknown}" "${acp_child_alive:-unknown}" "${acp_reader_alive:-unknown}"
+      if [ "$acp_reader_alive" = "false" ]; then
+        printf 'acp hint: the protocol reader is gone; use boss retrigger %s to continue in the same worktree\n' "$change"
+      fi
     fi
     if [ "$pending_permission" != "null" ]; then
       if [ "$(printf '%s' "$pending_permissions" | jq 'length')" -gt 1 ]; then
@@ -296,6 +320,8 @@ status_one() {
     fi
     if [ -n "$last_stop_reason" ]; then
       printf 'last stop: %s' "$last_stop_reason"
+      [ "$last_stop_reason" = "transport_lost" ] && [ -n "$acp_transport_lost_reason" ] \
+        && printf ' (%s)' "$acp_transport_lost_reason"
       [ "$acp_usage" != "null" ] && printf ' (usage %s)' "$(printf '%s' "$acp_usage" | jq -c '.')"
       printf '\n'
     fi

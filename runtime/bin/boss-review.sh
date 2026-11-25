@@ -309,7 +309,7 @@ cmd_review() {
     fi
   fi
 
-  local test_cmd test_result="not_run" test_timeout test_log=""
+  local test_cmd test_result="not_run" test_timeout test_log="" test_count=""
   test_cmd="$(config_test_command "$project")"
   [ -n "$test_cmd" ] || test_cmd="$(detect_test_command "$review_root")"
   # A command whose program is not installed did not run and must not read as
@@ -323,6 +323,7 @@ cmd_review() {
     test_log="$(test_log_file "$change" review)"
     [ -n "$test_log" ] || test_log="/dev/null"
     test_result="$(test_gate_run "$review_root" "$test_cmd" "$test_timeout" "$test_log")"
+    test_count="$(test_executed_count "$test_log")"
   fi
 
   local changed_files diff_stat
@@ -418,6 +419,7 @@ cmd_review() {
     --argjson tasks "$tasks_json" --arg validate "$validate_result" \
     --arg test_result "$test_result" --arg test_cmd "$test_cmd" \
     --argjson test_timeout "$test_timeout" --arg test_log "$test_log" \
+    --arg test_count "$test_count" \
     --argjson changed_files "$(printf '%s' "$changed_files" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     --argjson diff_stat "$(printf '%s' "$diff_stat" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     --arg base_head "$base_head" \
@@ -454,7 +456,9 @@ cmd_review() {
       lessons: {global: $lessons_global, project: $lessons_project},
       quality: {tasks: $tasks, validate: $validate,
         tests: {result: $test_result, command: (if $test_cmd == "" then null else $test_cmd end),
-          timeout_s: $test_timeout, log: (if $test_log == "" then null else $test_log end)},
+          timeout_s: $test_timeout, log: (if $test_log == "" then null else $test_log end),
+          executed: (if $test_count == "" then null else ($test_count | tonumber? // null) end),
+          zero: (if $test_count == "0" then true else false end)},
         git: {base_head: (if $base_head == "" then null else $base_head end),
           commits: $commits, diff_stat_range: $diff_stat_range,
           commit_policy: $commit_policy,
@@ -532,7 +536,11 @@ cmd_review() {
     printf 'inbox: %s pending -- boss inbox\n' "$inbox_pending"
   fi
   printf 'validate: %s\n' "$validate_result"
-  if [ -n "$test_cmd" ]; then
+  if [ -n "$test_count" ] && [ "$test_count" = "0" ]; then
+    printf 'tests: %s -- 0 tests executed; treat the gate as not run\n' "$test_result"
+  elif [ -n "$test_count" ]; then
+    printf 'tests (%s): %s (%s executed)\n' "${test_cmd:-command}" "$test_result" "$test_count"
+  elif [ -n "$test_cmd" ]; then
     printf 'tests (%s): %s\n' "$test_cmd" "$test_result"
   else
     printf 'tests: %s (no standard command recognized)\n' "$test_result"
