@@ -15,3 +15,5 @@
 - 2026-11-25T20:37:34+0100 [interrupt] interrupted acp-turn-end-reliability (ACP session/cancel: cancel_unconfirmed)
 
 - 2026-11-25T20:37:59+0100 [interrupt] interrupted acp-turn-end-reliability (ACP session/cancel: cancelled)
+
+- 2026-11-25T21:18:46+0100 [interrupt] interrupted acp-turn-end-reliability (ACP session/cancel: cancelled)
