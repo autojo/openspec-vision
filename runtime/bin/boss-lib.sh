@@ -298,8 +298,19 @@ die_json() {
   # A dispatch that wrote its state before starting the runner must not leave a
   # half-created apply behind when the start fails.
   if [ -n "${BOSS_FAILED_ACP_PID:-}" ]; then
-    kill "$BOSS_FAILED_ACP_PID" 2>/dev/null || true
+    # Wait for the failed supervisor to leave before its state file is
+    # removed or a retry reuses the same path: a supervisor still in cleanup
+    # could otherwise write into the next attempt's state.
+    local failed_pid="$BOSS_FAILED_ACP_PID" failed_wait=0
     BOSS_FAILED_ACP_PID=""
+    if acp_pid_alive "$failed_pid"; then
+      kill "$failed_pid" 2>/dev/null || true
+      while [ "$failed_wait" -lt 60 ] && acp_pid_alive "$failed_pid"; do
+        sleep 0.05
+        failed_wait=$((failed_wait + 1))
+      done
+      acp_pid_alive "$failed_pid" && kill -9 "$failed_pid" 2>/dev/null || true
+    fi
   fi
   if [ -n "${BOSS_FAILED_STATE:-}" ]; then
     local failed_socket

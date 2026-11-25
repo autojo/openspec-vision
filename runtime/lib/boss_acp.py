@@ -317,7 +317,9 @@ class StateFile:
                 log(f"acp: state file {self.path} is gone; not writing")
                 return
             mutate(data)
-            tmp = self.path + ".acp.tmp"
+            # A unique name keeps two supervisors that briefly overlap during
+            # a restart from renaming each other's temporary file away.
+            tmp = f"{self.path}.acp.{os.getpid()}.tmp"
             with open(tmp, "w", encoding="utf-8") as handle:
                 json.dump(data, handle, separators=(",", ":"))
                 handle.write("\n")
@@ -2020,7 +2022,6 @@ class Supervisor:
         await self.maybe_enforce_limit()
         if self.force_cost_limit:
             stop_reason = "cost_limit"
-        self.acp_set(last_stop_reason=stop_reason)
         self.event(
             "acp_stop",
             {
@@ -2037,6 +2038,9 @@ class Supervisor:
         self.transcript_append(stop_record, progress=not transport_stop)
         last_state = "idle" if stop_reason in ("end_turn", "unknown") else stop_reason
         self.set_phase("idle", last_state)
+        # Write the stop reason last: it is the marker every waiter polls, so
+        # the phase must already be settled when it appears.
+        self.acp_set(last_stop_reason=stop_reason)
         if self.deviation_this_turn:
             # The deviation handler already cancelled the turn and woke once.
             self.acp_set(last_stop_reason="model_mismatch")
