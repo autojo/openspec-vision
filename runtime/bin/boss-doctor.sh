@@ -169,17 +169,17 @@ doctor_check_worktrees() {
 # uses, so a passing doctor run exercises the real handshake.
 doctor_check_acp_runners() {
   local project="$1" cfg="$2" name command binary model effort mode script out rc status hint errfile
-  local runner_json isolated store policy policy_status policy_hint profile_flag session_left
+  local runner_json isolated policy policy_status policy_hint boundary session_left
   script="$(boss_acp_py)"
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     command="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.runners[$n].command // empty')"
     model="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.runners[$n].model // empty')"
     effort="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.runners[$n].effort // empty')"
-    mode="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.runners[$n].mode // "smart_approve"')"
+    mode="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.runners[$n].mode // ""')"
     runner_json="$(printf '%s' "$cfg" | jq -c --arg n "$name" '.runners[$n] + {name: $n}')"
     if [ -z "$command" ]; then
-      doctor_add "acp_runner:$name" fail "runner '$name' uses start = \"acp\" but has no command; set command = \"goose\""
+      doctor_add "acp_runner:$name" fail "runner '$name' uses start = \"acp\" but has no command; set command = \"opencode\""
       continue
     fi
     binary="${command%% *}"
@@ -191,20 +191,16 @@ doctor_check_acp_runners() {
       doctor_add "acp_runner:$name" fail "the ACP supervisor library boss_acp.py is missing; reinstall the runtime"
       continue
     fi
-    # The probe uses the same kind of profile a dispatch uses: isolated
-    # runners get a temporary boss-owned profile, non-isolated runners are
-    # probed in the user's own profile so a model a dispatch can select is
-    # not reported as missing.
-    isolated="$(printf '%s' "$runner_json" | jq -r 'if has("isolate") then (.isolate != false) else true end')"
+    # No per-apply profile exists any more: an OpenCode ACP runner uses the
+    # user's global OpenCode configuration and must not set isolate = true.
+    isolated="$(runner_is_isolated "$runner_json")"
     if [ "$isolated" = "true" ]; then
-      profile_flag="--profile-temp"
-    else
-      profile_flag=""
+      doctor_add "acp_runner:$name" fail "runner '$name' sets isolate = true; an OpenCode ACP runner uses the global OpenCode configuration, set isolate = false"
+      continue
     fi
     errfile="$(mktemp "${TMPDIR:-/tmp}/boss-acp-probe.XXXXXX")"
-    # shellcheck disable=SC2086  # profile_flag is empty or one literal word
     out="$(cd "$project" && run_with_deadline 300 python3 "$script" --probe "$command" --cwd "$project" \
-      $profile_flag --timeout 120 ${model:+--model "$model"} ${effort:+--effort "$effort"} ${mode:+--mode "$mode"} 2>"$errfile")"
+      --timeout 120 ${model:+--model "$model"} ${effort:+--effort "$effort"} ${mode:+--mode "$mode"} 2>"$errfile")"
     rc=$?
     if ! printf '%s' "$out" | jq -e '.status' >/dev/null 2>&1; then
       hint="$(tail -n 1 "$errfile" 2>/dev/null | cut -c1-400)"
@@ -224,31 +220,27 @@ doctor_check_acp_runners() {
       continue
     fi
     if [ "$session_left" = "true" ]; then
-      doctor_add "acp_probe_session:$name" warn "runner '$name' is non-isolated; the probe closed its session but could not delete it from the user's agent store"
+      doctor_add "acp_probe_session:$name" warn "runner '$name' is non-isolated; the probe closed its session but could not delete it from OpenCode's session store"
     else
       doctor_add "acp_probe_session:$name" ok "the probe sent no prompt and closed its session"
     fi
 
-    # The effective policy: an isolated profile cannot be bypassed by the
-    # user's global store; otherwise a global always_allow for shell/write/edit
-    # weakens the deny policy and is named here.
+    # The effective OpenCode permission configuration is the real boundary.
+    # OpenCode's ACP policy only sees the requests OpenCode actually sends, so
+    # a broad allow is reported as a boundary, not as ACP enforcement.
     policy="$(policy_check "$runner_json" "$project")"
     policy_status="$(printf '%s' "$policy" | jq -r '.status // "unavailable"')"
     policy_hint="$(printf '%s' "$policy" | jq -r '.hint // ""')"
-    if [ "$isolated" = "true" ]; then
-      store="per-apply profile under \$BOSS_STATE_DIR/acp"
-    else
-      store="$(acp_permission_store_path)"
-    fi
+    boundary="$(printf '%s' "$policy" | jq -r '[(.source // ""), (.boundary // "")] | map(select(length > 0)) | join(", ")')"
     case "$policy_status" in
       weakened)
-        doctor_add "acp_policy:$name" warn "isolated: $isolated; store: $store; $policy_hint"
+        doctor_add "acp_policy:$name" warn "OpenCode permissions: $boundary; $policy_hint"
         ;;
       enforced|verified)
-        doctor_add "acp_policy:$name" ok "isolated: $isolated; store: $store; $policy_hint"
+        doctor_add "acp_policy:$name" ok "OpenCode permissions: $boundary; $policy_hint"
         ;;
       *)
-        doctor_add "acp_policy:$name" warn "isolated: $isolated; store: $store; $policy_hint"
+        doctor_add "acp_policy:$name" warn "OpenCode permissions: $boundary; $policy_hint"
         ;;
     esac
   done < <(printf '%s' "$cfg" | jq -r '(.runners // {}) | to_entries[] | select((.value.start // "herdr") == "acp") | .key' 2>/dev/null || true)

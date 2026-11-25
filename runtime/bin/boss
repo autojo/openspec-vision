@@ -198,6 +198,7 @@ resolve_runner() {
     [ -n "$name" ] || die_json "no_default_runner" "no default runner configured in $BOSS_CONFIG"
   fi
   local runner configured commit start command policy mode model effort arg_flags
+  local isolate
   runner="$(printf '%s' "$cfg" | jq -c --arg n "$name" '.runners[$n]')"
   if [ "$runner" = "null" ]; then
     configured="$(printf '%s' "$cfg" | jq -r '(.runners // {}) | keys | join(", ") | if . == "" then "(none)" else . end')"
@@ -239,15 +240,24 @@ resolve_runner() {
     || die_json "invalid_runner_model" "runner '$name' has invalid effort '$effort'; use the agent's effort id (for example low, medium, high, xhigh)"
   if [ "$start" = "acp" ]; then
     [ -n "$command" ] \
-      || die_json "acp_command_missing" "runner '$name' uses start = \"acp\" but has no command; set command = \"goose\" (boss starts '<command> acp')"
+      || die_json "acp_command_missing" "runner '$name' uses start = \"acp\" but has no command; set command = \"opencode\" (boss starts '<command> acp')"
     policy="$(printf '%s' "$runner" | jq -r '.policy // "allow"')"
     case "$policy" in
       allow|ask) ;;
       *) die_json "invalid_runner_policy" "runner '$name' has invalid policy '$policy'; use 'allow' or 'ask'" ;;
     esac
+    # There is no per-apply profile builder: an ACP runner uses the global
+    # OpenCode configuration, so isolate = true has nothing to isolate with.
+    isolate="$(runner_is_isolated "$runner")"
+    if [ "$isolate" = "true" ]; then
+      die_json "acp_isolate_unsupported" "runner '$name' sets isolate = true; an OpenCode ACP runner uses the global OpenCode configuration, set isolate = false"
+    fi
     mode="$(printf '%s' "$runner" | jq -r '.mode // empty')"
     [ -z "$mode" ] || printf '%s' "$mode" | grep -qE '^[A-Za-z0-9_.-]+$' \
-      || die_json "invalid_runner_mode" "runner '$name' has invalid mode '$mode'; use the agent's mode id (for example auto, approve, smart_approve, chat)"
+      || die_json "invalid_runner_mode" "runner '$name' has invalid mode '$mode'; use the agent's mode id or an empty string"
+    if runner_is_opencode_acp "$runner" && [ -n "$mode" ]; then
+      die_json "invalid_runner_mode" "runner '$name' runs OpenCode over ACP, which has no session modes; set mode = \"\""
+    fi
   fi
   printf '%s\n' "$runner" | jq -c --arg n "$name" --arg c "$commit" --arg s "$start" \
     '. + {name: $n, commit: $c, start: $s}

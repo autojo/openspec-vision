@@ -237,9 +237,9 @@ The fields of a runner entry:
 | `command` | ACP only: the agent command; boss starts `<command> acp` |
 | `model` | native (`claude`) and ACP: the model pinned to this runner |
 | `effort` | native (`claude`) and ACP: the effort level pinned to this runner |
-| `mode` | ACP only: session mode; default `smart_approve` |
+| `mode` | ACP only: session mode; OpenCode ACP runners use `""` (no session modes) |
 | `policy` | ACP only: `allow` (default) or `ask` for an unmatched permission |
-| `isolate` | ACP only: `true` (default) runs the agent with a per-apply profile; `false` uses the user's global agent profile |
+| `isolate` | ACP only: must be `false`; an OpenCode ACP runner uses the user's global OpenCode configuration |
 | `deny` | command/path/title globs an apply never needs (default: force-push, mirror-push, `git push --delete`, `git filter-branch`, `git filter-repo`) |
 | `apply` | native: the prompt template with `{change}`; ACP: optional extra instructions (a slash-command template is ignored) |
 | `args`, `env` | native only: extra agent start arguments and environment entries; an ACP runner ignores them and is configured with `command`, `model`, `effort`, `mode`, `policy`, `deny` and `apply` instead |
@@ -260,7 +260,7 @@ The assignment rule used by the vision skill:
 | research, legal text, evaluation | `claude-sonnet` |
 | licenses, regulatory/legal, privacy, other expensive mistakes | `claude-opus` |
 | primarily code | `default` (here `opencode`) |
-| apply-only work that suits an ACP agent | `goose` (`start = "acp"`; permissions come from its `policy` and `mode`) |
+| apply-only work that suits an ACP agent | an `opencode-*` runner (`start = "acp"`; permissions come from its `policy` and the global OpenCode config) |
 
 An ACP runner is apply-only. `boss session` rejects it with
 `acp_session_unsupported`, because the session needs a Herdr-native agent to
@@ -452,7 +452,7 @@ boss model check <runner> [--project <p>] [--json]  # handshake only; sends no p
 boss model trial <runner> [--project <p>] --confirm-spend 0.10
 ```
 
-`list` and `check` are read-only. `check` probes the same profile kind a
+`list` and `check` are read-only. `check` probes the same configuration a
 dispatch uses and names the offered models, efforts and modes. A trial runs one
 fixed prompt in an empty temporary directory with its own limit, sends no
 project path or content, and writes a record under `$BOSS_STATE_DIR/models/`.
@@ -862,29 +862,49 @@ private server per apply instead, add `--standalone` to that runner's explicit
 `args`; this is an explicit isolation option, not a default, because it starts
 and manages a separate server process.
 
-## ACP runner (Goose and other ACP agents)
+## ACP runner (OpenCode)
 
-Goose is not a Herdr-native agent kind, but it exposes an ACP server
-(`goose acp`). A runner with `start = "acp"` is driven by the bundled
-`boss-acp` supervisor over stdio: session lifecycle, model and mode selection,
+OpenCode is not a Herdr-native agent kind, but it exposes an ACP server
+(`opencode acp`). A runner with `start = "acp"` is driven by the bundled
+`boss-acp` supervisor over stdio: session lifecycle, model and effort selection,
 permissions, cancellation, resume and a JSONL transcript. The apply tab still
 exists for a human view, but it only tails the transcript and hosts no agent;
 no behavior reads the pane.
 
 An ACP runner is apply-only: `boss session` rejects it with
-`acp_session_unsupported`. `command` names the agent binary that speaks ACP;
-`args` and `env` are native-only and have no effect on an ACP child, while
-`model`, `effort`, `mode`, `policy`, `deny` and `apply` are the supported knobs.
+`acp_session_unsupported`. The native `opencode` runner remains for
+`boss session`. `command` names the agent binary that speaks ACP; `args` and
+`env` are native-only and have no effect on an ACP child, while `model`,
+`effort`, `mode`, `policy`, `deny` and `apply` are the supported knobs.
+
+An OpenCode ACP runner uses the user's global `~/.config/opencode` and
+`~/.local/share/opencode`, so `isolate = false` is required and `mode = ""`
+because OpenCode advertises no session modes. Each named runner pins one
+model/effort pair; the configured default is one of them:
 
 ```toml
-[runners.goose]
+default = "opencode-deepseek"
+
+[runners.opencode-deepseek]
 start = "acp"
-command = "goose"
-model = "claude-sonnet"        # optional; must be offered by the agent
-effort = "high"                # optional; ACP category thought_level
-mode = "smart_approve"         # default; auto, approve, smart_approve, chat
-policy = "allow"               # allow (default) or ask for unmatched requests
-deny = ["git push --force*"]   # optional; defaults to the boss deny list
+command = "opencode"
+model = "deepseek/deepseek-flash"
+effort = "high"
+mode = ""
+isolate = false
+policy = "allow"
+commit = "explorer"
+
+[runners.opencode-openai]
+start = "acp"
+command = "opencode"
+model = "openai/gpt-6.2-sol"
+effort = "high"
+mode = ""
+isolate = false
+policy = "ask"
+commit = "explorer"
+deny = ["git push --force*"]
 apply = "Follow the returned tasks."  # optional extra instructions
 ```
 
@@ -898,8 +918,8 @@ and wakes the boss once. A model or effort the agent does not offer fails the
 dispatch with `model_not_offered` or `effort_not_offered` and names the offered
 values.
 
-`boss dispatch <change> --runner goose ...` starts the supervisor detached. It
-sends the apply prompt over ACP; the prompt runs
+`boss dispatch <change> --runner opencode-deepseek ...` starts the supervisor
+detached. It sends the apply prompt over ACP; the prompt runs
 `openspec instructions apply --change <change> --json` and never depends on a
 slash command. `session/update` notifications are appended to a JSONL
 transcript and shown in the apply tab. `boss status` reads the state file and
@@ -917,17 +937,17 @@ boss --version                     # names the installed commit and origin
 ```
 
 Before trusting the first ACP apply after such a change, check its state:
-`acp.isolated` must be `true` and `acp.profile_root` must name the per-apply
-profile (`boss status <change> --json`). Without them the dispatch came from an
-older runtime and keeps the old behaviour, including world-readable
-transcripts and no permission queueing. Re-run `./install.sh` and dispatch
-again instead of debugging the change.
+`transport` must be `"acp"` and `acp.model` must name the runner's model while
+`acp.mode` is `null` (`boss status <change> --json`). Without them the dispatch
+came from an older runtime and keeps the old behaviour, including
+world-readable transcripts and no permission queueing. Re-run `./install.sh`
+and dispatch again instead of debugging the change.
 
 The status JSON names what drives the session and what it waits for:
 
 | Field | Meaning |
 | --- | --- |
-| `runner` | the configured runner (`goose`); the aggregate row shows it too |
+| `runner` | the configured runner (`opencode-deepseek`); the aggregate row shows it too |
 | `acp.model`, `acp.effort`, `acp.mode` | the declared model, effort and mode applied to the session |
 | `model` | declared/confirmed model and effort, source, provider, billing, cost and tokens (see Models, effort and cost) |
 | `acp.last_update` | the last message text or tool activity (at most 200 characters). Streamed chunks are joined per message id; usage-only and whitespace-only chunks do not overwrite it |
@@ -992,48 +1012,40 @@ offers no allow-once option, the request stays pending (fail closed) and the
 supervisor logs why. An Explorer `allow_always` answer is recorded as an
 apply-scoped grant in `acp.apply_allows`, sent to the agent as `allow_once`, and
 kept for the rest of the apply; every matching request is auto-allowed. Nothing
-is written to the agent's global permission store.
+is written to a global agent permission store.
 
 `allow_always` is an agent-level grant in the agent's own model: it applies to
 every later session of that agent, not only to this apply. The runner therefore
 never creates one and maps an Explorer's `allow_always` answer to the
-apply-scoped `acp.apply_allows` above. A user who writes such an entry into
-Goose's own `permission.yaml` gives it to every session; an isolated runner is
-unaffected because its store is boss-owned and empty, while a non-isolated
-runner is reported as `weakened` by `boss doctor`, which names the entry. The
-grant only skips the prompt; only an OS sandbox or a separate user confines what
-the shell can do.
+apply-scoped `acp.apply_allows` above. OpenCode's own `opencode.jsonc`
+permission setting is the outer boundary: a broad
+`"permission": "allow"` applies to every session and lets tools run without a
+request, so the ACP `policy` and `deny` gate only the requests OpenCode actually
+sends. The grant only skips the prompt; only an OS sandbox or a separate user
+confines what the shell can do.
 
 `boss interrupt` sends `session/cancel` and never keystrokes; it records the
 `cancelled` stop reason and cancels every queued request first. If the agent does
 not confirm within `BOSS_ACP_CANCEL_TIMEOUT_S`, the state records
 `cancel_unconfirmed` and the boss is woken. `boss finish` closes the session
-(`session/close`), stops the supervisor and removes the per-apply profile.
+(`session/close`) and stops the supervisor.
 
-### Isolated agent state
+### OpenCode configuration
 
-By default the ACP child runs with a per-apply profile below
-`$BOSS_STATE_DIR/acp/profile-<hash>/`:
+An OpenCode ACP runner uses the user's global `~/.config/opencode` and
+`~/.local/share/opencode`: the same provider configuration, credentials,
+plugins, sessions and permission setting the interactive `opencode` uses.
+`isolate = true` is rejected at dispatch with `acp_isolate_unsupported`, and
+`boss` creates no per-apply profile and no permission store. A supervisor
+restart and a resume reuse the same global configuration.
 
-```text
-config/goose/   config.yaml, secrets.yaml and provider state linked from the
-                user's profile; permission.yaml generated and boss-owned
-data/goose/     private sessions/, apps and model catalog linked read-through
-```
-
-`XDG_CONFIG_HOME` and `XDG_DATA_HOME` point at that root. The generated
-`permission.yaml` has empty `always_allow`/`never_allow` lists in both the
-`user` and `smart_approve` sections and lists `shell`, `write`, `edit`,
-`read_image` and the extension manager under both `ask_before` lists, so Goose
-asks and the supervisor sees every request. A supervisor restart reuses the
-same profile; `boss finish` removes it together with the apply state.
-`isolate = false` is the escape hatch and uses the user's global profile.
-
-The profile isolates Goose's configuration, permission store and sessions. It
-is **not a filesystem sandbox**: the shell, write and edit tools still run with
-the user's OS permissions and reach every path that user can reach. Only an OS
-sandbox (a container, a sandboxed unit) or a separate user confines them; the
-worktree only keeps parallel applies out of each other's index.
+The global OpenCode configuration is **not a filesystem sandbox**: the shell,
+write and edit tools still run with the user's OS permissions and reach every
+path that user can reach. Only an OS sandbox (a container, a sandboxed unit) or
+a separate user confines them; the worktree only keeps parallel applies out of
+each other's index. Because OpenCode may approve a tool itself, the global
+`opencode.jsonc` permission setting is the real boundary; `boss doctor` reports
+it as such.
 
 ### Transcript and log privacy
 
@@ -1044,33 +1056,33 @@ only. The supervisor chmods the file on every append, so a transcript created
 world-readable by an older runtime is corrected the next time it is written.
 
 A transcript is retained until the operator removes it. `boss finish` deletes
-the state file, the profile and the socket, but keeps the transcript: it is the
-evidence for the finished apply and for a later audit. Rotation keeps one
-previous file (`<transcript>.1`) with the same mode. A cleanup (a cron job or a
-manual `rm`) is an operator decision; no retention policy is implemented.
+the state file and the socket, but keeps the transcript: it is the evidence for
+the finished apply and for a later audit. Rotation keeps one previous file
+(`<transcript>.1`) with the same mode. A cleanup (a cron job or a manual `rm`)
+is an operator decision; no retention policy is implemented.
 
 ### Doctor and the effective policy
 
 `boss doctor` validates every configured ACP runner: the command is on `PATH`,
-the handshake succeeds (`initialize` + `session/new`), and the configured model,
-effort and mode are offered (a mismatch names the available values). It also
-reports the isolation state, the effective permission store, unpinned runners
-and the mission changes that use them, a missing catalog entry or limit, the
-trial state and the helper models the agent configures. An ACP runner is skipped
-by the Herdr integration and `kind` checks.
+`isolate` is `false`, the handshake succeeds (`initialize` + `session/new`), and
+the configured model, effort and mode are offered (a mismatch names the
+available values). It also reports the effective OpenCode permission
+configuration, unpinned runners and the mission changes that use them, a
+missing catalog entry or limit, the trial state and the helper models the agent
+configures. An ACP runner is skipped by the Herdr integration and `kind` checks.
 
-The probe uses the same profile kind as a dispatch: an isolated runner gets a
-temporary boss-owned profile, and a non-isolated runner is probed in the user's
-own profile, so a model a dispatch can select is not reported as missing. The
-probe sends no prompt. It closes its session; with `isolate = false` it also
-deletes the session where the agent supports deletion and otherwise reports the
-one that remains.
+The probe starts the command with the user's global OpenCode configuration, so
+a model the dispatch can select is not reported as missing. It sends no prompt.
+It closes its session and deletes it where OpenCode supports deletion; otherwise
+it reports the empty session that remains.
 
-A runner is reported as `enforced` when its profile is isolated, or when a
-non-isolated runner's global permission store has no `always_allow` entry for
-`shell`, `write` or `edit`. If such an entry exists, the doctor reports
-`weakened`, names the entry and points at the per-apply profile; it reads the
-store read-only and never edits it.
+The policy check reads the effective OpenCode rules with
+`opencode debug config` (falling back to `opencode api get /api/config`) and
+verifies that a `deny` pattern is covered. It never reads or writes a separate
+agent permission store. A broad `"permission": "allow"` in `opencode.jsonc` is
+reported as `broad allow`, the actual boundary, not as ACP policy enforcement;
+an explicit deny rule covering every pattern is reported as `verified`. A
+missing rule is reported as `missing` and names the pattern to add.
 
 The supervisor persists the session id, model, effort, mode and last stop
 reason. After a crash, `boss resume` calls `session/load` when the agent

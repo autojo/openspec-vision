@@ -646,7 +646,6 @@ finish_worktree() {
   git -C "$project" branch -D "$branch" >/dev/null 2>&1 || true
   rm -rf "$worktree" 2>/dev/null || true
   rmdir "$(dirname "$worktree")" 2>/dev/null || true
-  acp_remove_profile "$state_file"
   rm -f "$state_file"
   inbox_remove "$project" "$change"
 
@@ -806,7 +805,6 @@ cmd_finish() {
     || log "warning: could not record cycle event"
 
   rm -f "$state_file"
-  acp_remove_profile "$state_file"
   # The apply is gone: drop its pending wake items with it.
   inbox_remove "$project" "$change"
 
