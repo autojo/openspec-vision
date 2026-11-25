@@ -50,10 +50,11 @@ status_one() {
   local state_file project agent runner pane_id tab_id workspace_id last_state last_state_at waiter_pid waiter_alive_flag
   local opencode_version permission_mode waiter_state
   local transport acp_json acp_phase acp_stalled pending_permission pending_permissions last_stop_reason acp_usage acp_transcript acp_last_update
-  local worktree branch worktree_workspace merge_state merged merge_test kept review_root touches declared
+  local worktree branch worktree_workspace merge_state merged merge_test kept review_root touches declared model_json
   state_file="$(find_state_file "$change" "$project_name")" || exit 1
   project="$(jq -r '.project' "$state_file")"
   runner="$(jq -r '.runner // empty' "$state_file" 2>/dev/null || true)"
+  model_json="$(model_state_json "$state_file")"
   transport="$(jq -r '.transport // "herdr"' "$state_file" 2>/dev/null || printf herdr)"
   acp_json="$(jq -c '.acp // null' "$state_file" 2>/dev/null || printf null)"
   acp_phase="$(jq -r '.acp.phase // "unknown"' "$state_file" 2>/dev/null || printf unknown)"
@@ -226,8 +227,8 @@ status_one() {
     --argjson acp_usage "$acp_usage" --arg acp_transcript "$acp_transcript" --arg acp_last_update "$acp_last_update" \
     --arg worktree "$worktree" --arg branch "$branch" --arg worktree_workspace "$worktree_workspace" \
     --arg merge_state "$merge_state" --argjson merged "$merged" --arg merge_test "$merge_test" \
-    --argjson kept "$kept" --argjson touches "$touches" --argjson declared "$declared" \
-    '{change: $change, project: $project, agent: $agent, runner: (if $runner == "" then null else $runner end), agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, transport: $transport, acp: (if $transport == "acp" then $acp else null end), acp_phase: (if $transport == "acp" then $acp_phase else null end), acp_stalled: (if $transport == "acp" then $acp_stalled else null end), pending_permission: (if $transport == "acp" then $pending_permission else null end), pending_permissions: (if $transport == "acp" then $pending_permissions else [] end), last_stop_reason: (if $last_stop_reason == "" then null else $last_stop_reason end), acp_usage: (if $transport == "acp" then $acp_usage else null end), acp_transcript: (if $acp_transcript == "" then null else $acp_transcript end), acp_last_update: (if $acp_last_update == "" then null else $acp_last_update end), worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), merge_state: $merge_state, merged: $merged, merge_test: $merge_test, kept: $kept, touches: $touches, declared: $declared, pane: $pane, herdr_agent: $herdr_agent, waiter_pid: (if $waiter_pid == "" then null else ($waiter_pid | tonumber? // $waiter_pid) end), waiter_alive: $waiter_alive, waiter: $waiter, inbox_pending: $inbox_pending, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, state: $state, human_tasks: $human_tasks, external_tasks: $external_tasks, opencode_version: (if $opencode_version == "" then null else ($opencode_version | tonumber? // null) end), permission_mode: (if $permission_mode == "" then null else $permission_mode end), lessons: {global: $lessons_global, project: $lessons_project}, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end), boss: (if $boss == "" then null else $boss end), boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok, wake_plan: $wake_plan, wake_target: $wake_target, last_wake: $last_wake}')"
+    --argjson kept "$kept" --argjson touches "$touches" --argjson declared "$declared" --argjson model "$model_json" \
+    '{change: $change, project: $project, agent: $agent, runner: (if $runner == "" then null else $runner end), model: $model, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, transport: $transport, acp: (if $transport == "acp" then $acp else null end), acp_phase: (if $transport == "acp" then $acp_phase else null end), acp_stalled: (if $transport == "acp" then $acp_stalled else null end), pending_permission: (if $transport == "acp" then $pending_permission else null end), pending_permissions: (if $transport == "acp" then $pending_permissions else [] end), last_stop_reason: (if $last_stop_reason == "" then null else $last_stop_reason end), acp_usage: (if $transport == "acp" then $acp_usage else null end), acp_transcript: (if $acp_transcript == "" then null else $acp_transcript end), acp_last_update: (if $acp_last_update == "" then null else $acp_last_update end), worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), merge_state: $merge_state, merged: $merged, merge_test: $merge_test, kept: $kept, touches: $touches, declared: $declared, pane: $pane, herdr_agent: $herdr_agent, waiter_pid: (if $waiter_pid == "" then null else ($waiter_pid | tonumber? // $waiter_pid) end), waiter_alive: $waiter_alive, waiter: $waiter, inbox_pending: $inbox_pending, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, state: $state, human_tasks: $human_tasks, external_tasks: $external_tasks, opencode_version: (if $opencode_version == "" then null else ($opencode_version | tonumber? // null) end), permission_mode: (if $permission_mode == "" then null else $permission_mode end), lessons: {global: $lessons_global, project: $lessons_project}, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end), boss: (if $boss == "" then null else $boss end), boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok, wake_plan: $wake_plan, wake_target: $wake_target, last_wake: $last_wake}')"
 
   if [ "$json_only" -eq 1 ]; then
     printf '%s\n' "$json"
@@ -252,6 +253,29 @@ status_one() {
     printf 'permission: %s (OpenCode version unknown)\n' "$permission_mode"
   fi
   printf 'agent: %s (%s)\n' "$agent" "$agent_state"
+  printf '%s\n' "$model_json" | jq -r '
+    if .status == "unknown" then
+      "model: unknown (no model was recorded; state from an older runtime)"
+    else
+      "model: " + (.declared // "unpinned") + " (" + .status + ")"
+      + (if (.effort_declared // "") != "" then ", effort " + .effort_declared else "" end)
+      + (if (.provider // "") != "" then ", provider " + .provider else "" end)
+      + (if (.billing // "") != "" then ", billing " + .billing else "" end)
+      + "\n  confirmed: " + (.confirmed // "none")
+      + (if (.effort_confirmed // "") != "" then " (effort " + .effort_confirmed + ")" else "" end)
+      + ", source " + (.source // "none")
+      + (if (.checked_at // "") != "" then " at " + .checked_at else "" end)
+      + (if ((.warnings // []) | length) > 0 then "\n  warning: " + ((.warnings | join("; "))) else "" end)
+      + (if .warning_80 == true then "\n  warning: " + (.warning // "passed 80 percent of the limit") else "" end)
+      + (if .status == "mismatch" and (.actual // null) != null then "\n  actual: " + (.actual | tostring) else "" end)
+      + "\n  cost: " + (if (.billing // "") == "quota" then "quota"
+                       elif (.cost_usd // null) == null then "unknown"
+                       else ((.cost_usd | tostring) + " USD") end)
+      + ", tokens " + (if (.tokens // null) == null then "unknown" else (.tokens | tostring) end)
+      + (if (.limit_usd // null) != null then ", limit " + (.limit_usd | tostring) + " USD" else "" end)
+      + (if (.limit_tokens // null) != null then ", limit " + (.limit_tokens | tostring) + " tokens" else "" end)
+      + (if ((.seen // []) | length) > 1 then "\n  seen: " + (.seen | join(", ")) else "" end)
+    end'
   if [ "$transport" = "acp" ]; then
     printf 'transport: acp (%s, model %s, mode %s)\n' \
       "$(jq -r '.acp.command // "-"' "$state_file")" \
@@ -366,7 +390,7 @@ agent_runner_label() {
 status_all() {
   local json_only="$1"
   local files state_file agent agent_state waiter_pid waiter_alive_flag inbox_pending e json="[]" idx mission_state
-  local opencode_version permission_mode transport acp_phase runner pending_count pending_ids pending_text
+  local opencode_version permission_mode transport acp_phase runner pending_count pending_ids pending_text model_json
   files="$(ls "$BOSS_APPLIES_DIR"/*.json 2>/dev/null || true)"
   if [ "$json_only" -eq 0 ] && [ -z "$files" ]; then
     printf 'no applies recorded\n'
@@ -394,6 +418,7 @@ status_all() {
     waiter_alive_flag=false
     effective_waiter_alive "$state_file" && waiter_alive_flag=true
     runner="$(jq -r '.runner // empty' "$state_file" 2>/dev/null || true)"
+    model_json="$(model_state_json "$state_file")"
     pending_count="$(jq -r '(.acp.pending_permissions // (if .acp.pending_permission != null then [.acp.pending_permission] else [] end)) | length' "$state_file" 2>/dev/null || printf 0)"
     pending_ids="$(jq -c '(.acp.pending_permissions // (if .acp.pending_permission != null then [.acp.pending_permission] else [] end)) | map(.tool_call_id // "?")' "$state_file" 2>/dev/null || printf '[]')"
     pending_text="$(printf '%s' "$pending_ids" | jq -r 'join(", ")')"
@@ -404,7 +429,8 @@ status_all() {
     e="$(jq -c --arg s "$agent_state" --argjson wa "$waiter_alive_flag" --argjson ip "$inbox_pending" --arg ms "$mission_state" \
       --arg ov "$opencode_version" --arg pm "$permission_mode" --arg tr "$transport" --arg ap "$acp_phase" \
       --arg rn "$runner" --argjson pc "$pending_count" --argjson pids "$pending_ids" --arg wpid "$waiter_pid" \
-      '. + {agent_state: $s, waiter_alive: $wa, inbox_pending: $ip, waiter_pid: (if $wpid == "" then null else ($wpid | tonumber? // $wpid) end)} | {change, project, agent, runner: (if $rn == "" then null else $rn end), agent_state, waiter_pid, waiter_alive, inbox_pending, pane_id, tab_id, workspace_id, transport: $tr, acp_phase: (if $tr == "acp" then $ap else null end), acp_stalled: (if $tr == "acp" then (.acp.stalled // false) else null end), pending_count: (if $tr == "acp" then $pc else 0 end), pending_ids: (if $tr == "acp" then $pids else [] end), worktree: (.worktree // null), branch: (.branch // null), merge_state: (.merge_state // "none"), merged: (.merged // false), merge_test: (.merge_test // "not_run"), kept: (.kept // false), touches: (.touches // []), declared: (.declared // false), last_state, last_state_at, state: $ms, opencode_version: (if $ov == "" then null else ($ov | tonumber? // null) end), permission_mode: (if $pm == "" then null else $pm end)}' "$state_file")"
+      --argjson model "$model_json" \
+      '. + {agent_state: $s, waiter_alive: $wa, inbox_pending: $ip, waiter_pid: (if $wpid == "" then null else ($wpid | tonumber? // $wpid) end)} | {change, project, agent, runner: (if $rn == "" then null else $rn end), model: $model, agent_state, waiter_pid, waiter_alive, inbox_pending, pane_id, tab_id, workspace_id, transport: $tr, acp_phase: (if $tr == "acp" then $ap else null end), acp_stalled: (if $tr == "acp" then (.acp.stalled // false) else null end), pending_count: (if $tr == "acp" then $pc else 0 end), pending_ids: (if $tr == "acp" then $pids else [] end), worktree: (.worktree // null), branch: (.branch // null), merge_state: (.merge_state // "none"), merged: (.merged // false), merge_test: (.merge_test // "not_run"), kept: (.kept // false), touches: (.touches // []), declared: (.declared // false), last_state, last_state_at, state: $ms, opencode_version: (if $ov == "" then null else ($ov | tonumber? // null) end), permission_mode: (if $pm == "" then null else $pm end)}' "$state_file")"
     json="$(printf '%s' "$json" | jq -c --argjson e "$e" '. + [$e]')"
     if [ "$json_only" -eq 0 ]; then
       if [ "$mission_state" = "waiting_human" ]; then
@@ -418,6 +444,14 @@ status_all() {
         printf '   pending: %s permission request%s (%s)\n' "$pending_count" \
           "$([ "$pending_count" -ne 1 ] && printf s || true)" "$pending_text"
       fi
+      printf '   model: %s\n' "$(printf '%s' "$model_json" | jq -r '
+        if .status == "unknown" then "unknown (older state)"
+        else (.declared // "unpinned") + " (" + .status + ")"
+          + (if (.billing // "") != "" then ", " + .billing else "" end)
+          + (if (.cost_usd // null) != null then ", cost " + (.cost_usd | tostring) + " USD"
+             elif (.billing // "") == "quota" then ", quota"
+             else ", cost unknown" end)
+        end')"
       if [ "$transport" = "acp" ] && [ "$(jq -r '.acp.stalled // false' "$state_file")" = "true" ]; then
         printf '   acp stalled: no transcript progress; last activity: %s\n' \
           "$(jq -r '.acp.last_update // "unknown"' "$state_file")"

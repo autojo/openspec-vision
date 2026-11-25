@@ -26,7 +26,7 @@ BIN_DIR="$(dirname "$(resolve_path "${BASH_SOURCE[0]}")")"
 # The commands are split by area into modules next to this script. They only
 # define functions, so the order does not matter; splitting keeps one file from
 # growing past what a review can hold at once.
-for _boss_module in apply status review run doctor mission; do
+for _boss_module in apply status review run doctor mission model; do
   # shellcheck source=./boss-apply.sh
   . "$BOSS_LIB_DIR/boss-$_boss_module.sh"
 done
@@ -42,6 +42,9 @@ Usage:
   boss plan commit <change> [--project <name|path>]
   boss status [<change>] [--project <name|path>] [--json]
   boss review <change> [--project <name|path>] [--json]
+  boss model list [--project <name|path>] [--json]
+  boss model check <runner> [--project <name|path>] [--json]
+  boss model trial <runner> [--project <name|path>] [--confirm-spend <amount>] [--json]
   boss wait <change> [--project <name|path>]
   boss wait --all [--project <name|path> | --all-projects]
   boss inbox [--project <name|path>] [--json] [--ack <id>]
@@ -189,11 +192,12 @@ ensure_config() {
 resolve_runner() {
   local name="${1:-}" cfg
   cfg="$(config_json)" || exit 1
+  model_config_validate "$cfg"
   if [ -z "$name" ]; then
     name="$(printf '%s' "$cfg" | jq -r '.default // empty')"
     [ -n "$name" ] || die_json "no_default_runner" "no default runner configured in $BOSS_CONFIG"
   fi
-  local runner configured commit start command policy mode model
+  local runner configured commit start command policy mode model effort arg_flags
   runner="$(printf '%s' "$cfg" | jq -c --arg n "$name" '.runners[$n]')"
   if [ "$runner" = "null" ]; then
     configured="$(printf '%s' "$cfg" | jq -r '(.runners // {}) | keys | join(", ") | if . == "" then "(none)" else . end')"
@@ -209,8 +213,31 @@ resolve_runner() {
     herdr|acp) ;;
     *) die_json "invalid_runner_start" "runner '$name' has invalid start value '$start'; use 'herdr' (default) or 'acp'" ;;
   esac
+  model="$(printf '%s' "$runner" | jq -r '.model // empty')"
+  effort="$(printf '%s' "$runner" | jq -r '.effort // empty')"
+  # A runner that declares model/effort must not also select them in args: two
+  # sources would make the effective value depend on argument order.
+  arg_flags="$(printf '%s' "$runner" | jq -r '(.args // [])[]?')"
+  if [ -n "$model" ] && printf '%s\n' "$arg_flags" | grep -qxE -- '(--model|-m)'; then
+    die_json "invalid_runner_model" "runner '$name' declares model = \"$model\" and also passes a model flag in args"
+  fi
+  if [ -n "$effort" ] && printf '%s\n' "$arg_flags" | grep -qxE -- '--effort'; then
+    die_json "invalid_runner_model" "runner '$name' declares effort = \"$effort\" and also passes --effort in args"
+  fi
+  # An agent-side fallback would replace the declared model without a warning.
+  if printf '%s\n' "$arg_flags" | grep -qE -- '--fallback-model(=|$)'; then
+    die_json "model_fallback_configured" "runner '$name' enables an agent-side fallback model; remove --fallback-model so a missing model fails instead"
+  fi
+  local command
+  command="$(printf '%s' "$runner" | jq -r '.command // empty')"
+  if printf '%s' "$command" | grep -qE -- '--fallback-model(=|$)'; then
+    die_json "model_fallback_configured" "runner '$name' enables an agent-side fallback model in command; remove --fallback-model so a missing model fails instead"
+  fi
+  [ -z "$model" ] || printf '%s' "$model" | grep -q '[^[:space:]]' \
+    || die_json "invalid_runner_model" "runner '$name' has an empty model"
+  [ -z "$effort" ] || printf '%s' "$effort" | grep -qE '^[A-Za-z0-9_.-]+$' \
+    || die_json "invalid_runner_model" "runner '$name' has invalid effort '$effort'; use the agent's effort id (for example low, medium, high, xhigh)"
   if [ "$start" = "acp" ]; then
-    command="$(printf '%s' "$runner" | jq -r '.command // empty')"
     [ -n "$command" ] \
       || die_json "acp_command_missing" "runner '$name' uses start = \"acp\" but has no command; set command = \"goose\" (boss starts '<command> acp')"
     policy="$(printf '%s' "$runner" | jq -r '.policy // "allow"')"
@@ -221,9 +248,6 @@ resolve_runner() {
     mode="$(printf '%s' "$runner" | jq -r '.mode // empty')"
     [ -z "$mode" ] || printf '%s' "$mode" | grep -qE '^[A-Za-z0-9_.-]+$' \
       || die_json "invalid_runner_mode" "runner '$name' has invalid mode '$mode'; use the agent's mode id (for example auto, approve, smart_approve, chat)"
-    model="$(printf '%s' "$runner" | jq -r '.model // empty')"
-    [ -z "$model" ] || printf '%s' "$model" | grep -q '[^[:space:]]' \
-      || die_json "invalid_runner_model" "runner '$name' has an empty model"
   fi
   printf '%s\n' "$runner" | jq -c --arg n "$name" --arg c "$commit" --arg s "$start" \
     '. + {name: $n, commit: $c, start: $s}
@@ -385,6 +409,7 @@ main() {
     plan) shift; cmd_plan "$@" ;;
     status) shift; cmd_status "$@" ;;
     review) shift; cmd_review "$@" ;;
+    model) shift; cmd_model "$@" ;;
     wait) shift; cmd_wait "$@" ;;
     inbox) shift; cmd_inbox "$@" ;;
     journal) shift; cmd_journal "$@" ;;

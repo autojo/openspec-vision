@@ -255,12 +255,15 @@ mission_progress_state() {
 # cell; 'open' otherwise (also for a missing or legacy doc).
 mission_charter_state() {
   local file="$1" line section="" open_q=0 undecided=0 cell
+  local metered_rows=0 metered_no_limit=0 auth_spending=0 metered_no_auth=0
+  local runner billing limit_cell category
   if [ -f "$file" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
-      if [[ "$line" =~ ^[[:space:]]*##[[:space:]]+(Open[[:space:]]+Questions|Authorization)[[:space:]]*$ ]]; then
+      if [[ "$line" =~ ^[[:space:]]*##[[:space:]]+(Open[[:space:]]+Questions|Authorization|Runner[[:space:]]+Policy)[[:space:]]*$ ]]; then
         case "${BASH_REMATCH[1]}" in
           "Open Questions") section="questions" ;;
           "Authorization") section="auth" ;;
+          "Runner Policy") section="runner_policy" ;;
         esac
         continue
       fi
@@ -274,20 +277,54 @@ mission_charter_state() {
           ;;
         auth)
           if [[ "$line" =~ ^[[:space:]]*\| ]]; then
+            category="$(printf '%s' "$line" | awk -F'|' '{v=$2; gsub(/^[ \t]+/,"",v); gsub(/[ \t]+$/,"",v); print v}')"
             cell="$(printf '%s' "$line" | awk -F'|' '{v=$3; gsub(/^[ \t]+/,"",v); gsub(/[ \t]+$/,"",v); print v}')"
+            if printf '%s' "$category" | grep -qiE 'spending|api|cost'; then
+              if [ "$cell" != "Decision" ] && ! printf '%s' "$cell" | grep -qE '^-+$'; then
+                auth_spending=1
+                [ -n "$cell" ] || undecided=$(( undecided + 1 ))
+              fi
+            fi
             if [ "$cell" != "Decision" ] && ! printf '%s' "$cell" | grep -qE '^-+$'; then
               [ -n "$cell" ] || undecided=$(( undecided + 1 ))
+            fi
+          fi
+          ;;
+        runner_policy)
+          if [[ "$line" =~ ^[[:space:]]*\| ]]; then
+            runner="$(printf '%s' "$line" | awk -F'|' '{v=$2; gsub(/^[ \t]+/,"",v); gsub(/[ \t]+$/,"",v); print v}')"
+            if [ "$runner" = "Runner" ]; then
+              continue
+            fi
+            printf '%s' "$runner" | grep -qE '^-+$' && continue
+            [ -n "$runner" ] || continue
+            billing="$(printf '%s' "$line" | awk -F'|' '{v=$6; gsub(/^[ \t]+/,"",v); gsub(/[ \t]+$/,"",v); print v}')"
+            limit_cell="$(printf '%s' "$line" | awk -F'|' '{v=$7; gsub(/^[ \t]+/,"",v); gsub(/[ \t]+$/,"",v); print v}')"
+            if [ "$billing" = "metered" ]; then
+              metered_rows=$(( metered_rows + 1 ))
+              [ -n "$limit_cell" ] || metered_no_limit=$(( metered_no_limit + 1 ))
             fi
           fi
           ;;
       esac
     done <"$file"
   fi
+  # A metered runner is only authorized with an amount in the Spending/API-cost
+  # row. A charter without a Runner Policy table keeps the old behavior.
+  if [ "$metered_rows" -gt 0 ] && [ "$auth_spending" -eq 0 ]; then
+    metered_no_auth=$metered_rows
+  fi
   local gate="open"
   [ "$open_q" -gt 0 ] && gate="charter_open"
   [ "$undecided" -gt 0 ] && gate="charter_open"
+  [ "$metered_no_limit" -gt 0 ] && gate="charter_open"
+  [ "$metered_no_auth" -gt 0 ] && gate="charter_open"
   jq -nc --arg gate "$gate" --argjson oq "$open_q" --argjson u "$undecided" \
-    '{gate: $gate, open_questions: $oq, undecided_authorization: $u}'
+    --argjson metered "$metered_rows" --argjson no_limit "$metered_no_limit" \
+    --argjson no_auth "$metered_no_auth" \
+    '{gate: $gate, open_questions: $oq, undecided_authorization: $u,
+      runner_policy_metered: $metered, metered_without_limit: $no_limit,
+      metered_without_authorization: $no_auth}'
 }
 
 # mission_add_change <file> <change> -- append '- <change>' under '## Changes'
@@ -370,6 +407,9 @@ Describe the goal of this mission: what should exist when it is done.
 ## Commit Policy
 
 ## Runner Policy
+
+| Runner | Model | Effort | Provider | Billing | Per-apply limit | Data classes |
+| --- | --- | --- | --- | --- | --- | --- |
 
 ## Start
 

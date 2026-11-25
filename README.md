@@ -235,13 +235,14 @@ The fields of a runner entry:
 | `kind` | Herdr agent kind for the default `start = "herdr"` |
 | `start` | transport: `herdr` (default) or `acp` |
 | `command` | ACP only: the agent command; boss starts `<command> acp` |
-| `model` | ACP only: session model, applied before the first prompt |
+| `model` | native (`claude`) and ACP: the model pinned to this runner |
+| `effort` | native (`claude`) and ACP: the effort level pinned to this runner |
 | `mode` | ACP only: session mode; default `smart_approve` |
 | `policy` | ACP only: `allow` (default) or `ask` for an unmatched permission |
 | `isolate` | ACP only: `true` (default) runs the agent with a per-apply profile; `false` uses the user's global agent profile |
 | `deny` | command/path/title globs an apply never needs (default: force-push, mirror-push, `git push --delete`, `git filter-branch`, `git filter-repo`) |
 | `apply` | native: the prompt template with `{change}`; ACP: optional extra instructions (a slash-command template is ignored) |
-| `args`, `env` | native only: extra agent start arguments and environment entries; an ACP runner ignores them and is configured with `command`, `model`, `mode`, `policy`, `deny` and `apply` instead |
+| `args`, `env` | native only: extra agent start arguments and environment entries; an ACP runner ignores them and is configured with `command`, `model`, `effort`, `mode`, `policy`, `deny` and `apply` instead |
 | `commit` | `explorer` (default) or `agent` |
 | `interrupt_keys` | native: keys for `boss interrupt` |
 | `ready`, `ready_regex`, `ready_timeout_ms` | native: readiness marker and timeout |
@@ -309,6 +310,168 @@ The `boss mission start` skeleton includes `## Build Environment`,
 `## External Review`, `## Marker Policy`, `## Commit Policy`, `## Runner Policy`
 and `## Start` in addition to the original charter sections; fill them during
 P5.
+
+## Models, effort and cost
+
+A runner pins one model, so the runner name on the mission bullet is the only
+model annotation. Model and effort are explicit, confirmed by the agent and
+shown in the apply state, status, wake and review. A model that is not offered
+fails the dispatch; nothing falls back to another model or the default runner.
+
+```toml
+[model_policy]
+unpinned = "warn"          # warn (default) or strict
+confirm_timeout_s = 120    # native confirmation interval, seconds
+
+[models."deepseek/deepseek-flash"]
+provider = "deepseek"
+billing = "metered"        # free | metered | quota
+limit_usd = 1.00           # at least one limit for a metered model
+limit_tokens = 3000000
+
+[models."opus"]
+provider = "anthropic"
+billing = "quota"
+expect = ["claude-opus-*"]           # ids an alias may resolve to
+helpers = ["claude-sonnet-*"]        # allowed secondary models
+
+[runners.opencode-deepseek]
+start = "acp"
+command = "opencode"
+model = "deepseek/deepseek-flash"
+mode = ""
+
+[runners.openai-review]
+start = "acp"
+command = "opencode"
+model = "openai/gpt-6.2-astra"
+effort = "xhigh"
+mode = ""
+
+[runners.claude-opus]
+kind = "claude"
+model = "opus"
+effort = "high"
+
+[model_roles]
+code = "opencode-deepseek"
+ui_hard = "claude-opus"
+formula_check = "claude-opus"
+second_review = "openai-review"
+
+[model_providers]
+shop = ["deepseek", "anthropic", "openai"]
+```
+
+`[models]` fields:
+
+| Field | Meaning |
+| --- | --- |
+| `provider` | provider id the model is reached through (a gateway counts as one) |
+| `vendor` | optional model vendor when a gateway is used; both must be allowed |
+| `billing` | `free`, `metered` or `quota`; a metered model needs a limit |
+| `limit_usd`, `limit_tokens` | per-apply limits; at least one for `metered` |
+| `expect` | optional globs of ids an alias may resolve to; another id is a mismatch |
+| `helpers` | optional globs of allowed secondary models (a child or helper session) |
+
+`[model_policy]`: `unpinned` is `warn` (start visibly, mark `unpinned`) or
+`strict` (refuse). `confirm_timeout_s` bounds the native confirmation wait.
+`[model_roles]` maps a task role to a runner name; `[model_providers]` maps a
+project (its `[projects]` name, otherwise the directory basename) to the
+providers its content may be sent to. An unregistered project uses its basename.
+
+The provider list gates which provider an apply uses. It is **not** a content
+filter: the agent has the user's file rights, so the enforceable statement is
+"this project's applies start only with these providers". Data classes (code,
+plans, logs, personal data) are charter decisions. A gateway and the model
+vendor behind it both count as providers.
+
+### Where a model is confirmed
+
+| Transport | Pin | Confirm | When |
+| --- | --- | --- | --- |
+| ACP | session config `model`, then `effort` (category `thought_level`) | `currentValue` of the returned configuration | before every prompt, and after `session/load` |
+| native `claude` | `--model`, `--effort` at start | model field in the session transcript, synthetic entries ignored | after the first answer |
+| native `opencode` | not possible | OpenCode session API by session id (detection only) | after the first answer |
+| other native kinds | not possible | none | `unverifiable` |
+
+A `metered` model is only dispatched through a transport that confirms before
+the first prompt; a native metered runner is refused with
+`model_confirmation_late`. A `quota` model may be confirmed after the start.
+Native confirmation waits up to `confirm_timeout_s`; a model that stays
+unreadable is `unverifiable` (and a metered one is stopped). A mismatch stops
+the turn and keeps worktree, state and transcript for review; the declared value
+is never overwritten.
+
+### Error codes
+
+| Code | Meaning |
+| --- | --- |
+| `invalid_runner_model` | the runner declares a model twice, or names an invalid effort |
+| `model_fallback_configured` | the runner's args or command enable `--fallback-model` |
+| `model_unpinned` | `strict` policy and the runner pins no usable model |
+| `model_uncataloged` | `strict` policy and the model has no `[models]` entry |
+| `model_not_offered` | the agent does not offer the declared model |
+| `effort_not_offered` | the agent offers no such effort for the model |
+| `model_mismatch` | the agent accepts a value but reports another one (also after load or during the run) |
+| `model_confirmation_late` | a metered model on a transport that confirms after the start |
+| `model_limit_missing` | a metered model has neither `limit_usd` nor `limit_tokens` |
+| `model_untried` | a metered model has no valid trial record for this runner |
+| `provider_not_allowed` | the model's provider (or vendor) is not on the project's list, or `strict` with no list |
+| `invalid_model_billing`, `invalid_model_limit`, `invalid_model_policy`, `invalid_model_role`, `invalid_model_providers` | malformed configuration tables |
+
+Each error leaves no tab, worktree or state behind. Under `warn` the first four
+gates start the apply and mark the model `unpinned`, `unchecked` or with a
+warning instead. A stop reason `cost_limit` is reported like a model mismatch.
+
+### Cost and limits
+
+Status, wake and review show the cost and tokens the agent reported, together
+with the billing class and the configured limit. An unreported cost is shown as
+`unknown`, never as zero; a `quota` model shows tokens without a currency
+amount. Reported use is summed across the prompts of an apply, so a retrigger or
+resume counts against the same limit. At 80 percent of a limit status records a
+warning once; at the limit the turn is cancelled with `cost_limit` and the boss
+is woken once.
+
+Some agents report usage only at the end of a turn, so a limit can be overshot
+by one turn. A provider-side cap (prepaid balance, project budget) is the hard
+stop; the runtime limit is the second line of defence. A metered model needs a
+token limit wherever the agent does not report cost.
+
+Helper models of an apply are recorded in `model.seen`. A model the catalog
+lists under `helpers` is allowed and only listed; a metered model that is not
+declared stops the turn as a mismatch. `boss doctor` names the helper models the
+agent configuration sets for a runner.
+
+### `boss model`
+
+```bash
+boss model list  [--project <name|path>] [--json]   # runners, models, billing, limits, trial state
+boss model check <runner> [--project <p>] [--json]  # handshake only; sends no prompt
+boss model trial <runner> [--project <p>] --confirm-spend 0.10
+```
+
+`list` and `check` are read-only. `check` probes the same profile kind a
+dispatch uses and names the offered models, efforts and modes. A trial runs one
+fixed prompt in an empty temporary directory with its own limit, sends no
+project path or content, and writes a record under `$BOSS_STATE_DIR/models/`.
+It needs `--confirm-spend <amount>` or a Spending / API cost amount in a mission
+charter. Doctor, status and dispatch never start a trial themselves.
+
+Onboarding a new model, in order:
+
+1. Add a `[models]` entry (provider, billing, limit, optional `expect`/`helpers`).
+   For a gateway also add `vendor`.
+2. Add a runner that pins the model and effort, and add its name to
+   `[model_roles]` where it should be used.
+3. Add the provider (and vendor) to `[model_providers]` for every project that
+   may use it.
+4. Run `boss model check <runner>` and `boss doctor`; fix everything they name.
+5. For a metered model, run `boss model trial <runner> --confirm-spend <amount>`
+   and inspect the recorded model, effort, cost and tokens.
+6. Dispatch a change. Only after `boss doctor` names no unpinned runner in use
+   switch `unpinned` to `strict`.
 
 ## Worktree applies
 
@@ -711,18 +874,29 @@ no behavior reads the pane.
 An ACP runner is apply-only: `boss session` rejects it with
 `acp_session_unsupported`. `command` names the agent binary that speaks ACP;
 `args` and `env` are native-only and have no effect on an ACP child, while
-`model`, `mode`, `policy`, `deny` and `apply` are the supported knobs.
+`model`, `effort`, `mode`, `policy`, `deny` and `apply` are the supported knobs.
 
 ```toml
 [runners.goose]
 start = "acp"
 command = "goose"
 model = "claude-sonnet"        # optional; must be offered by the agent
+effort = "high"                # optional; ACP category thought_level
 mode = "smart_approve"         # default; auto, approve, smart_approve, chat
 policy = "allow"               # allow (default) or ask for unmatched requests
 deny = ["git push --force*"]   # optional; defaults to the boss deny list
 apply = "Follow the returned tasks."  # optional extra instructions
 ```
+
+The supervisor sets the model first and then the effort, because the offered
+levels depend on the model, and reads both back from the configuration the
+agent returns. No prompt is sent until they equal the declared values. It
+repeats the confirmation before every prompt and after `session/load`; a loaded
+session that returns no config options fails with `model_mismatch`. A later
+`config_option_update` that deviates cancels the turn, keeps the declared value
+and wakes the boss once. A model or effort the agent does not offer fails the
+dispatch with `model_not_offered` or `effort_not_offered` and names the offered
+values.
 
 `boss dispatch <change> --runner goose ...` starts the supervisor detached. It
 sends the apply prompt over ACP; the prompt runs
@@ -754,7 +928,8 @@ The status JSON names what drives the session and what it waits for:
 | Field | Meaning |
 | --- | --- |
 | `runner` | the configured runner (`goose`); the aggregate row shows it too |
-| `acp.model`, `acp.mode` | the model and mode applied to the session |
+| `acp.model`, `acp.effort`, `acp.mode` | the declared model, effort and mode applied to the session |
+| `model` | declared/confirmed model and effort, source, provider, billing, cost and tokens (see Models, effort and cost) |
 | `acp.last_update` | the last message text or tool activity (at most 200 characters). Streamed chunks are joined per message id; usage-only and whitespace-only chunks do not overwrite it |
 | `pending_permissions` | every pending request with tool-call id, command and options |
 | `pending_permission` | compatibility alias for the first entry; `null` when nothing is pending |
@@ -877,27 +1052,34 @@ manual `rm`) is an operator decision; no retention policy is implemented.
 ### Doctor and the effective policy
 
 `boss doctor` validates every configured ACP runner: the command is on `PATH`,
-the handshake succeeds (`initialize` + `session/new`), and the configured model
-and mode are offered (a mismatch names the available values). It also reports
-the isolation state and the effective permission store. An ACP runner is skipped
+the handshake succeeds (`initialize` + `session/new`), and the configured model,
+effort and mode are offered (a mismatch names the available values). It also
+reports the isolation state, the effective permission store, unpinned runners
+and the mission changes that use them, a missing catalog entry or limit, the
+trial state and the helper models the agent configures. An ACP runner is skipped
 by the Herdr integration and `kind` checks.
+
+The probe uses the same profile kind as a dispatch: an isolated runner gets a
+temporary boss-owned profile, and a non-isolated runner is probed in the user's
+own profile, so a model a dispatch can select is not reported as missing. The
+probe sends no prompt. It closes its session; with `isolate = false` it also
+deletes the session where the agent supports deletion and otherwise reports the
+one that remains.
 
 A runner is reported as `enforced` when its profile is isolated, or when a
 non-isolated runner's global permission store has no `always_allow` entry for
 `shell`, `write` or `edit`. If such an entry exists, the doctor reports
 `weakened`, names the entry and points at the per-apply profile; it reads the
-store read-only and never edits it. Doctor probes run with a temporary profile
-and delete it afterwards, so a probe leaves no session or permission entry
-behind.
+store read-only and never edits it.
 
-The supervisor persists the session id, model, mode and last stop reason.
-After a crash, `boss resume` calls `session/load` when the agent advertises it,
-replays the updates into the transcript (duplicates are skipped by message and
-tool-call id) and re-applies model and mode. Without `loadSession` the apply is
-reported as `unresumable` and `boss retrigger` starts an explicit new session
-instead of silently editing the same worktree twice. A dead supervisor frees
-its concurrency slot and wakes the boss; the declared resource locks remain
-until the apply is finished.
+The supervisor persists the session id, model, effort, mode and last stop
+reason. After a crash, `boss resume` calls `session/load` when the agent
+advertises it, replays the updates into the transcript (duplicates are skipped
+by message and tool-call id) and confirms model and effort again before any
+prompt. Without `loadSession` the apply is reported as `unresumable` and
+`boss retrigger` starts an explicit new session instead of silently editing the
+same worktree twice. A dead supervisor frees its concurrency slot and wakes the
+boss; the declared resource locks remain until the apply is finished.
 
 ## Trust model and limits
 
@@ -942,16 +1124,18 @@ pass on such a station).
 | Path | Purpose |
 | --- | --- |
 | `runtime/bin/boss` | entry point: config, runner resolution, dispatch table |
-| `runtime/bin/boss-lib.sh` | shared helpers: paths, JSON, locks, policy, herdr |
+| `runtime/bin/boss-lib.sh` | shared helpers: paths, JSON, locks, policy, herdr, model gate |
 | `runtime/bin/boss-apply.sh` | dispatch, claim, session, worktrees, readiness |
 | `runtime/bin/boss-status.sh` | `status` |
 | `runtime/bin/boss-review.sh` | `review` (tasks, validate, tests, git, friction) |
 | `runtime/bin/boss-run.sh` | wait, inbox, journal, retrigger, finish, park, resume |
 | `runtime/bin/boss-doctor.sh` | `doctor` |
+| `runtime/bin/boss-model.sh` | `model list`, `model check`, `model trial` |
 | `runtime/bin/boss-mission.sh` | missions and `reconcile` |
 | `runtime/bin/boss-waiter` | detached watcher for one apply |
 | `runtime/bin/boss-acp` | wrapper that starts the ACP supervisor |
 | `runtime/lib/boss_acp.py` | ACP session, permission, transcript and control supervisor |
+| `runtime/lib/boss_model.py` | read-only native session-record adapters (Claude transcript, OpenCode session API) |
 | `scripts/gen-commands.sh` | generates the 34 command wrappers from `commands/commands.tsv` |
 | `scripts/runtime-manifest.sh` | records/verifies the vendored runtime hashes |
 | `scripts/check-generated.sh` | fails when the OpenSpec instruction files are stale |
