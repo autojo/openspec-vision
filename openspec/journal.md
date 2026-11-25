@@ -11,3 +11,5 @@
 - 2026-11-24T22:40:43+0100 [interrupt] interrupted runner-model-selection (ACP session/cancel: cancel_unconfirmed)
 
 - 2026-11-24T23:17:00+0100 [interrupt] interrupted runner-model-selection (ACP session/cancel: cancel_unconfirmed)
+
+- 2026-11-25T20:37:34+0100 [interrupt] interrupted acp-turn-end-reliability (ACP session/cancel: cancel_unconfirmed)
