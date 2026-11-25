@@ -934,6 +934,9 @@ The status JSON names what drives the session and what it waits for:
 | `pending_permissions` | every pending request with tool-call id, command and options |
 | `pending_permission` | compatibility alias for the first entry; `null` when nothing is pending |
 | `acp.stalled` | `true` while a working turn has made no progress and the boss has been woken about it |
+| `acp.child_alive`, `acp.reader_alive` | whether the ACP child and the protocol reader are alive; the stall wake names both |
+| `acp.last_activity_at` | when the last transcript entry arrived; `boss status` prints its age |
+| `acp.transport_lost_reason` | why the protocol reader stopped; set with `last_stop_reason: transport_lost` |
 
 The aggregate `boss status` derives liveness from the same process as the
 per-apply view: for an ACP apply that is the supervisor pid, so a live
@@ -985,6 +988,32 @@ eight minutes) so a normal `./tests/run.sh` is not a stall. A tool call that
 keeps emitting `tool_call_update` is progress; a silent tool call is not, which
 is why the stall interval, not the tool-execution time, is the measure. Raise
 both values for a project with a longer run rather than disabling them.
+
+### Protocol reader and lost transport
+
+The reader accepts long ACP lines, because one whole-file edit is serialized in
+a single line. `BOSS_ACP_LINE_LIMIT` (default `67108864`, 64 MiB) bounds one
+line; a longer line is skipped, reported once with its size in the supervisor
+log, and reading continues with the next line. The supervisor and the doctor
+probe start the child with the same limit. A skipped line that was the response
+to an open prompt ends that turn as `transport_lost` instead of waiting for the
+timeout.
+
+A reader that stops never does so silently. Every exit sets `acp.reader_alive`
+to `false`, fails the open request and runs the close handler once. If the child
+is still alive the turn ends as `transport_lost` with
+`acp.transport_lost_reason`, not as `end_turn`, `cancelled` or `turn_timeout`;
+the boss is woken exactly once with the last activity, its age, and whether the
+child and reader are alive. `boss retrigger` after a lost end stops a child that
+still runs, resumes the recorded session when the agent advertises
+`session/load`, and otherwise opens a new session in the same worktree; the
+command is never refused with `turn_active` and no uncommitted file is touched.
+
+`boss finish` cancels the open prompt first, closes the child and the session,
+and ends the supervisor within `BOSS_ACP_SHUTDOWN_BUDGET_S` (default `15`
+seconds). Finishing works while a prompt is unanswered, and an apply state that
+was already removed does not make the supervisor crash. No supervisor process,
+control socket or heartbeat file is left behind.
 
 An automatic allow always selects the agent's `allow_once` option and never
 `allow_always`, so it cannot create a persistent agent-level grant. If the agent
@@ -1071,6 +1100,13 @@ non-isolated runner's global permission store has no `always_allow` entry for
 `shell`, `write` or `edit`. If such an entry exists, the doctor reports
 `weakened`, names the entry and points at the per-apply profile; it reads the
 store read-only and never edits it.
+
+For an OpenCode runner the doctor also reads the effective configuration and
+warns when it enables a known memory plugin (`opencode-supermemory`, `mem0`,
+`memory` and similar). Such a plugin can add text from earlier sessions to a
+prompt and make an apply mistake an old summary for its task. The warning names
+the plugin and the way to leave it out for the boss runner (a per-runner
+`env` entry that starts OpenCode without it); the doctor changes no file.
 
 The supervisor persists the session id, model, effort, mode and last stop
 reason. After a crash, `boss resume` calls `session/load` when the agent

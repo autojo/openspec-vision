@@ -513,14 +513,27 @@ it only keeps parallel applies out of each other's index.
 
 A turn is bounded. `BOSS_ACP_TURN_TIMEOUT_S` (default 7200 s) ends a turn that
 never answers: it records `turn_timeout`, sends `session/cancel` and wakes you.
-`BOSS_ACP_STALL_S` (default 1800 s) wakes you once with `stalled` and the last
-activity when a `working` turn makes no transcript progress; `acp.stalled` is
-set, and the flag clears on the next transcript entry. A `blocked` turn is
-never a stall. Both values are above the longest expected command; raise them
-for a longer suite instead of disabling them.
+`BOSS_ACP_STALL_S` (default 1800 s) wakes you once with `stalled`, the last
+activity and the age when a `working` turn makes no transcript progress;
+`acp.stalled` is set, and the flag clears on the next transcript entry. A
+`blocked` turn is never a stall. `stalled` alone is not a failed apply: read
+`acp.child_alive` and `acp.reader_alive` first. A live child with a live reader
+may be running a long command; a reader that is gone means `boss retrigger`.
+Both values are above the longest expected command; raise them for a longer
+suite instead of disabling them.
+
+A lost transport is not a timeout. When the protocol reader stops while the
+child still runs, the turn ends as `transport_lost`,
+`acp.transport_lost_reason` names the cause, and the wake says whether the child
+and the reader are alive. The boss is woken once. A `boss retrigger` after a
+lost end stops a child that still runs, resumes the recorded session when the
+agent offers it, and otherwise opens a new session in the same worktree; no
+uncommitted file is touched and the command is not refused with `turn_active`.
 
 `boss interrupt` uses `session/cancel`, never keys. `boss finish` closes the ACP
-session; `boss resume` calls `session/load` when the agent advertises it, and an
+session and ends the supervisor within its shutdown budget, even when the prompt
+is unanswered; no supervisor, socket or heartbeat file is left. `boss resume`
+calls `session/load` when the agent advertises it, and an
 `unresumable` result means use `boss retrigger` for an explicit new session. The
 apply prompt is the OpenSpec CLI workflow
 (`openspec instructions apply --change <change> --json`), not a slash command.
@@ -1166,6 +1179,29 @@ Follow this fixed table instead of asking (review outcome -> one action):
   project, `boss` commands via `--project <name|path>`.
 - This skill uses direct CLI only. It never invokes another skill or a
   tool-specific slash command for planning, fixing, finishing or archiving.
+
+### Evidence, coordination and reporting
+
+A review accepts only evidence that can be checked:
+
+- A green gate counts only when its output shows how many tests ran. Zero
+  executed tests, or no count at all, means the gate did not run: treat it as
+  `not_run`, not as proof.
+- Before reporting "nothing changed", show a control that the comparison can
+  detect a difference. A comparison that cannot fail proves nothing.
+- When a screen or component changes, run every test that opens it, not only
+  the tests written for the change.
+- Before a script deletes or overwrites real data with an option whose scope is
+  undocumented, use the documented scope or try it on a disposable target first.
+
+Never ask a human or another session to open, edit or write a resource that a
+running operation is reading or writing. Name what must stay untouched and when
+that ends. After an aborted transfer, treat the partial result as present until
+a read-only check shows otherwise.
+
+Separate what was measured from what was inferred. When later evidence
+contradicts an earlier statement, correct it in the next report, state its
+consequence, and update every file or task that carried the old explanation.
 
 ### Autonomy policy A
 

@@ -298,8 +298,19 @@ die_json() {
   # A dispatch that wrote its state before starting the runner must not leave a
   # half-created apply behind when the start fails.
   if [ -n "${BOSS_FAILED_ACP_PID:-}" ]; then
-    kill "$BOSS_FAILED_ACP_PID" 2>/dev/null || true
+    # Wait for the failed supervisor to leave before its state file is
+    # removed or a retry reuses the same path: a supervisor still in cleanup
+    # could otherwise write into the next attempt's state.
+    local failed_pid="$BOSS_FAILED_ACP_PID" failed_wait=0
     BOSS_FAILED_ACP_PID=""
+    if acp_pid_alive "$failed_pid"; then
+      kill "$failed_pid" 2>/dev/null || true
+      while [ "$failed_wait" -lt 60 ] && acp_pid_alive "$failed_pid"; do
+        sleep 0.05
+        failed_wait=$((failed_wait + 1))
+      done
+      acp_pid_alive "$failed_pid" && kill -9 "$failed_pid" 2>/dev/null || true
+    fi
   fi
   if [ -n "${BOSS_FAILED_STATE:-}" ]; then
     local failed_socket
@@ -704,7 +715,27 @@ opencode_effective_permissions() {
      permissions: [ (if type == "array" then .[]? else . end)
                     | select(type == "object")
                     | ((.info.permissions // .permissions) // [])[]?
-                    | select(type == "object") ]}'
+                    | select(type == "object") ],
+     plugins: [ (if type == "array" then .[]? else . end)
+                | select(type == "object")
+                | ((.info.plugins // .info.plugin // .plugins // .plugin) // [])[]?
+                | (if type == "string" then .
+                   elif type == "object" then (.name // .path // "")
+                   else "" end)
+                | select(length > 0) ] | unique}'
+}
+
+# opencode_memory_plugins <plugins-array-json> -- known plugins that can inject
+# text from earlier sessions into a prompt. Only the known list is reported;
+# unknown plugins stay silent (they may do anything, but naming them would be a
+# guess). Case does not matter.
+opencode_memory_plugins() {
+  printf '%s' "${1:-[]}" | jq -r '
+    [ .[]?
+      | tostring
+      | select(test("(?i)(supermemory|mem0|memory|memoir|claude-mem)")) ]
+    | unique[]
+  ' 2>/dev/null || true
 }
 
 # opencode_broad_denials <permissions-array-json> -- the permission categories
@@ -3139,6 +3170,31 @@ test_output_tail() {
   local log="$1" lines="${2:-40}"
   [ -f "$log" ] || return 0
   tail -n "$lines" "$log" 2>/dev/null || true
+}
+
+# test_executed_count <log-file> -- the number of executed tests parsed from the
+# usual reporters, or empty when the output carries no count. Zero is a real
+# count: a gate that ran nothing must not read as green evidence.
+test_executed_count() {
+  local log="$1" count
+  [ -f "$log" ] || return 0
+  # unittest: "Ran 12 tests in 0.4s" (also "Ran 0 tests").
+  count="$(sed -n 's/^Ran \([0-9][0-9]*\) tests\?.*/\1/p' "$log" 2>/dev/null | tail -n 1)"
+  if [ -n "$count" ]; then printf '%s' "$count"; return 0; fi
+  # TAP plan: "1..12".
+  count="$(sed -n 's/^1\.\.\([0-9][0-9]*\)[[:space:]]*$/\1/p' "$log" 2>/dev/null | tail -n 1)"
+  if [ -n "$count" ]; then printf '%s' "$count"; return 0; fi
+  # pytest, jest and similar summaries: "42 passed", "42 tests passed".
+  count="$(grep -Eo '[0-9]+ (tests? )?passed' "$log" 2>/dev/null \
+    | grep -Eo '^[0-9]+' | tail -n 1)"
+  if [ -n "$count" ]; then printf '%s' "$count"; return 0; fi
+  # Node test runner: "# tests 42" or "tests 42".
+  count="$(sed -n 's/^#\?[[:space:]]*tests[[:space:]][[:space:]]*\([0-9][0-9]*\).*/\1/p' "$log" 2>/dev/null | tail -n 1)"
+  if [ -n "$count" ]; then printf '%s' "$count"; return 0; fi
+  # Jest summary: "Tests:       42 passed".
+  count="$(sed -n 's/^Tests:[[:space:]]*\([0-9][0-9]*\) passed.*/\1/p' "$log" 2>/dev/null | tail -n 1)"
+  if [ -n "$count" ]; then printf '%s' "$count"; return 0; fi
+  return 0
 }
 
 # waiter_alive <pid> -- 0 when pid is a running boss-waiter. The script runs

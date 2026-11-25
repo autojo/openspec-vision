@@ -655,6 +655,30 @@ cmd_doctor() {
     doctor_add boss_permission warn "start the boss via 'boss session' so its tab carries the allow scope (OpenCode V1/legacy path)"
   fi
 
+  # Memory plugins: a plugin that injects text from earlier sessions can make
+  # an apply mistake an old summary for its task. The check is advisory and
+  # changes nothing; only plugins from the known list are named.
+  local plugin_probe memory_plugins memory_names
+  plugin_probe=""
+  if [ "$have_opencode" -eq 1 ]; then
+    if [ "$opencode_version" = "2" ]; then
+      plugin_probe="$probe"
+    else
+      plugin_probe="$(opencode_effective_permissions "$project")"
+    fi
+  fi
+  memory_plugins=""
+  if [ -n "$plugin_probe" ] \
+     && [ "$(printf '%s' "$plugin_probe" | jq -r '.status // "unavailable"')" = "ok" ]; then
+    memory_plugins="$(opencode_memory_plugins "$(printf '%s' "$plugin_probe" | jq -c '.plugins // []')")"
+  fi
+  if [ -z "$memory_plugins" ]; then
+    doctor_add opencode_memory_plugins ok ""
+  else
+    memory_names="$(printf '%s' "$memory_plugins" | paste -sd', ' - 2>/dev/null || printf '%s' "$memory_plugins" | tr '\n' ' ')"
+    doctor_add opencode_memory_plugins warn "OpenCode memory plugin enabled: $memory_names. It can add text from earlier sessions to an apply and make an agent mistake an old summary for its task. Exclude it for the boss runner: give [runners.<name>] an env entry that starts OpenCode without it, for example env = [\"OPENCODE_CONFIG_CONTENT={\\\"plugin\\\":[]}\"], or remove it from this project's OpenCode configuration. No file was changed."
+  fi
+
   # Policy: does the agent configuration in effect deny the destructive
   # commands an apply never needs? Reported for the default runner; never a
   # hard failure, because the charter remains the boundary.
