@@ -11,3 +11,5 @@
 - 2026-11-24T22:40:43+0100 [interrupt] interrupted runner-model-selection (ACP session/cancel: cancel_unconfirmed)
 
 - 2026-11-24T23:17:00+0100 [interrupt] interrupted runner-model-selection (ACP session/cancel: cancel_unconfirmed)
+
+- 2026-11-25T21:16:12+0100 [interrupt] interrupted opencode-acp-runners (ACP session/cancel: cancel_unconfirmed)
