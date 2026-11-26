@@ -192,7 +192,8 @@ After the human made progress, either check the tasks off in `tasks.md` or run:
 boss resume <change> --project <name|path> --note "what was reported"
 ```
 
-`resume` clears the park and starts a fresh dispatch when no apply is live.
+`resume` clears the park and starts a fresh dispatch when no apply is live; if
+the recorded apply tab was closed, the dispatch recreates it.
 
 Mission changes may declare dependencies on their `## Changes` bullets:
 
@@ -523,7 +524,8 @@ fields keeps the base-checkout behaviour.
 `boss finish` verifies the worktree, merges `boss/<change>` into the base
 (`--ff-only` when the base is still at `base_head`, otherwise a `--no-ff`
 merge), runs the configured or detected test command on the merged base, then
-closes the tab, removes the worktree, deletes the branch and the state:
+closes every tab of the worktree workspace, removes the worktree, deletes the
+branch and the state:
 
 ```bash
 boss finish <change> --project <name|path>
@@ -539,9 +541,11 @@ budget keeps the state with `merge_state=test_timeout`, reports
 (see [Test gate](#test-gate)); the base-checkout finish path runs the same gate.
 `--keep-worktree`
 merges and tests but keeps the worktree, branch and state (`kept=true`,
-`merge_state=done`) for inspection; `--no-merge` closes the tab and keeps them
-for a manual merge without recording a finish. A later `boss finish` cleans up
-either kept path.
+`merge_state=done`) for inspection; `--no-merge` closes the apply tabs and keeps
+them for a manual merge without recording a finish. A later `boss finish` cleans
+up either kept path. Closing the worktree tabs covers stale tabs from earlier
+dispatches, not only the recorded one, and never touches unrelated tabs in the
+base workspace.
 
 `boss park` keeps the worktree and branch for the human handoff. `boss resume`
 reuses the same worktree and branch and starts a fresh agent there; `boss
@@ -551,7 +555,9 @@ silently using the base checkout. `boss doctor` reports a missing worktree
 path, a `conflict`/`test_failed`/`test_timeout` state, an uncommitted change dir, orphaned
 worktrees under the state root, a dirty base and an uncommitted plan.
 `boss doctor --fix` removes only merged worktrees that belong to a kept or
-finished state; unmerged worktrees are only reported.
+finished state; unmerged worktrees are only reported. Before removing a merged
+worktree it closes every apply tab in that worktree workspace, reports each
+closed tab, and leaves unrelated tabs in the base workspace untouched.
 
 ## Test gate
 
@@ -738,7 +744,10 @@ stderr, so `boss park … | jq` and the other JSON commands stay parseable.
 Stop an apply deliberately with `boss interrupt <change>`; the runner's
 `interrupt_keys` (default opencode `esc esc`, Claude `esc`) are sent, the event
 log and journal record the interruption, and the next wake is reported as
-`interrupted` instead of `done`/`idle`. `boss retrigger` clears the marker.
+`interrupted` instead of `done`/`idle`. For an ACP apply it also closes the
+transcript tab by default; `--keep-tab` keeps it for inspection. The state and
+worktree stay readable, and a later `boss retrigger` clears the marker (and
+opens a new apply tab when the recorded one is gone).
 
 `boss wait --all` is scoped to the caller's project, or to its Herdr
 workspace when no project is available; `--all-projects` performs the explicit
@@ -975,7 +984,8 @@ offered options:
 boss status <change>                                # all pending requests
 boss answer <change> allow_once --tool-call <id>    # answer one request
 boss answer <change> allow_once <id>                # same, positional form
-boss interrupt <change>                             # cancel every pending request
+boss interrupt <change>                             # cancel every pending request; close the apply tab
+boss interrupt <change> --keep-tab                  # keep the apply tab for inspection
 ```
 
 With exactly one pending request the option alone is still enough; with more,
@@ -1056,7 +1066,11 @@ confines what the shell can do.
 `boss interrupt` sends `session/cancel` and never keystrokes; it records the
 `cancelled` stop reason and cancels every queued request first. If the agent does
 not confirm within `BOSS_ACP_CANCEL_TIMEOUT_S`, the state records
-`cancel_unconfirmed` and the boss is woken. `boss finish` closes the session
+`cancel_unconfirmed` and the boss is woken. By default interrupt closes the
+transcript tab after the cancellation and clears `tab_id`/`pane_id`;
+`--keep-tab` preserves the tab and records `tab_kept: true`. The state and
+worktree stay readable, so a later `resume`/`retrigger` reuses the live tab or
+creates a new transcript tab. `boss finish` closes the session
 (`session/close`) and stops the supervisor.
 
 ### OpenCode configuration

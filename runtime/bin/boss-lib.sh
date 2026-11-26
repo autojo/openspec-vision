@@ -524,6 +524,75 @@ herdr_worktree_remove() {
   herdr worktree remove --workspace "$workspace" --force >/dev/null 2>&1 || true
 }
 
+# herdr_workspace_for_path <path> -- workspace that hosts <path>: a workspace
+# whose worktree checkout is the path, or a pane whose cwd is the path or below
+# it. Empty when Herdr is unavailable or nothing matches. Never fails.
+herdr_workspace_for_path() {
+  local path="$1" out ws=""
+  [ -n "$path" ] || { printf '\n'; return 0; }
+  out="$(herdr workspace list 2>/dev/null || true)"
+  if [ -n "$out" ]; then
+    ws="$(printf '%s' "$out" | jq -r --arg p "$path" '
+      [(.result.workspaces // .workspaces // [])[]?
+       | select((.worktree.checkout_path // .checkout_path // "") == $p)
+       | .workspace_id] | .[0] // empty' 2>/dev/null || true)"
+  fi
+  if [ -z "$ws" ]; then
+    out="$(herdr pane list 2>/dev/null || true)"
+    if [ -n "$out" ]; then
+      ws="$(printf '%s' "$out" | jq -r --arg p "$path" --arg ps "$path/" '
+        [.result.panes[]?
+         | select((.cwd // "") == $p or ((.cwd // "") | startswith($ps)))
+         | .workspace_id] | .[0] // empty' 2>/dev/null || true)"
+    fi
+  fi
+  printf '%s\n' "$ws"
+}
+
+# herdr_close_apply_tabs <worktree> <change> <workspace> <base-workspace>
+# [<recorded-tab>] -- close every tab that belongs to an apply's worktree: all
+# tabs in the dedicated worktree workspace, tabs whose cwd is inside the
+# worktree and the recorded tab (when it is not in the base workspace). The
+# base project workspace is never touched. Prints each closed tab id, one per
+# line; never fails.
+herdr_close_apply_tabs() {
+  local worktree="$1" change="$2" ws="${3:-}" base="${4:-}" recorded="${5:-}"
+  local tabs panes ids id
+  tabs="$(herdr tab list 2>/dev/null || true)"
+  [ -n "$tabs" ] || tabs='{}'
+  panes="$(herdr pane list 2>/dev/null || true)"
+  [ -n "$panes" ] || panes='{}'
+  ids="$(jq -rn --argjson t "$tabs" --argjson p "$panes" \
+    --arg worktree "$worktree" --arg change "$change" \
+    --arg ws "$ws" --arg base "$base" --arg rec "$recorded" \
+    --arg self "${HERDR_PANE_ID:-${BOSS_CALLER_PANE:-}}" '
+    (($t.result.tabs // .tabs // []) | map(select(type == "object"))) as $tabs
+    | (($p.result.panes // .panes // []) | map(select(type == "object"))) as $panes
+    | $tabs
+    | map(. as $tab
+        | (($panes | map(select(.tab_id == $tab.tab_id)) | .[0]) // {}) as $pane
+        | {tab_id: ($tab.tab_id // ""), label: ($tab.label // ""),
+           pane_id: ($pane.pane_id // ""),
+           workspace_id: ($tab.workspace_id // $pane.workspace_id // ""),
+           cwd: ($pane.cwd // $pane.foreground_cwd // "")})
+    | map(select(.tab_id != "")
+        | select($self == "" or .pane_id != $self)
+        | select($base == "" or .workspace_id != $base)
+        | select(($rec != "" and .tab_id == $rec)
+                 or ($ws != "" and .workspace_id == $ws)
+                 or ($worktree != "" and
+                     (.cwd == $worktree or ((.cwd // "") | startswith($worktree + "/"))))
+                 or ($ws == "" and $worktree == "" and $change != ""
+                     and .label == $change)))
+    | map(.tab_id) | unique | .[]' 2>/dev/null || true)"
+  [ -n "$ids" ] || return 0
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    herdr tab close "$id" >/dev/null 2>&1 || true
+    printf '%s\n' "$id"
+  done <<<"$ids"
+}
+
 # worktree_cleanup_failed -- undo a half-created worktree dispatch. Removes the
 # tab when one was created, the worktree and the branch. Intentionally quiet and
 # idempotent; die_json calls it before printing the original error.

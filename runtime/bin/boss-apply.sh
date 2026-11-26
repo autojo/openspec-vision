@@ -431,6 +431,44 @@ ensure_workspace() {
   printf '%s' "$ws_id"
 }
 
+# ensure_acp_apply_tab <state-file> -- an ACP apply's tab is only a transcript
+# view. Reuse a live recorded tab; when it is gone (for example after 'boss
+# interrupt'), create a new tail tab in the recorded workspace and record it.
+# Never fails the caller.
+ensure_acp_apply_tab() {
+  local f="$1" tab pane ws root change transcript created tmp
+  [ -f "$f" ] || return 0
+  acp_is_acp "$f" || return 0
+  tab="$(jq -r '.tab_id // empty' "$f" 2>/dev/null || true)"
+  if [ -n "$tab" ] && [ "$tab" != "null" ] && herdr tab get "$tab" >/dev/null 2>&1; then
+    return 0
+  fi
+  ws="$(jq -r '.workspace_id // empty' "$f" 2>/dev/null || true)"
+  root="$(jq -r '.acp.apply_root // .worktree // .project // empty' "$f" 2>/dev/null || true)"
+  change="$(jq -r '.change // empty' "$f" 2>/dev/null || true)"
+  transcript="$(jq -r '.acp.transcript // empty' "$f" 2>/dev/null || true)"
+  [ -n "$ws" ] && [ -n "$root" ] || return 0
+  created="$(herdr tab create --workspace "$ws" --cwd "$root" --label "$change" --no-focus 2>/dev/null || true)"
+  pane="$(printf '%s' "$created" | jq -r '.result.root_pane.pane_id // .root_pane.pane_id // empty' 2>/dev/null || true)"
+  tab="$(printf '%s' "$created" | jq -r '.result.tab.tab_id // .result.root_pane.tab_id // .tab.tab_id // .root_pane.tab_id // empty' 2>/dev/null || true)"
+  if [ -z "$pane" ] || [ -z "$tab" ]; then
+    log "warning: could not recreate the apply tab for $change"
+    return 0
+  fi
+  if [ -n "$transcript" ]; then
+    herdr pane run "$pane" "tail -n +1 -f '$transcript'" >/dev/null 2>&1 \
+      || log "warning: could not start the transcript tail in pane $pane"
+  fi
+  tmp="$(mktemp)"
+  if jq --arg p "$pane" --arg t "$tab" '.pane_id = $p | .tab_id = $t' "$f" >"$tmp" 2>/dev/null; then
+    mv "$tmp" "$f"
+  else
+    rm -f "$tmp"
+  fi
+  log "retrigger: recreated apply tab $tab for $change"
+  return 0
+}
+
 # ---------------------------------------------------------- apply readiness ---
 
 # check_apply_ready <project> <change> -- all applyRequires artifacts done?
@@ -1049,6 +1087,27 @@ dispatch_change() {
   fi
 
   assert_workspace_free "$workspace_id" "$change"
+
+  # A live apply was returned above; anything else is a stale tab from an
+  # earlier dispatch. Close stale tabs for the change/worktree before creating
+  # the new one, so at most one apply tab remains. The base workspace is only
+  # touched through its recorded tab.
+  local stale_tab="" stale_closed="" base_ws=""
+  if [ -f "$state_file" ]; then
+    stale_tab="$(jq -r '.tab_id // empty' "$state_file" 2>/dev/null || true)"
+    base_ws="$(jq -r '.boss_workspace // empty' "$state_file" 2>/dev/null || true)"
+  fi
+  [ -n "$base_ws" ] || base_ws="$(herdr_workspace_for_path "$project")"
+  [ -n "$base_ws" ] || base_ws="$dispatcher_workspace"
+  if [ "$want_worktree" = "1" ] && [ -n "$worktree" ]; then
+    stale_closed="$(herdr_close_apply_tabs "$worktree" "$change" "$worktree_workspace" "$base_ws" "$stale_tab")"
+  elif [ -n "$stale_tab" ] && [ "$stale_tab" != "null" ]; then
+    herdr tab close "$stale_tab" >/dev/null 2>&1 || true
+    stale_closed="$stale_tab"
+  fi
+  if [ -n "$stale_closed" ]; then
+    log "dispatch: closed stale apply tab(s) $(printf '%s' "$stale_closed" | paste -sd ', ' -) for $change"
+  fi
 
   local -a env_args=()
   while IFS= read -r e; do [ -n "$e" ] && env_args+=(--env "$e"); done < <(runner_env_of "$runner")

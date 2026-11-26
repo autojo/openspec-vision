@@ -357,6 +357,7 @@ cmd_retrigger() {
         resp_error="$(printf '%s' "$resp" | jq -r '.error // "control_failed"' 2>/dev/null || printf control_failed)"
         die_json "acp_control_failed" "cannot send a new prompt to the ACP supervisor: $resp_error"
       fi
+      ensure_acp_apply_tab "$state_file"
       append_event "$(events_file_for "$project" "$change")" retrigger \
         "$(jq -nc --arg c "$change" --arg p "$project" '{change: $c, project: $p}')" \
         || log "warning: could not record retrigger event"
@@ -444,6 +445,24 @@ finish_record_test() {
   fi
 }
 
+# finish_close_apply_tabs <project> <state-file> <worktree> <change>
+# <worktree-workspace> <recorded-tab> -- close every tab of the apply's
+# worktree before finish keeps or removes it. The recorded tab is closed last
+# as the fallback for a workspace that cannot be resolved.
+finish_close_apply_tabs() {
+  local project="$1" state_file="$2" worktree="$3" change="$4" ws="$5" tab="$6"
+  local base_ws closed
+  base_ws="$(herdr_workspace_for_path "$project")"
+  [ -n "$base_ws" ] || base_ws="$(jq -r '.boss_workspace // empty' "$state_file" 2>/dev/null || true)"
+  closed="$(herdr_close_apply_tabs "$worktree" "$change" "$ws" "$base_ws" "$tab")"
+  if [ -n "$tab" ] && [ "$tab" != "null" ] \
+     && ! printf '%s\n' "$closed" | grep -Fxq "$tab"; then
+    herdr tab close "$tab" >/dev/null 2>&1 || true
+  fi
+  [ -n "$closed" ] || return 0
+  log "finish: closed apply tab(s) $(printf '%s' "$closed" | paste -sd ', ' -) for $change"
+}
+
 # tasks_file_for <project> <change> -- active or archived tasks.md, or empty
 finish_worktree() {
   local change="$1" project="$2" state_file="$3" worktree="$4" branch="$5"
@@ -485,7 +504,7 @@ finish_worktree() {
 
   # --no-merge is the manual path: close the agent, keep worktree and state.
   if [ "$no_merge" = "1" ]; then
-    [ -n "$tab_id" ] && [ "$tab_id" != "null" ] && herdr tab close "$tab_id" >/dev/null 2>&1 || true
+    finish_close_apply_tabs "$project" "$state_file" "$worktree" "$change" "$worktree_workspace" "$tab_id"
     kill_waiter "$waiter_pid" >/dev/null 2>&1 || true
     local nm_now tmp
     nm_now="$(now_iso)"
@@ -609,7 +628,7 @@ finish_worktree() {
       '{change: $c, project: $p, started_at: $started_at, finished_at: $finished_at, duration_s: $duration_s, retriggers: $retriggers, blocked_count: $blocked_count, waiter_lost: $waiter_lost, tasks_open: $tasks_open, archived: $archived}')" \
     || log "warning: could not record cycle event"
 
-  [ -n "$tab_id" ] && [ "$tab_id" != "null" ] && herdr tab close "$tab_id" >/dev/null 2>&1 || true
+  finish_close_apply_tabs "$project" "$state_file" "$worktree" "$change" "$worktree_workspace" "$tab_id"
   kill_waiter "$waiter_pid" >/dev/null 2>&1 || true
 
   local lesson_json
@@ -907,19 +926,27 @@ cmd_park() {
     fi
     tab_id="$(jq -r '.tab_id // empty' "$state_file")"
     waiter_pid="$(jq -r '.waiter_pid // empty' "$state_file")"
+    local park_tab_closed=0
     if [ -n "$tab_id" ] && [ "$tab_id" != "null" ]; then
-      herdr tab close "$tab_id" >/dev/null 2>&1 \
-        && log "park: closed tab $tab_id for $change" \
-        || log "park: tab $tab_id already gone for $change"
+      if herdr tab close "$tab_id" >/dev/null 2>&1; then
+        park_tab_closed=1
+        log "park: closed tab $tab_id for $change"
+      elif ! herdr tab get "$tab_id" >/dev/null 2>&1; then
+        park_tab_closed=1
+        log "park: tab $tab_id already gone for $change"
+      else
+        log "park: could not close tab $tab_id for $change"
+      fi
     fi
     kill_waiter "$waiter_pid" >/dev/null 2>&1 || true
     local tmp park_lock acquired=0
     park_lock="$(state_lock "$state_file")"
     if lock_acquire "$park_lock"; then acquired=1; else log "warning: park: state lock busy; updating without it"; fi
     tmp="$(mktemp)"
-    if jq --arg t "$now" --arg n "$note" \
+    if jq --arg t "$now" --arg n "$note" --argjson closed "$park_tab_closed" \
         '.parked = true | .parked_at = $t | .parked_note = (if $n == "" then null else $n end) | .waiter_pid = null
-         | (if .transport == "acp" then .acp.supervisor_pid = null | .acp.phase = "closed" else . end)' \
+         | (if .transport == "acp" then .acp.supervisor_pid = null | .acp.phase = "closed" else . end)
+         | (if $closed == 1 then (.tab_id = null | .pane_id = null) else . end)' \
         "$state_file" >"$tmp" 2>/dev/null; then
       mv "$tmp" "$state_file"
     else
@@ -1018,6 +1045,7 @@ cmd_resume() {
     if acp_pid_alive "$acp_pid"; then
       acp_update_state "$state_file" \
         'del(.parked, .parked_at, .parked_note) | .acp.dead_reported = false'
+      ensure_acp_apply_tab "$state_file"
       printf '%s\n' "$(jq -n --arg change "$change" --arg project "$project" \
         '{change: $change, project: $project, transport: "acp", status: "resumed", started: false}')"
       return 0
@@ -1050,6 +1078,7 @@ cmd_resume() {
     # the session id and worktree the Explorer needs to inspect or retrigger.
     start_acp_supervisor "$state_file" >/dev/null
     acp_wait_ready "$state_file"
+    ensure_acp_apply_tab "$state_file"
     # shellcheck disable=SC2034  # read by die_json in boss-lib.sh
     BOSS_FAILED_ACP_PID=""
     printf '%s\n' "$(jq -n --arg change "$change" --arg project "$project" \
@@ -1086,27 +1115,29 @@ cmd_resume() {
 # runner's interrupt keys, mark the state/event log and journal the action. The
 # waiter reports the next settle as 'interrupted'.
 cmd_interrupt() {
-  local change="" project_name="" as_target="" arg
+  local change="" project_name="" as_target="" keep_tab=0 arg
   while [ $# -gt 0 ]; do
     arg="$1"; shift
     case "$arg" in
       --project) project_name="${1:-}"; shift ;;
       --as) as_target="${1:-}"; shift ;;
+      --keep-tab) keep_tab=1 ;;
       -h|--help) usage ;;
       --*) usage_error "unknown option: $arg" ;;
       *) if [ -z "$change" ]; then change="$arg"; else usage_error "unexpected argument: $arg"; fi ;;
     esac
   done
-  [ -n "$change" ] || usage_error "usage: boss interrupt <change> [--project <name|path>] [--as <pane|agent>]"
+  [ -n "$change" ] || usage_error "usage: boss interrupt <change> [--project <name|path>] [--keep-tab] [--as <pane|agent>]"
   boss_use_caller "$as_target"
   ensure_boss_claim interrupt
   ensure_config
 
-  local state_file project pane_id runner_name runner_json kind
+  local state_file project pane_id tab_id runner_name runner_json kind
   local -a keys=()
   state_file="$(find_state_file "$change" "$project_name")" || exit 1
   project="$(jq -r '.project' "$state_file")"
   pane_id="$(jq -r '.pane_id // empty' "$state_file")"
+  tab_id="$(jq -r '.tab_id // empty' "$state_file")"
   runner_name="$(jq -r '.runner // empty' "$state_file")"
   kind="$(jq -r '.kind // empty' "$state_file")"
 
@@ -1125,12 +1156,34 @@ cmd_interrupt() {
     fi
     acp_status="$(printf '%s' "$acp_resp" | jq -r '.status // "cancel_requested"' 2>/dev/null || printf cancel_requested)"
     acp_phase="$(jq -r '.acp.phase // "unknown"' "$state_file" 2>/dev/null || printf unknown)"
-    acp_update_state "$state_file" '.interrupted = true
-      | .interrupted_at = (now | strftime("%Y-%m-%dT%H:%M:%S%z"))
-      | .interrupt_keys = [] | .acp.last_stop_reason = $s' --arg s "$acp_status"
+    local tab_closed=0
+    if [ "$keep_tab" -eq 1 ]; then
+      acp_update_state "$state_file" '.interrupted = true
+        | .interrupted_at = (now | strftime("%Y-%m-%dT%H:%M:%S%z"))
+        | .interrupt_keys = [] | .acp.last_stop_reason = $s
+        | .tab_kept = true' --arg s "$acp_status"
+    else
+      if [ -n "$tab_id" ] && [ "$tab_id" != "null" ]; then
+        if herdr tab close "$tab_id" >/dev/null 2>&1; then
+          tab_closed=1
+          log "interrupt: closed tab $tab_id for $change"
+        elif ! herdr tab get "$tab_id" >/dev/null 2>&1; then
+          tab_closed=1
+          log "interrupt: tab $tab_id already gone for $change"
+        else
+          log "warning: interrupt: could not close tab $tab_id for $change; boss doctor --fix retries"
+        fi
+      fi
+      acp_update_state "$state_file" '.interrupted = true
+        | .interrupted_at = (now | strftime("%Y-%m-%dT%H:%M:%S%z"))
+        | .interrupt_keys = [] | .acp.last_stop_reason = $s
+        | .tab_kept = false
+        | (if $closed == 1 then (.tab_id = null | .pane_id = null) else . end)' \
+        --arg s "$acp_status" --argjson closed "$tab_closed"
+    fi
     append_event "$(events_file_for "$project" "$change")" interrupt \
-      "$(jq -nc --arg c "$change" --arg p "$project" --arg s "$acp_status" \
-        '{change: $c, project: $p, transport: "acp", status: $s}')" \
+      "$(jq -nc --arg c "$change" --arg p "$project" --arg s "$acp_status" --argjson tc "$tab_closed" \
+        '{change: $c, project: $p, transport: "acp", status: $s, tab_closed: ($tc == 1)}')" \
       || log "warning: could not record interrupt event"
     local ajfile
     ajfile="$(journal_project_path "$project" 2>/dev/null || true)"
@@ -1138,8 +1191,10 @@ cmd_interrupt() {
       || true
     printf '%s\n' "$(jq -n --arg change "$change" --arg project "$project" \
       --arg status "$acp_status" --arg phase "$acp_phase" \
+      --argjson tab_closed "$tab_closed" --argjson tab_kept "$keep_tab" \
       '{change: $change, project: $project, transport: "acp",
-        status: $status, phase: $phase, cancelled: ($status == "cancelled")}')"
+        status: $status, phase: $phase, cancelled: ($status == "cancelled"),
+        tab_closed: ($tab_closed == 1), tab_kept: ($tab_kept == 1)}')"
     return 0
   fi
 

@@ -138,7 +138,9 @@ case "${1:-} ${2:-}" in
     ;;
   "pane list")
     if [ -n "${HERDR_PANES_JSON:-}" ]; then
-      printf '{"result":{"panes":%s}}\n' "$HERDR_PANES_JSON"
+      panes_json="$HERDR_PANES_JSON"
+      [ -f "$panes_json" ] && panes_json="$(cat "$panes_json")"
+      printf '{"result":{"panes":%s}}\n' "$panes_json"
     else
       printf '{"result":{"panes":[{"pane_id":"p-boss","workspace_id":"ws-1","cwd":"%s","foreground_cwd":"%s"}]}}\n' "$PWD" "$PWD"
     fi
@@ -228,6 +230,45 @@ case "${1:-} ${2:-}" in
     if [ -n "${HERDR_RENAME_LOG:-}" ]; then
       printf '%s %s\n' "${3:-}" "${4:-}" >>"$HERDR_RENAME_LOG"
     fi
+    printf '%s\n' '{"result":{}}'
+    ;;
+  "workspace list")
+    ws_json="${HERDR_WORKSPACES_JSON:-[]}"
+    [ -f "$ws_json" ] && ws_json="$(cat "$ws_json")"
+    printf '{"result":{"workspaces":%s}}\n' "$ws_json"
+    ;;
+  "tab list")
+    ws=""
+    i=3
+    while [ "$i" -le "$#" ]; do
+      eval "arg=\${$i}"
+      case "$arg" in
+        --workspace) i=$((i + 1)); eval "ws=\${$i}" ;;
+      esac
+      i=$((i + 1))
+    done
+    tabs="${HERDR_TABS_JSON:-[]}"
+    [ -f "$tabs" ] && tabs="$(cat "$tabs")"
+    if [ -n "$ws" ]; then
+      tabs="$(printf '%s' "$tabs" | jq -c --arg w "$ws" 'map(select(.workspace_id == $w))')"
+    fi
+    printf '{"result":{"tabs":%s}}\n' "$tabs"
+    ;;
+  "tab get")
+    id="${3:-}"
+    case " ${HERDR_DEAD_TABS:-} " in
+      *" $id "*) exit 1 ;;
+    esac
+    printf '{"result":{"tab":{"tab_id":"%s","label":"","workspace_id":"ws-1"}}}\n' "$id"
+    ;;
+  "tab close")
+    id="${3:-}"
+    if [ -n "${HERDR_TAB_CLOSE_LOG:-}" ]; then
+      printf '%s\n' "$id" >>"$HERDR_TAB_CLOSE_LOG"
+    fi
+    case " ${HERDR_DEAD_TABS:-} " in
+      *" $id "*) exit 1 ;;
+    esac
     printf '%s\n' '{"result":{}}'
     ;;
   "worktree create"|"worktree open"|"worktree list"|"worktree remove")
@@ -714,6 +755,10 @@ run_boss() {
     HERDR_INTEGRATION_STATUS="${HERDR_INTEGRATION_STATUS:-}" \
     HERDR_AGENT_START_LOG="${HERDR_AGENT_START_LOG:-}" \
     HERDR_TAB_CREATE_LOG="${HERDR_TAB_CREATE_LOG:-}" \
+    HERDR_TABS_JSON="${HERDR_TABS_JSON:-}" \
+    HERDR_DEAD_TABS="${HERDR_DEAD_TABS:-}" \
+    HERDR_TAB_CLOSE_LOG="${HERDR_TAB_CLOSE_LOG:-}" \
+    HERDR_WORKSPACES_JSON="${HERDR_WORKSPACES_JSON:-}" \
     HERDR_PROMPT_LOG="${HERDR_PROMPT_LOG:-}" \
     HERDR_WORKTREE_CREATE_FAIL="${HERDR_WORKTREE_CREATE_FAIL:-}" \
     HERDR_WORKTREE_CREATE_MINIMAL="${HERDR_WORKTREE_CREATE_MINIMAL:-}" \
@@ -739,6 +784,10 @@ run_boss_fail() {
     HERDR_INTEGRATION_STATUS="${HERDR_INTEGRATION_STATUS:-}" \
     HERDR_AGENT_START_LOG="${HERDR_AGENT_START_LOG:-}" \
     HERDR_TAB_CREATE_LOG="${HERDR_TAB_CREATE_LOG:-}" \
+    HERDR_TABS_JSON="${HERDR_TABS_JSON:-}" \
+    HERDR_DEAD_TABS="${HERDR_DEAD_TABS:-}" \
+    HERDR_TAB_CLOSE_LOG="${HERDR_TAB_CLOSE_LOG:-}" \
+    HERDR_WORKSPACES_JSON="${HERDR_WORKSPACES_JSON:-}" \
     HERDR_PROMPT_LOG="${HERDR_PROMPT_LOG:-}" \
     HERDR_WORKTREE_CREATE_FAIL="${HERDR_WORKTREE_CREATE_FAIL:-}" \
     HERDR_WORKTREE_CREATE_MINIMAL="${HERDR_WORKTREE_CREATE_MINIMAL:-}" \
@@ -765,6 +814,10 @@ run_boss_state() {
     HERDR_INTEGRATION_STATUS="${HERDR_INTEGRATION_STATUS:-}" \
     HERDR_AGENT_START_LOG="${HERDR_AGENT_START_LOG:-}" \
     HERDR_TAB_CREATE_LOG="${HERDR_TAB_CREATE_LOG:-}" \
+    HERDR_TABS_JSON="${HERDR_TABS_JSON:-}" \
+    HERDR_DEAD_TABS="${HERDR_DEAD_TABS:-}" \
+    HERDR_TAB_CLOSE_LOG="${HERDR_TAB_CLOSE_LOG:-}" \
+    HERDR_WORKSPACES_JSON="${HERDR_WORKSPACES_JSON:-}" \
     HERDR_PROMPT_LOG="${HERDR_PROMPT_LOG:-}" \
     HERDR_WORKTREE_CREATE_FAIL="${HERDR_WORKTREE_CREATE_FAIL:-}" \
     HERDR_WORKTREE_CREATE_MINIMAL="${HERDR_WORKTREE_CREATE_MINIMAL:-}" \
@@ -791,6 +844,10 @@ run_boss_fail_state() {
     HERDR_INTEGRATION_STATUS="${HERDR_INTEGRATION_STATUS:-}" \
     HERDR_AGENT_START_LOG="${HERDR_AGENT_START_LOG:-}" \
     HERDR_TAB_CREATE_LOG="${HERDR_TAB_CREATE_LOG:-}" \
+    HERDR_TABS_JSON="${HERDR_TABS_JSON:-}" \
+    HERDR_DEAD_TABS="${HERDR_DEAD_TABS:-}" \
+    HERDR_TAB_CLOSE_LOG="${HERDR_TAB_CLOSE_LOG:-}" \
+    HERDR_WORKSPACES_JSON="${HERDR_WORKSPACES_JSON:-}" \
     HERDR_PROMPT_LOG="${HERDR_PROMPT_LOG:-}" \
     HERDR_WORKTREE_CREATE_FAIL="${HERDR_WORKTREE_CREATE_FAIL:-}" \
     HERDR_WORKTREE_CREATE_MINIMAL="${HERDR_WORKTREE_CREATE_MINIMAL:-}" \
@@ -3005,7 +3062,29 @@ if [ -z "$WTK" ] || [ ! -d "$WTK" ]; then bad "worktree keep: no worktree"; WTK=
 KSF="$WTST_K/applies/$(run_lib sha1_hex "$P_WTK")-wt-keep.json"
 printf 'kept\n' >"$WTK/kept.txt"
 git -C "$WTK" add -A; git -C "$WTK" commit -qm "kept work"
-out="$(HERDR_LIVE_PANES=pane-wt-keep run_boss_state "$WTST_K" \
+# A recorded tab plus a stale extra tab in the worktree workspace and an
+# unrelated tab in the base workspace; only the worktree tabs may close.
+WTWS_K="$(jq -r '.worktree_workspace // "ws-wt-wt-keep"' "$KSF")"
+TAB_REC_K="$(jq -r '.tab_id // "tab-wt-keep"' "$KSF")"
+K_TABS="$TMP/worktree-keep-tabs.json"
+K_PANES="$TMP/worktree-keep-panes.json"
+K_WS="$TMP/worktree-keep-ws.json"
+jq -n --arg w "$WTWS_K" --arg t "$TAB_REC_K" '[
+  {tab_id:$t,label:"wt-keep",workspace_id:$w},
+  {tab_id:"t-stale",label:"wt-keep",workspace_id:$w},
+  {tab_id:"t-base",label:"wt-keep",workspace_id:"ws-1"}
+]' >"$K_TABS"
+jq -n --arg w "$WTWS_K" --arg wt "$WTK" --arg base "$P_WTK" --arg t "$TAB_REC_K" --arg cwd "$PWD" '[
+  {pane_id:"p-apply",tab_id:$t,workspace_id:$w,cwd:$wt},
+  {pane_id:"p-stale",tab_id:"t-stale",workspace_id:$w,cwd:$wt},
+  {pane_id:"p-base",tab_id:"t-base",workspace_id:"ws-1",cwd:$base},
+  {pane_id:"p-boss",tab_id:"t-boss",workspace_id:"ws-1",cwd:$cwd}
+]' >"$K_PANES"
+jq -n --arg p "$P_WTK" '[{workspace_id:"ws-1",worktree:{checkout_path:$p}}]' >"$K_WS"
+CLOSE_K1="$TMP/worktree-keep-close1.log"
+out="$(HERDR_LIVE_PANES=pane-wt-keep HERDR_TABS_JSON="$K_TABS" \
+  HERDR_PANES_JSON="$K_PANES" HERDR_WORKSPACES_JSON="$K_WS" \
+  HERDR_TAB_CLOSE_LOG="$CLOSE_K1" run_boss_state "$WTST_K" \
   finish wt-keep --project "$P_WTK" --no-merge)"
 check_eq "no-merge: status" "kept" "$(printf '%s' "$out" | jq -r '.status')"
 check_eq "no-merge: worktree kept" "1" "$([ -d "$WTK" ] && printf 1 || printf 0)"
@@ -3014,16 +3093,83 @@ check_eq "no-merge: branch kept" "1" \
 check_eq "no-merge: state kept" "1" "$([ -f "$KSF" ] && printf 1 || printf 0)"
 check_eq "no-merge: no finish event" "0" \
   "$(run_lib event_count "$WTST_K/cycles/$(run_lib sha1_hex "$P_WTK")-wt-keep.events.jsonl" finish)"
-out="$(run_boss_state "$WTST_K" finish wt-keep --project "$P_WTK" --keep-worktree)"
+check_contains "no-merge: recorded tab closed" "$TAB_REC_K" "$(cat "$CLOSE_K1")"
+check_contains "no-merge: stale tab closed" "t-stale" "$(cat "$CLOSE_K1")"
+check_not_contains "no-merge: base tab untouched" "t-base" "$(cat "$CLOSE_K1")"
+check_eq "no-merge: closed tab id cleared" "null" "$(jq -r '.tab_id // "null"' "$KSF")"
+jq --arg t "$TAB_REC_K" --arg p "p-apply" '.tab_id=$t | .pane_id=$p' "$KSF" >"$KSF.tmp" && mv "$KSF.tmp" "$KSF"
+CLOSE_K2="$TMP/worktree-keep-close2.log"
+out="$(HERDR_LIVE_PANES=p-apply HERDR_TABS_JSON="$K_TABS" \
+  HERDR_PANES_JSON="$K_PANES" HERDR_WORKSPACES_JSON="$K_WS" \
+  HERDR_TAB_CLOSE_LOG="$CLOSE_K2" run_boss_state "$WTST_K" \
+  finish wt-keep --project "$P_WTK" --keep-worktree)"
 check_eq "keep-worktree: status" "kept" "$(printf '%s' "$out" | jq -r '.status')"
 check_eq "keep-worktree: state kept" "true" "$(jq -r '.kept' "$KSF")"
 check_eq "keep-worktree: merge done" "done" "$(jq -r '.merge_state' "$KSF")"
 check_eq "keep-worktree: worktree kept" "1" "$([ -d "$WTK" ] && printf 1 || printf 0)"
 check_eq "keep-worktree: base has change" "kept" "$(cat "$P_WTK/kept.txt")"
-out="$(run_boss_state "$WTST_K" finish wt-keep --project "$P_WTK")"
+check_eq "keep-worktree: all worktree tabs closed" "2" \
+  "$(grep -c -E "$TAB_REC_K|t-stale" "$CLOSE_K2" 2>/dev/null || true)"
+check_not_contains "keep-worktree: base tab untouched" "t-base" "$(cat "$CLOSE_K2")"
+jq --arg t "$TAB_REC_K" --arg p "p-apply" '.tab_id=$t | .pane_id=$p' "$KSF" >"$KSF.tmp" && mv "$KSF.tmp" "$KSF"
+CLOSE_K3="$TMP/worktree-keep-close3.log"
+out="$(HERDR_LIVE_PANES=p-apply HERDR_TABS_JSON="$K_TABS" \
+  HERDR_PANES_JSON="$K_PANES" HERDR_WORKSPACES_JSON="$K_WS" \
+  HERDR_TAB_CLOSE_LOG="$CLOSE_K3" run_boss_state "$WTST_K" \
+  finish wt-keep --project "$P_WTK")"
 check_eq "keep-worktree: second finish" "finished" "$(printf '%s' "$out" | jq -r '.status')"
 check_eq "keep-worktree: removed" "0" "$([ -e "$WTK" ] && printf 1 || printf 0)"
 check_eq "keep-worktree: state removed" "0" "$([ -f "$KSF" ] && printf 1 || printf 0)"
+check_contains "keep-worktree: final close recorded" "$TAB_REC_K" "$(cat "$CLOSE_K3")"
+check_contains "keep-worktree: final close stale" "t-stale" "$(cat "$CLOSE_K3")"
+check_not_contains "keep-worktree: final base untouched" "t-base" "$(cat "$CLOSE_K3")"
+
+# 63b. A new dispatch in an existing worktree closes stale tabs and leaves at
+# most one apply tab for the change.
+P_WTR="$TMP/project-worktree-retry"
+make_git_project "$P_WTR"
+make_change "$P_WTR" wt-retry '- [ ] 1.1 Code.'
+plan_commit "$P_WTR" wt-retry >/dev/null
+WTST_R="$TMP/worktree-retry-state"
+mkdir -p "$WTST_R"
+TAB_R1="$TMP/worktree-retry-tab1.log"
+out="$(HERDR_TAB_CREATE_LOG="$TAB_R1" run_boss_state "$WTST_R" \
+  dispatch wt-retry --project "$P_WTR" --worktree)"
+WTR="$(printf '%s' "$out" | jq -r '.worktree')"
+if [ -z "$WTR" ] || [ ! -d "$WTR" ]; then bad "worktree retry: no worktree"; WTR="$TMP/missing-worktree"; fi
+RSF="$WTST_R/applies/$(run_lib sha1_hex "$P_WTR")-wt-retry.json"
+RWSS="$(jq -r '.worktree_workspace' "$RSF")"
+RTAB="$(jq -r '.tab_id' "$RSF")"
+R_TABS="$TMP/worktree-retry-tabs.json"
+R_PANES="$TMP/worktree-retry-panes.json"
+R_WS="$TMP/worktree-retry-ws.json"
+jq -n --arg w "$RWSS" --arg t "$RTAB" '[
+  {tab_id:$t,label:"wt-retry",workspace_id:$w},
+  {tab_id:"t-retry-stale",label:"wt-retry",workspace_id:$w},
+  {tab_id:"t-retry-base",label:"wt-retry",workspace_id:"ws-1"}
+]' >"$R_TABS"
+jq -n --arg w "$RWSS" --arg wt "$WTR" --arg base "$P_WTR" --arg t "$RTAB" --arg cwd "$PWD" '[
+  {pane_id:"p-retry",tab_id:$t,workspace_id:$w,cwd:$wt},
+  {pane_id:"p-retry-stale",tab_id:"t-retry-stale",workspace_id:$w,cwd:$wt},
+  {pane_id:"p-retry-base",tab_id:"t-retry-base",workspace_id:"ws-1",cwd:$base},
+  {pane_id:"p-boss",tab_id:"t-boss",workspace_id:"ws-1",cwd:$cwd}
+]' >"$R_PANES"
+jq -n --arg p "$P_WTR" '[{workspace_id:"ws-1",worktree:{checkout_path:$p}}]' >"$R_WS"
+TAB_R2="$TMP/worktree-retry-tab2.log"
+CLOSE_R="$TMP/worktree-retry-close.log"
+out="$(HERDR_TABS_JSON="$R_TABS" HERDR_PANES_JSON="$R_PANES" \
+  HERDR_WORKSPACES_JSON="$R_WS" HERDR_TAB_CLOSE_LOG="$CLOSE_R" \
+  HERDR_TAB_CREATE_LOG="$TAB_R2" run_boss_state "$WTST_R" \
+  dispatch wt-retry --project "$P_WTR" --worktree)"
+check_eq "dispatch retry: status" "started" "$(printf '%s' "$out" | jq -r '.status')"
+check_contains "dispatch retry: recorded tab closed" "$RTAB" "$(cat "$CLOSE_R")"
+check_contains "dispatch retry: stale tab closed" "t-retry-stale" "$(cat "$CLOSE_R")"
+check_not_contains "dispatch retry: base tab untouched" "t-retry-base" "$(cat "$CLOSE_R")"
+check_eq "dispatch retry: one new tab" "1" "$(wc -l <"$TAB_R2" | tr -d ' ')"
+check_eq "dispatch retry: one worktree" "1" \
+  "$(git -C "$P_WTR" worktree list --porcelain | grep -c 'worktrees/.*/wt-retry' || true)"
+check_eq "dispatch retry: state records current tab" "true" \
+  "$(jq -r '.tab_id != null' "$RSF")"
 
 # 64. A merge conflict aborts, keeps the worktree and names the path.
 P_WTC="$TMP/project-worktree-conflict"
@@ -3494,10 +3640,33 @@ jq --arg w "$WT_DOC" '.worktree=$w | .merged=true | .kept=true | .merge_state="d
   "$DSF" >"$DSF.tmp" && mv "$DSF.tmp" "$DSF"
 printf '{"workspace":"ws-wt-wt-doc","path":"%s","base":"%s"}\n' "$WT_DOC" "$P_WTDOC" \
   >>"$TMP/herdr-worktrees.jsonl"
+DOC_TABS="$TMP/worktree-doctor-tabs.json"
+DOC_PANES="$TMP/worktree-doctor-panes.json"
+DOC_WS="$TMP/worktree-doctor-ws.json"
+jq -n '[
+  {tab_id:"t-wt-doc",label:"wt-doc",workspace_id:"ws-wt-wt-doc"},
+  {tab_id:"t-wt-doc-extra",label:"wt-doc",workspace_id:"ws-wt-wt-doc"},
+  {tab_id:"t-base-doc",label:"wt-doc",workspace_id:"ws-1"}
+]' >"$DOC_TABS"
+jq -n --arg wt "$WT_DOC" --arg base "$P_WTDOC" --arg cwd "$PWD" '[
+  {pane_id:"p-wt-doc",tab_id:"t-wt-doc",workspace_id:"ws-wt-wt-doc",cwd:$wt},
+  {pane_id:"p-wt-doc-extra",tab_id:"t-wt-doc-extra",workspace_id:"ws-wt-wt-doc",cwd:$wt},
+  {pane_id:"p-base-doc",tab_id:"t-base-doc",workspace_id:"ws-1",cwd:$base},
+  {pane_id:"p-boss",tab_id:"t-boss",workspace_id:"ws-1",cwd:$cwd}
+]' >"$DOC_PANES"
+jq -n --arg p "$P_WTDOC" '[{workspace_id:"ws-1",worktree:{checkout_path:$p}}]' >"$DOC_WS"
 REMOVE_DOC="$TMP/worktree-doctor-remove.log"
-HERDR_WORKTREE_REMOVE_LOG="$REMOVE_DOC" \
-  run_boss_state "$WTST_D" doctor --project "$P_WTDOC" --json --fix >/dev/null 2>&1
+CLOSE_DOC="$TMP/worktree-doctor-tab-close.log"
+DOC_FIX="$(HERDR_TABS_JSON="$DOC_TABS" HERDR_PANES_JSON="$DOC_PANES" \
+  HERDR_WORKSPACES_JSON="$DOC_WS" HERDR_TAB_CLOSE_LOG="$CLOSE_DOC" \
+  HERDR_WORKTREE_REMOVE_LOG="$REMOVE_DOC" \
+  run_boss_state "$WTST_D" doctor --project "$P_WTDOC" --json --fix 2>/dev/null)"
 check_eq "doctor fix: merged worktree removed" "0" "$([ -e "$WT_DOC" ] && printf 1 || printf 0)"
+check_contains "doctor fix: closed recorded tab" "t-wt-doc" "$(cat "$CLOSE_DOC" 2>/dev/null)"
+check_contains "doctor fix: closed stale tab" "t-wt-doc-extra" "$(cat "$CLOSE_DOC" 2>/dev/null)"
+check_not_contains "doctor fix: base tab untouched" "t-base-doc" "$(cat "$CLOSE_DOC" 2>/dev/null)"
+check_contains "doctor fix: reports closed tabs" "closed apply tabs" \
+  "$(printf '%s' "$DOC_FIX" | jq -r '.checks[] | select(.id=="worktree_state") | .hint')"
 check_contains "doctor fix: herdr removes by workspace" \
   "--workspace ws-wt-wt-doc" "$(cat "$REMOVE_DOC" 2>/dev/null)"
 check_not_contains "doctor fix: no --cwd" "--cwd" "$(cat "$REMOVE_DOC" 2>/dev/null)"
@@ -4657,9 +4826,20 @@ AS6="$TMP/acp-state-6"; mkdir -p "$AS6"
 S6="$(acp_state "$AS6" "$AP" acp-cancel)"
 FAKE_ACP_MODE=cancel acp_boss "$AS6" dispatch acp-cancel --project acp-test --runner opencode-acp >/dev/null
 sleep 0.3
-out="$(acp_boss "$AS6" interrupt acp-cancel --project acp-test)"
+T6="$(jq -r '.tab_id // empty' "$S6")"
+CLOSE6="$TMP/acp-interrupt-tab-close.log"
+out="$(HERDR_TAB_CLOSE_LOG="$CLOSE6" acp_boss "$AS6" interrupt acp-cancel --project acp-test)"
 check_eq "acp cancel: generation status" "cancelled" "$(printf '%s' "$out" | jq -r '.status')"
 check_eq "acp cancel: stop reason" "cancelled" "$(jq -r '.acp.last_stop_reason' "$S6")"
+check_eq "acp cancel: tab closed" "true" "$(printf '%s' "$out" | jq -r '.tab_closed')"
+check_eq "acp cancel: closed recorded tab" "$T6" "$(cat "$CLOSE6" 2>/dev/null)"
+check_eq "acp cancel: tab id cleared" "null" "$(jq -r '.tab_id // "null"' "$S6")"
+RTAB6="$TMP/acp-retrigger-tab.log"
+out="$(HERDR_TAB_CREATE_LOG="$RTAB6" acp_boss "$AS6" retrigger acp-cancel --project acp-test)"
+check_eq "acp cancel: retrigger status" "retriggered" "$(printf '%s' "$out" | jq -r '.status')"
+check_contains "acp cancel: retrigger recreates tab" "--label acp-cancel" "$(cat "$RTAB6" 2>/dev/null)"
+check_eq "acp cancel: retrigger records tab" "true" \
+  "$(jq -r '.tab_id != null' "$S6")"
 acp_boss "$AS6" finish acp-cancel --project acp-test >/dev/null 2>&1
 
 make_change "$AP" acp-cancel-tool '- [ ] 1.1 Do the work.'
@@ -4667,9 +4847,16 @@ AS7="$TMP/acp-state-7"; mkdir -p "$AS7"
 S7="$(acp_state "$AS7" "$AP" acp-cancel-tool)"
 FAKE_ACP_MODE=cancel_tool acp_boss "$AS7" dispatch acp-cancel-tool --project acp-test --runner opencode-acp >/dev/null
 sleep 0.6
-out="$(acp_boss "$AS7" interrupt acp-cancel-tool --project acp-test)"
+T7="$(jq -r '.tab_id // empty' "$S7")"
+CLOSE7="$TMP/acp-keep-tab-close.log"
+out="$(HERDR_TAB_CLOSE_LOG="$CLOSE7" acp_boss "$AS7" interrupt acp-cancel-tool --project acp-test --keep-tab)"
 check_eq "acp cancel tool: status" "cancelled" "$(printf '%s' "$out" | jq -r '.status')"
 check_eq "acp cancel tool: stop reason" "cancelled" "$(jq -r '.acp.last_stop_reason' "$S7")"
+check_eq "acp keep tab: kept" "true" "$(printf '%s' "$out" | jq -r '.tab_kept')"
+check_eq "acp keep tab: not closed" "false" "$(printf '%s' "$out" | jq -r '.tab_closed')"
+check_eq "acp keep tab: state flag" "true" "$(jq -r '.tab_kept // false' "$S7")"
+check_eq "acp keep tab: tab id kept" "$T7" "$(jq -r '.tab_id' "$S7")"
+check_eq "acp keep tab: close log empty" "" "$(cat "$CLOSE7" 2>/dev/null)"
 acp_boss "$AS7" finish acp-cancel-tool --project acp-test >/dev/null 2>&1
 
 make_change "$AP" acp-cancel-unconfirmed '- [ ] 1.1 Do the work.'

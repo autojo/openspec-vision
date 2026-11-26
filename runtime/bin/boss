@@ -56,7 +56,7 @@ Usage:
   boss finish <change> [--project <name|path>] [--force] [--keep-worktree] [--no-merge] [--lesson <text>] [--lesson-scope project|global] [--as <pane|agent>]
   boss park <change> [--project <name|path>] [--note <text>] [--as <pane|agent>]
   boss resume <change> [--project <name|path>] [--note <text>] [--as <pane|agent>]
-  boss interrupt <change> [--project <name|path>] [--as <pane|agent>]
+  boss interrupt <change> [--project <name|path>] [--keep-tab] [--as <pane|agent>]
   boss answer <change> <key>... [--project <name|path>] [--as <pane|agent>]
   boss skills dir [--project <name|path>] [--json]
   boss claim [--name <name>] [--release] [--force] [--as <pane|agent>]

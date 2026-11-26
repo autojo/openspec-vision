@@ -61,7 +61,7 @@ doctor_check_worktrees() {
   fi
   doctor_add worktree_support "$wt_support" "$wt_support_hint"
 
-  local wt_project_hash wt_warn="" wt_orphans="" wt_removed="" wt_count=0
+  local wt_project_hash wt_warn="" wt_orphans="" wt_removed="" wt_tabs="" wt_count=0
   local wt_f wt_ch wt_path wt_ms wt_merged wt_kept wt_branch wt_tab wt_ws
   wt_project_hash="$(sha1_hex "$project")"
   if [ -d "$BOSS_APPLIES_DIR" ]; then
@@ -91,8 +91,19 @@ doctor_check_worktrees() {
       fi
       if [ "$fix" -eq 1 ] && [ "$wt_merged" = "true" ]; then
         if [ "$wt_kept" = "true" ] || [ "$wt_ms" = "done" ]; then
+          local wt_base_ws wt_closed
           wt_tab="$(jq -r '.tab_id // empty' "$wt_f" 2>/dev/null || true)"
-          [ -n "$wt_tab" ] && [ "$wt_tab" != "null" ] && herdr tab close "$wt_tab" >/dev/null 2>&1 || true
+          wt_base_ws="$(herdr_workspace_for_path "$project")"
+          [ -n "$wt_base_ws" ] || wt_base_ws="$(jq -r '.boss_workspace // empty' "$wt_f" 2>/dev/null || true)"
+          wt_closed="$(herdr_close_apply_tabs "$wt_path" "$wt_ch" "$wt_ws" "$wt_base_ws" "$wt_tab")"
+          if [ -n "$wt_tab" ] && [ "$wt_tab" != "null" ] \
+             && ! printf '%s\n' "$wt_closed" | grep -Fxq "$wt_tab"; then
+            herdr tab close "$wt_tab" >/dev/null 2>&1 || true
+          fi
+          if [ -n "$wt_closed" ]; then
+            wt_tabs="$wt_tabs $wt_ch:$(printf '%s' "$wt_closed" | paste -sd ',' -)"
+            log "doctor --fix: closed apply tab(s) $(printf '%s' "$wt_closed" | paste -sd ', ' -) for $wt_ch"
+          fi
           herdr_worktree_remove "$project" "$wt_path" "$wt_ws"
           git -C "$project" worktree remove --force "$wt_path" >/dev/null 2>&1 || true
           git -C "$project" worktree prune >/dev/null 2>&1 || true
@@ -123,10 +134,12 @@ doctor_check_worktrees() {
   if [ -z "$wt_warn" ]; then
     local wt_hint=""
     [ -n "$wt_removed" ] && wt_hint="removed merged worktrees:$wt_removed"
+    [ -n "$wt_tabs" ] && wt_hint="${wt_hint:+$wt_hint; }closed apply tabs:$wt_tabs"
     doctor_add worktree_state ok "$wt_hint"
   else
     local wt_hint="worktree states need attention:$wt_warn; run 'boss review' and 'boss finish', or 'boss doctor --fix' for merged kept worktrees"
     [ -n "$wt_removed" ] && wt_hint="$wt_hint; removed merged worktrees:$wt_removed"
+    [ -n "$wt_tabs" ] && wt_hint="$wt_hint; closed apply tabs:$wt_tabs"
     doctor_add worktree_state warn "$wt_hint"
   fi
   if [ -z "$wt_orphans" ]; then

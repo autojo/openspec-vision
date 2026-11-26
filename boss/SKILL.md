@@ -179,9 +179,12 @@ lost end stops a child that still runs, resumes the recorded session when the
 agent offers it, and otherwise opens a new session in the same worktree; no
 uncommitted file is touched and the command is not refused with `turn_active`.
 
-`boss interrupt` uses `session/cancel`, never keys. `boss finish` closes the ACP
-session and ends the supervisor within its shutdown budget, even when the prompt
-is unanswered; no supervisor, socket or heartbeat file is left. `boss resume`
+`boss interrupt` uses `session/cancel`, never keys; it closes the ACP apply tab
+by default and `--keep-tab` preserves it for inspection. The state and worktree
+stay readable, so a later `resume`/`retrigger` reuses a live tab or creates a new
+one. `boss finish` closes the ACP session and ends the supervisor within its
+shutdown budget, even when the prompt is unanswered; no supervisor, socket or
+heartbeat file is left. `boss resume`
 calls `session/load` when the agent advertises it, and an
 `unresumable` result means use `boss retrigger` for an explicit new session. The
 apply prompt is the OpenSpec CLI workflow
@@ -378,8 +381,8 @@ checkout must stay unchanged by the apply.
 
 On green, `boss finish` merges the worktree branch into the base
 (`--ff-only` at `base_head`, otherwise `--no-ff`), runs the configured or
-detected test command on the merged base, then closes the tab, removes the
-worktree, deletes the branch and the state. On a conflict it aborts the merge,
+detected test command on the merged base, then closes every tab of the worktree
+workspace, removes the worktree, deletes the branch and the state. On a conflict it aborts the merge,
 keeps worktree and state and returns `merge_conflict` with the paths. A red
 integration test keeps the state with `merge_state=test_failed` and
 `merge_test_failed`; fix on the base and run `boss finish` again. A test that
@@ -390,8 +393,9 @@ and reports `merge_test_timeout` with the budget and log path; raise
 `explorer` the worktree must be clean and the Explorer commits the reviewed
 change paths there first; under `agent` verify the commits. `--keep-worktree`
 merges and tests but keeps the worktree, branch and state (`kept=true`,
-`merge_state=done`); `--no-merge` closes the tab and keeps them without a finish
-event. A later `finish` cleans up either path.
+`merge_state=done`); `--no-merge` closes the apply tabs and keeps them without a
+finish event. A later `finish` cleans up either path. Both paths close every
+tab of the worktree workspace and leave unrelated base tabs untouched.
 
 `boss park` keeps the worktree and branch. `boss resume` reuses them and starts
 a fresh agent in the same worktree; `boss retrigger` continues in place, or
@@ -399,7 +403,8 @@ starts a new agent there when the old one is gone. A missing worktree fails with
 `worktree_missing`; never fall back to the base checkout. `boss doctor` reports
 missing worktree paths, conflicted, test-failed or test-timeout states,
 uncommitted change dirs, orphaned worktrees, a dirty base and an uncommitted
-plan.
+plan. `boss doctor --fix` also closes orphaned apply tabs for the worktrees it
+removes, reports each closed tab, and leaves unrelated base tabs untouched.
 
 ### Caller identity and wake targets
 
