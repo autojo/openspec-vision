@@ -53,7 +53,7 @@
       `~/.config/openspec-boss/boss.toml`; set `default = "opencode-deepseek"`.
 - [x] 6.2 [Nutzer] Add the OpenCode runners and catalog/roles for the models that
       should be used; run `boss doctor` and `boss model list`.
-- [ ] 6.3 [Nutzer] Install the resulting runtime with `./install.sh` after the
+- [x] 6.3 [Nutzer] Install the resulting runtime with `./install.sh` after the
       change is merged.
 
 ## Workflow follow-up
