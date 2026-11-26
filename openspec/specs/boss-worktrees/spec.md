@@ -117,14 +117,21 @@ A conflict or a red test SHALL keep the worktree and state and report it.
 
 ### Requirement: Finish cleanup
 
-A successful finish SHALL close the tab and remove the worktree and branch.
-`--keep-worktree` or `--no-merge` SHALL preserve them for a manual path.
+A successful finish SHALL close every tab belonging to the apply's worktree
+workspace and remove the worktree and branch. `--keep-worktree` or `--no-merge`
+SHALL preserve them for a manual path.
 
 #### Scenario: Cleanup after merge
 
 - **WHEN** finish completes successfully
-- **THEN** the tab is closed, the worktree is removed, the branch is deleted and
-  the state file is gone
+- **THEN** every apply tab in the worktree workspace is closed, the worktree is
+  removed, the branch is deleted and the state file is gone
+
+#### Scenario: Stale tab from an earlier dispatch
+
+- **WHEN** the worktree contains a tab whose id is no longer the recorded state
+  tab
+- **THEN** finish closes it with the rest of the worktree workspace
 
 #### Scenario: Keep worktree
 
@@ -165,3 +172,27 @@ report orphaned worktrees, a dirty base and a missing plan commit.
 
 - **WHEN** a worktree has no apply state or the base is dirty
 - **THEN** `boss doctor` reports the worktree or the dirty paths
+
+### Requirement: Apply tab lifecycle
+
+The runtime SHALL keep at most one apply tab per change and worktree. A dispatch
+or retrigger that reuses an existing worktree SHALL reuse the recorded tab if it
+is alive and close it before creating a new one otherwise. `boss doctor --fix`
+SHALL close orphaned apply tabs for the worktrees and states it repairs.
+
+#### Scenario: Retry keeps one tab
+
+- **WHEN** a change is retriggered in an existing worktree
+- **THEN** the runtime reuses the live apply tab or replaces the stale one, and
+  at most one tab remains for that change
+
+#### Scenario: Orphan tab cleanup
+
+- **WHEN** `boss doctor --fix` finds an orphaned apply tab for a worktree
+- **THEN** it closes the tab and reports what it closed
+
+#### Scenario: Base workspace untouched
+
+- **WHEN** the runtime closes apply tabs
+- **THEN** it does not close tabs in the base project workspace that do not
+  belong to the apply

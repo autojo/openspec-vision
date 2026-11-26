@@ -431,6 +431,44 @@ ensure_workspace() {
   printf '%s' "$ws_id"
 }
 
+# ensure_acp_apply_tab <state-file> -- an ACP apply's tab is only a transcript
+# view. Reuse a live recorded tab; when it is gone (for example after 'boss
+# interrupt'), create a new tail tab in the recorded workspace and record it.
+# Never fails the caller.
+ensure_acp_apply_tab() {
+  local f="$1" tab pane ws root change transcript created tmp
+  [ -f "$f" ] || return 0
+  acp_is_acp "$f" || return 0
+  tab="$(jq -r '.tab_id // empty' "$f" 2>/dev/null || true)"
+  if [ -n "$tab" ] && [ "$tab" != "null" ] && herdr tab get "$tab" >/dev/null 2>&1; then
+    return 0
+  fi
+  ws="$(jq -r '.workspace_id // empty' "$f" 2>/dev/null || true)"
+  root="$(jq -r '.acp.apply_root // .worktree // .project // empty' "$f" 2>/dev/null || true)"
+  change="$(jq -r '.change // empty' "$f" 2>/dev/null || true)"
+  transcript="$(jq -r '.acp.transcript // empty' "$f" 2>/dev/null || true)"
+  [ -n "$ws" ] && [ -n "$root" ] || return 0
+  created="$(herdr tab create --workspace "$ws" --cwd "$root" --label "$change" --no-focus 2>/dev/null || true)"
+  pane="$(printf '%s' "$created" | jq -r '.result.root_pane.pane_id // .root_pane.pane_id // empty' 2>/dev/null || true)"
+  tab="$(printf '%s' "$created" | jq -r '.result.tab.tab_id // .result.root_pane.tab_id // .tab.tab_id // .root_pane.tab_id // empty' 2>/dev/null || true)"
+  if [ -z "$pane" ] || [ -z "$tab" ]; then
+    log "warning: could not recreate the apply tab for $change"
+    return 0
+  fi
+  if [ -n "$transcript" ]; then
+    herdr pane run "$pane" "tail -n +1 -f '$transcript'" >/dev/null 2>&1 \
+      || log "warning: could not start the transcript tail in pane $pane"
+  fi
+  tmp="$(mktemp)"
+  if jq --arg p "$pane" --arg t "$tab" '.pane_id = $p | .tab_id = $t' "$f" >"$tmp" 2>/dev/null; then
+    mv "$tmp" "$f"
+  else
+    rm -f "$tmp"
+  fi
+  log "retrigger: recreated apply tab $tab for $change"
+  return 0
+}
+
 # ---------------------------------------------------------- apply readiness ---
 
 # check_apply_ready <project> <change> -- all applyRequires artifacts done?
@@ -709,29 +747,40 @@ start_acp_supervisor() {
   printf '%s\n' "$pid"
 }
 
+# acp_fail_from_state <state-file> -- die with the error the supervisor recorded
+# in the state, mapping a rejected session configuration to its own code. A
+# state without an error returns 0, so the caller can keep waiting.
+acp_fail_from_state() {
+  local state_file="$1" error error_code
+  error="$(jq -r '.acp.error // empty' "$state_file" 2>/dev/null || true)"
+  [ -n "$error" ] || return 0
+  error_code="$(jq -r '.acp.error_code // empty' "$state_file" 2>/dev/null || true)"
+  case "$error_code" in
+    model_not_offered|effort_not_offered|model_mismatch|mode_not_offered)
+      die_json "$error_code" "ACP session configuration failed for the apply: $error" ;;
+  esac
+  die_json "acp_start_failed" "ACP supervisor failed for the apply: $error"
+}
+
 # acp_wait_ready <state-file> [<timeout-ms>] -- wait until the supervisor has
 # completed the ACP handshake and applied the session configuration, or has
 # written an error. Dispatch uses this so a bad command/model/mode fails the
 # dispatch instead of leaving a half-created apply behind.
 acp_wait_ready() {
-  local state_file="$1" timeout="${2:-$BOSS_ACP_START_TIMEOUT_MS}" deadline error ready pid change error_code
+  local state_file="$1" timeout="${2:-$BOSS_ACP_START_TIMEOUT_MS}" deadline ready pid change
   change="$(jq -r '.change // "acp"' "$state_file" 2>/dev/null || printf acp)"
   deadline=$(( $(now_ms) + timeout ))
   while :; do
-    error="$(jq -r '.acp.error // empty' "$state_file" 2>/dev/null || true)"
-    if [ -n "$error" ]; then
-      error_code="$(jq -r '.acp.error_code // empty' "$state_file" 2>/dev/null || true)"
-      case "$error_code" in
-        model_not_offered|effort_not_offered|model_mismatch|mode_not_offered)
-          die_json "$error_code" "ACP session configuration failed for the apply: $error" ;;
-      esac
-      die_json "acp_start_failed" "ACP supervisor failed for the apply: $error"
-    fi
+    acp_fail_from_state "$state_file"
     ready="$(jq -r '.acp.ready // false' "$state_file" 2>/dev/null || printf false)"
     [ "$ready" = "true" ] && return 0
     pid="$(jq -r '.acp.supervisor_pid // empty' "$state_file" 2>/dev/null || true)"
     [ -n "$pid" ] || pid="${BOSS_FAILED_ACP_PID:-}"
     if [ -n "$pid" ] && ! acp_pid_alive "$pid"; then
+      # The supervisor writes its error before it exits, but a dispatcher state
+      # write can land between the reads above. Look again before reporting a
+      # fast-failing supervisor as a silent exit.
+      acp_fail_from_state "$state_file"
       die_json "acp_start_failed" "the ACP supervisor exited before the session was ready; see $BOSS_LOGS_DIR/$change-acp.log"
     fi
     [ "$(now_ms)" -lt "$deadline" ] \
@@ -1039,6 +1088,27 @@ dispatch_change() {
 
   assert_workspace_free "$workspace_id" "$change"
 
+  # A live apply was returned above; anything else is a stale tab from an
+  # earlier dispatch. Close stale tabs for the change/worktree before creating
+  # the new one, so at most one apply tab remains. The base workspace is only
+  # touched through its recorded tab.
+  local stale_tab="" stale_closed="" base_ws=""
+  if [ -f "$state_file" ]; then
+    stale_tab="$(jq -r '.tab_id // empty' "$state_file" 2>/dev/null || true)"
+    base_ws="$(jq -r '.boss_workspace // empty' "$state_file" 2>/dev/null || true)"
+  fi
+  [ -n "$base_ws" ] || base_ws="$(herdr_workspace_for_path "$project")"
+  [ -n "$base_ws" ] || base_ws="$dispatcher_workspace"
+  if [ "$want_worktree" = "1" ] && [ -n "$worktree" ]; then
+    stale_closed="$(herdr_close_apply_tabs "$worktree" "$change" "$worktree_workspace" "$base_ws" "$stale_tab")"
+  elif [ -n "$stale_tab" ] && [ "$stale_tab" != "null" ]; then
+    herdr tab close "$stale_tab" >/dev/null 2>&1 || true
+    stale_closed="$stale_tab"
+  fi
+  if [ -n "$stale_closed" ]; then
+    log "dispatch: closed stale apply tab(s) $(printf '%s' "$stale_closed" | paste -sd ', ' -) for $change"
+  fi
+
   local -a env_args=()
   while IFS= read -r e; do [ -n "$e" ] && env_args+=(--env "$e"); done < <(runner_env_of "$runner")
 
@@ -1069,25 +1139,20 @@ dispatch_change() {
 
   local acp_prompt="" acp_command="" acp_model="" acp_effort="" acp_mode="" acp_policy="" acp_transcript=""
   local acp_socket="" acp_deny="[]" acp_events="" acp_boss_bin="" acp_heartbeat=""
-  local acp_isolate="false" acp_profile=""
   if [ "$start" = "acp" ]; then
     acp_prompt="$(compose_acp_apply_prompt "$apply_root" "$change" "$note" "$lessons_block" \
       "$external_block" "$commit_block" "$runner_yield" "$apply_cmd")"
     acp_command="$(printf '%s' "$runner" | jq -r '.command // empty')"
     acp_model="$(printf '%s' "$runner" | jq -r '.model // empty')"
     acp_effort="$(printf '%s' "$runner" | jq -r '.effort // empty')"
-    acp_mode="$(printf '%s' "$runner" | jq -r '.mode // "smart_approve"')"
+    acp_mode="$(printf '%s' "$runner" | jq -r '.mode // ""')"
     acp_policy="$(printf '%s' "$runner" | jq -r '.policy // "allow"')"
-    acp_isolate="$(printf '%s' "$runner" | jq -r 'if has("isolate") then (.isolate != false) else true end')"
     acp_transcript="$(acp_transcript_for "$state_file")"
     acp_socket="$(acp_socket_for "$state_file")"
     acp_heartbeat="$(acp_heartbeat_for "$state_file")"
     acp_deny="$(policy_denies "$runner" | jq -Rsc 'split("\n") | map(select(length > 0))')"
     acp_events="$(events_file_for "$project" "$change")"
     acp_boss_bin="${BIN_DIR:-$(dirname "$(resolve_path "${BASH_SOURCE[0]}")")}/boss"
-    if [ "$acp_isolate" = "true" ]; then
-      acp_profile="$(acp_profile_dir_for "$state_file")"
-    fi
     mkdir -p "$(dirname "$acp_transcript")" "$(dirname "$acp_socket")" 2>/dev/null || true
   fi
 
@@ -1135,7 +1200,6 @@ dispatch_change() {
     --arg acp_mode "$acp_mode" --arg acp_policy "$acp_policy" --arg acp_transcript "$acp_transcript" \
     --arg acp_socket "$acp_socket" --arg acp_events "$acp_events" --arg acp_boss_bin "$acp_boss_bin" \
     --arg acp_heartbeat "$acp_heartbeat" --arg acp_root "$apply_root" --argjson acp_deny "${acp_deny:-[]}" \
-    --arg acp_isolate "$acp_isolate" --arg acp_profile "$acp_profile" \
     --argjson mode "$mode_json" --argjson model "$model_json" \
     '{change: $change, project: $project, runner: $runner, kind: $kind, transport: $start, apply_cmd: $apply_cmd, note: $note, lessons: $lessons, external_block: $external_block, commit_block: $commit_block, commit_policy: $commit_policy, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, worktree: (if $worktree == "" then null else $worktree end), branch: (if $branch == "" then null else $branch end), worktree_workspace: (if $worktree_workspace == "" then null else $worktree_workspace end), touches: $touches, declared: $declared, merge_state: "none", merged: false, merge_test: "not_run", kept: false, boss: $boss, boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_workspace: (if $boss_workspace == "" then null else $boss_workspace end), boss_cwd: (if $boss_cwd == "" then null else $boss_cwd end), boss_cross_workspace: $boss_cross, boss_cross_project: $boss_cross_project, base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at, opencode_version: $mode.opencode_version, permission_mode: $mode.permission_mode, model: $model,
      acp: (if $start == "acp" then {
@@ -1146,8 +1210,6 @@ dispatch_change() {
        session_id: null, supervisor_pid: null, control_socket: $acp_socket,
        transcript: $acp_transcript, events_file: $acp_events,
        boss_bin: $acp_boss_bin, heartbeat_file: $acp_heartbeat,
-       isolated: ($acp_isolate == "true"),
-       profile_root: (if $acp_profile == "" then null else $acp_profile end),
        ready: false, phase: "starting", last_stop_reason: null,
        pending_permission: null, pending_permissions: [], apply_allows: [],
        usage: null, last_update: null,

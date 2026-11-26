@@ -122,13 +122,13 @@ cmd_model_list() {
 # with the same profile kind a dispatch uses. Native: the command and the model
 # arrangement are checked without starting an agent.
 model_check_json() {
-  local project="$1" runner="$2" name command model effort mode isolated profile_flag
+  local project="$1" runner="$2" name command model effort mode
   local script out rc
   name="$(printf '%s' "$runner" | jq -r '.name // "?"')"
   command="$(printf '%s' "$runner" | jq -r '.command // empty')"
   model="$(printf '%s' "$runner" | jq -r '.model // empty')"
   effort="$(printf '%s' "$runner" | jq -r '.effort // empty')"
-  mode="$(printf '%s' "$runner" | jq -r '.mode // "smart_approve"')"
+  mode="$(printf '%s' "$runner" | jq -r '.mode // ""')"
   if [ "$(runner_start_of "$runner")" != "acp" ]; then
     local kind binary present=true
     kind="$(printf '%s' "$runner" | jq -r '.kind // empty')"
@@ -147,11 +147,8 @@ model_check_json() {
     jq -nc --arg runner "$name" '{runner: $runner, status: "fail", message: "boss_acp.py is missing; reinstall the runtime"}'
     return 0
   fi
-  isolated="$(printf '%s' "$runner" | jq -r 'if has("isolate") then (.isolate != false) else true end')"
-  if [ "$isolated" = "true" ]; then profile_flag="--profile-temp"; else profile_flag=""; fi
-  # shellcheck disable=SC2086  # profile_flag is empty or one literal word
   out="$(cd "$project" && run_with_deadline 300 python3 "$script" --probe "$command" --cwd "$project" \
-    $profile_flag --timeout 120 ${model:+--model "$model"} ${effort:+--effort "$effort"} ${mode:+--mode "$mode"} 2>/dev/null)"
+    --timeout 120 ${model:+--model "$model"} ${effort:+--effort "$effort"} ${mode:+--mode "$mode"} 2>/dev/null)"
   rc=$?
   if ! printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
     jq -nc --arg runner "$name" --argjson rc "$rc" \
@@ -216,7 +213,7 @@ cmd_model_trial() {
   model="$(printf '%s' "$runner" | jq -r '.model // empty')"
   effort="$(printf '%s' "$runner" | jq -r '.effort // empty')"
   command="$(printf '%s' "$runner" | jq -r '.command // empty')"
-  mode="$(printf '%s' "$runner" | jq -r '.mode // "smart_approve"')"
+  mode="$(printf '%s' "$runner" | jq -r '.mode // ""')"
   entry="$(model_catalog_entry "$cfg" "$model")"
   if [ "$entry" = "null" ]; then
     die_json "model_uncataloged" "model '$model' of runner '$name' has no [models] entry; add one before a trial"
@@ -240,7 +237,7 @@ cmd_model_trial() {
   esac
   authoritative="$amount"
 
-  local dir state_file socket transcript events heartbeat profile prompt boss_bin deny_json
+  local dir state_file socket transcript events heartbeat prompt boss_bin deny_json
   local deadline stop_reason trial_json record_path result status confirmed cost tokens agent_version
   dir="$(mktemp -d "${TMPDIR:-/tmp}/boss-model-trial.XXXXXX")" || die_json "state_write" "cannot create a temporary directory"
   state_file="$dir/state.json"
@@ -248,7 +245,6 @@ cmd_model_trial() {
   transcript="$dir/transcript.jsonl"
   events="$dir/events.jsonl"
   heartbeat="$dir/heartbeat"
-  profile="$dir/profile"
   prompt="This is a boss model trial. Reply with the single word OK and nothing else."
   boss_bin="${BIN_DIR:-$(dirname "$(resolve_path "${BASH_SOURCE[0]}")")}/boss"
   deny_json="$(policy_denies "$runner" | jq -Rsc 'split("\n") | map(select(length > 0))')"
@@ -258,7 +254,7 @@ cmd_model_trial() {
     --argjson limit_usd "$authoritative" --arg command "$command" --arg mode "$mode" \
     --arg prompt "$prompt" --arg socket "$socket" --arg transcript "$transcript" \
     --arg events "$events" --arg heartbeat "$heartbeat" --arg boss_bin "$boss_bin" \
-    --argjson deny "$deny_json" --arg profile "$profile" \
+    --argjson deny "$deny_json" \
     '{change: $change, project: $project, runner: "trial", kind: "acp", transport: "acp",
       agent: "trial", pane_id: null, tab_id: null, workspace_id: null,
       started_at: (now | strftime("%Y-%m-%dT%H:%M:%S%z")), last_state: "starting",
@@ -274,7 +270,7 @@ cmd_model_trial() {
         mode: $mode, policy: "allow", deny: $deny,
         session_id: null, supervisor_pid: null, control_socket: $socket,
         transcript: $transcript, events_file: $events, boss_bin: $boss_bin,
-        heartbeat_file: $heartbeat, isolated: true, profile_root: $profile,
+        heartbeat_file: $heartbeat,
         ready: false, phase: "starting", last_stop_reason: null,
         pending_permission: null, pending_permissions: [], apply_allows: [],
         usage: null, last_update: null, stalled: false, stalled_at: null,

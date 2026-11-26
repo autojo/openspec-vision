@@ -97,7 +97,7 @@ opencode integration v13 or newer. Re-run `./install.sh` after updating Herdr.
 
 ### ACP runners
 
-A runner with `start = "acp"` (for example Goose) is driven by the bundled
+A runner with `start = "acp"` (`opencode acp`) is driven by the bundled
 `boss-acp` supervisor instead of a Herdr-native agent. Dispatch starts the
 supervisor detached and creates the tab only as a transcript view; never send
 keystrokes to it, never read its pane for state, and do not call
@@ -114,13 +114,14 @@ An ACP runner is apply-only: `boss session` rejects it with
 `acp_session_unsupported`. There is no hidden native path, and a change that
 needs an interactive session belongs to a native runner. The supported knobs
 are `command`, `model`, `effort`, `mode`, `policy`, `deny` and `apply`; `args`
-and `env` are native-only and have no effect on an ACP child. The supervisor
+and `env` are native-only and have no effect on an ACP child. An OpenCode
+runner uses `mode = ""` and `isolate = false`. The supervisor
 sets the model first and the effort (ACP category `thought_level`) after it,
 reads both back from the returned configuration and sends no prompt until they
 match the declared values. It repeats that confirmation before every prompt and
 after `session/load`, so a retrigger or resume cannot drift silently.
-`boss model check <runner>` probes the same profile a dispatch uses and sends no
-prompt.
+`boss model check <runner>` probes the same configuration a dispatch uses and
+sends no prompt.
 
 Permissions follow the runner policy. `policy = "ask"` leaves an unmatched
 request pending and wakes you with `blocked`; every pending request is queued by
@@ -139,26 +140,25 @@ pending and the supervisor logs why. An Explorer `allow_always` answer means
 allow-once to the agent for every matching request and keeps the grant for the rest of the apply.
 Nothing is written to the global agent permission store.
 
-`allow_always` is an agent-level grant in the agent's own model: written into
-Goose's config it applies to every later session. The runner maps your answer to
-the apply-scoped `acp.apply_allows` above; a user who edits Goose's own
-`permission.yaml` creates the global grant instead. `boss doctor` reports a
-non-isolated runner with such an entry as `weakened` and names it.
+`allow_always` is an agent-level grant in the agent's own model: it applies to
+every later session of that agent. The runner maps your answer to the
+apply-scoped `acp.apply_allows` above and never creates one. OpenCode's
+`opencode.jsonc` permission setting is the outer boundary: a broad
+`"permission": "allow"` lets tools run without a request, while the ACP `policy`
+and `deny` gate only the requests OpenCode actually sends. `boss doctor` reports
+that boundary.
 
-By default the ACP child runs with a per-apply profile below
-`$BOSS_STATE_DIR/acp/` (`XDG_CONFIG_HOME` and `XDG_DATA_HOME` point at it):
-provider files are linked, `permission.yaml` is boss-owned with empty
-`always_allow` lists, and sessions are private. `boss finish` removes the
-profile; a resume reuses it. Set `isolate = false` only when you deliberately
-want the user's global profile. `boss doctor` reports the isolation state and
-the effective store, and reports `weakened` when a non-isolated global store
-always allows `shell`, `write` or `edit`.
+An OpenCode ACP runner uses the user's global `~/.config/opencode` and
+`~/.local/share/opencode`; `isolate = true` is rejected and `boss` creates no
+per-apply profile or permission store. A supervisor restart and a resume reuse
+the same global configuration. `boss doctor` reports the effective OpenCode
+permission configuration and never reads a separate permission store.
 
-The profile isolates Goose's configuration, permission store and sessions; it is
-not a filesystem sandbox. Shell, write and edit still run with the user's OS
-permissions on every path that user can reach. Only an OS sandbox (a container,
-a sandboxed unit) or a separate user confines them, and the worktree does not:
-it only keeps parallel applies out of each other's index.
+The global configuration is not a filesystem sandbox. Shell, write and edit
+still run with the user's OS permissions on every path that user can reach.
+Only an OS sandbox (a container, a sandboxed unit) or a separate user confines
+them, and the worktree does not: it only keeps parallel applies out of each
+other's index.
 
 A turn is bounded. `BOSS_ACP_TURN_TIMEOUT_S` (default 7200 s) ends a turn that
 never answers: it records `turn_timeout`, sends `session/cancel` and wakes you.
@@ -179,9 +179,12 @@ lost end stops a child that still runs, resumes the recorded session when the
 agent offers it, and otherwise opens a new session in the same worktree; no
 uncommitted file is touched and the command is not refused with `turn_active`.
 
-`boss interrupt` uses `session/cancel`, never keys. `boss finish` closes the ACP
-session and ends the supervisor within its shutdown budget, even when the prompt
-is unanswered; no supervisor, socket or heartbeat file is left. `boss resume`
+`boss interrupt` uses `session/cancel`, never keys; it closes the ACP apply tab
+by default and `--keep-tab` preserves it for inspection. The state and worktree
+stay readable, so a later `resume`/`retrigger` reuses a live tab or creates a new
+one. `boss finish` closes the ACP session and ends the supervisor within its
+shutdown budget, even when the prompt is unanswered; no supervisor, socket or
+heartbeat file is left. `boss resume`
 calls `session/load` when the agent advertises it, and an
 `unresumable` result means use `boss retrigger` for an explicit new session. The
 apply prompt is the OpenSpec CLI workflow
@@ -190,13 +193,13 @@ apply prompt is the OpenSpec CLI workflow
 A dispatch runs the installed runtime, never the repository branch you are
 reading. After a merged runtime change, run `./install.sh` and check
 `boss --version` before the next ACP dispatch. The apply state must show
-`acp.isolated: true` and a `profile_root`; without them the dispatch came from
-an older runtime and keeps the old behaviour, including world-readable
-transcripts and no permission queueing.
+`transport: "acp"`, the runner's `acp.model` and `acp.mode: null`; otherwise the
+dispatch came from an older runtime and keeps the old behaviour, including
+world-readable transcripts and no permission queueing.
 
 The transcript and the supervisor log are created with mode `0600` because they
 contain full commands and tool output. A transcript stays until the operator
-removes it: `boss finish` deletes the state and the profile but keeps the
+removes it: `boss finish` deletes the state but keeps the
 transcript as the evidence for the apply. Cleanup is an operator decision; no
 retention policy is implemented.
 
@@ -378,8 +381,8 @@ checkout must stay unchanged by the apply.
 
 On green, `boss finish` merges the worktree branch into the base
 (`--ff-only` at `base_head`, otherwise `--no-ff`), runs the configured or
-detected test command on the merged base, then closes the tab, removes the
-worktree, deletes the branch and the state. On a conflict it aborts the merge,
+detected test command on the merged base, then closes every tab of the worktree
+workspace, removes the worktree, deletes the branch and the state. On a conflict it aborts the merge,
 keeps worktree and state and returns `merge_conflict` with the paths. A red
 integration test keeps the state with `merge_state=test_failed` and
 `merge_test_failed`; fix on the base and run `boss finish` again. A test that
@@ -390,8 +393,9 @@ and reports `merge_test_timeout` with the budget and log path; raise
 `explorer` the worktree must be clean and the Explorer commits the reviewed
 change paths there first; under `agent` verify the commits. `--keep-worktree`
 merges and tests but keeps the worktree, branch and state (`kept=true`,
-`merge_state=done`); `--no-merge` closes the tab and keeps them without a finish
-event. A later `finish` cleans up either path.
+`merge_state=done`); `--no-merge` closes the apply tabs and keeps them without a
+finish event. A later `finish` cleans up either path. Both paths close every
+tab of the worktree workspace and leave unrelated base tabs untouched.
 
 `boss park` keeps the worktree and branch. `boss resume` reuses them and starts
 a fresh agent in the same worktree; `boss retrigger` continues in place, or
@@ -399,7 +403,8 @@ starts a new agent there when the old one is gone. A missing worktree fails with
 `worktree_missing`; never fall back to the base checkout. `boss doctor` reports
 missing worktree paths, conflicted, test-failed or test-timeout states,
 uncommitted change dirs, orphaned worktrees, a dirty base and an uncommitted
-plan.
+plan. `boss doctor --fix` also closes orphaned apply tabs for the worktrees it
+removes, reports each closed tab, and leaves unrelated base tabs untouched.
 
 ### Caller identity and wake targets
 

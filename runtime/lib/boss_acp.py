@@ -9,7 +9,7 @@ per-apply Unix control socket without a second state machine.
 Usage:
   boss_acp.py <state-file>
   boss_acp.py --probe <command> [--cwd DIR] [--model M] [--mode MODE]
-              [--timeout S] [--profile-temp]
+              [--timeout S]
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ import shlex
 import shutil
 import signal
 import sys
-import tempfile
 import time
 
 PROTOCOL_VERSION = 1
@@ -34,17 +33,6 @@ PROTOCOL_VERSION = 1
 # waits this long so its text can name every request that opened the same
 # transition, instead of only the first one.
 BLOCKED_WAKE_COALESCE_S = 0.25
-
-# Tools that must always reach the supervisor instead of being pre-approved by
-# an agent-level permission store. Kept in both the user and the smart-approve
-# section of the generated permission.yaml.
-PERMISSION_ASK_TOOLS = (
-    "shell",
-    "write",
-    "edit",
-    "read_image",
-    "extensionmanager__manage_extensions",
-)
 
 
 def now_iso() -> str:
@@ -164,85 +152,6 @@ def boss_state_dir() -> str:
         "BOSS_STATE_DIR",
         os.path.join(os.path.expanduser("~"), ".local", "state", "openspec-boss"),
     )
-
-
-def user_config_home() -> str:
-    return os.environ.get("XDG_CONFIG_HOME") or os.path.join(
-        os.path.expanduser("~"), ".config"
-    )
-
-
-def user_data_home() -> str:
-    return os.environ.get("XDG_DATA_HOME") or os.path.join(
-        os.path.expanduser("~"), ".local", "share"
-    )
-
-
-def profile_root_for(state_path: str) -> str:
-    """The per-apply agent profile root; the same state path always maps to the
-    same root, so a supervisor restart reuses it."""
-    key = hashlib.sha1(
-        ("profile:" + os.path.abspath(state_path)).encode("utf-8")
-    ).hexdigest()
-    return os.path.join(boss_state_dir(), "acp", "profile-" + key)
-
-
-def write_permission_store(path: str) -> None:
-    lines = []
-    for section in ("user", "smart_approve"):
-        lines.append(f"{section}:")
-        lines.append("  always_allow: []")
-        lines.append("  never_allow: []")
-        lines.append("  ask_before:")
-        for tool in PERMISSION_ASK_TOOLS:
-            lines.append(f"    - {tool}")
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines) + "\n")
-    os.replace(tmp, path)
-
-
-def link_entries(source: str, target: str, skip=()) -> None:
-    if not os.path.isdir(source):
-        return
-    os.makedirs(target, exist_ok=True)
-    for name in sorted(os.listdir(source)):
-        if name in skip or name.endswith(".lock"):
-            continue
-        src = os.path.join(source, name)
-        dst = os.path.join(target, name)
-        if os.path.lexists(dst):
-            continue
-        os.symlink(src, dst)
-        log(f"acp profile: linked {dst} -> {src}")
-
-
-def build_agent_profile(root: str) -> str:
-    """Create a boss-owned Goose profile below root and return it.
-
-    Provider configuration and secrets are linked read-through, so the user's
-    own setup keeps working. The permission store is generated here and never
-    links the user's store, so no global grant can bypass the supervisor.
-    """
-    config_goose = os.path.join(root, "config", "goose")
-    data_goose = os.path.join(root, "data", "goose")
-    os.makedirs(config_goose, exist_ok=True)
-    os.makedirs(os.path.join(data_goose, "sessions"), exist_ok=True)
-    link_entries(
-        os.path.join(user_config_home(), "goose"),
-        config_goose,
-        skip=("permission.yaml", "sessions", "logs"),
-    )
-    link_entries(
-        os.path.join(user_data_home(), "goose"),
-        data_goose,
-        skip=("sessions",),
-    )
-    permission_path = os.path.join(config_goose, "permission.yaml")
-    if not os.path.exists(permission_path):
-        write_permission_store(permission_path)
-        log(f"acp profile: wrote boss-owned permission store {permission_path}")
-    return root
 
 
 class AcpError(Exception):
@@ -724,11 +633,6 @@ class Supervisor:
         self.load_session = self.acp.get("load_session")
         self.resume = bool(self.acp.get("resume"))
         self.phase = str(self.acp.get("phase") or "starting")
-        raw_isolate = self.acp.get("isolated")
-        if raw_isolate is None:
-            raw_isolate = self.acp.get("isolate")
-        self.isolated = True if raw_isolate is None else bool(raw_isolate)
-        self.profile_root = str(self.acp.get("profile_root") or profile_root_for(state_path))
         self.usage = None
         # Pending permissions are independent and keyed by tool-call id. A
         # second request must never replace the first one's future.
@@ -1136,8 +1040,6 @@ class Supervisor:
         await self.confirm_config(after_load=after_load)
 
         mode = self.mode_wanted
-        if not mode and isinstance(self.modes, dict):
-            mode = self.modes.get("currentModeId")
         self.acp_set(mode=mode or None)
         self.event(
             "acp_config",
@@ -2136,8 +2038,6 @@ class Supervisor:
                     "pending": bool(self.pending),
                     "pending_permissions": self.pending_list(),
                     "apply_allows": self.apply_allows,
-                    "isolated": self.isolated,
-                    "profile_root": self.profile_root if self.isolated else None,
                     "last_stop_reason": self.acp.get("last_stop_reason"),
                     "last_update": self.acp.get("last_update"),
                     "stalled": bool(self.stalled),
@@ -2220,9 +2120,7 @@ class Supervisor:
         grant = False
         if option_is_allow_always(selected_option):
             once = pick_option_once(entry.get("options") or [])
-            if once is not None:
-                selected = option_id(once)
-            elif not self.isolated:
+            if once is None:
                 # A persistent agent-level grant could bypass the supervisor.
                 # The request stays pending and the Explorer must choose an
                 # allow-once option.
@@ -2232,6 +2130,7 @@ class Supervisor:
                     "tool_call_id": key,
                     "message": "the agent offers no allow-once option; allow-always would become a persistent grant",
                 }
+            selected = option_id(once)
             self.remember_apply_allow(
                 entry.get("tool") or {},
                 str(entry.get("title") or ""),
@@ -2430,20 +2329,6 @@ class Supervisor:
             raise AcpError("command_missing", "the apply state carries no ACP command")
         argv = shlex.split(command) + ["acp"]
         env = os.environ.copy()
-        if self.isolated:
-            try:
-                build_agent_profile(self.profile_root)
-            except OSError as exc:
-                raise AcpError(
-                    "profile_failed",
-                    f"cannot create the per-apply agent profile {self.profile_root}: {exc}",
-                )
-            env["XDG_CONFIG_HOME"] = os.path.join(self.profile_root, "config")
-            env["XDG_DATA_HOME"] = os.path.join(self.profile_root, "data")
-        self.acp_set(
-            isolated=self.isolated,
-            profile_root=self.profile_root if self.isolated else None,
-        )
         try:
             self.proc = await spawn_agent_process(*argv, cwd=self.root or None, env=env)
         except FileNotFoundError:
@@ -2469,8 +2354,6 @@ class Supervisor:
                 "command": command,
                 "pid": self.proc.pid,
                 "cwd": self.root,
-                "isolated": self.isolated,
-                "profile_root": self.profile_root if self.isolated else None,
             },
         )
         self.transcript_append(
@@ -2479,7 +2362,6 @@ class Supervisor:
                 "command": command,
                 "cwd": self.root,
                 "pid": self.proc.pid,
-                "isolated": self.isolated,
             }
         )
 
@@ -2550,6 +2432,12 @@ class Supervisor:
 
     # ----------------------------------------------------------------- run ---
     async def run(self) -> None:
+        # The supervisor log is an operator artifact: name the apply and the
+        # command it starts, so the 0600 log exists even for a clean turn.
+        log(
+            f"acp: supervisor starting for {self.change} in {self.project} "
+            f"({self.acp.get('command') or 'no command'})"
+        )
         self.acp_set(
             supervisor_pid=os.getpid(),
             phase="starting",
@@ -2559,8 +2447,6 @@ class Supervisor:
             pending_permission=None,
             pending_permissions=[],
             apply_allows=self.apply_allows,
-            isolated=self.isolated,
-            profile_root=self.profile_root if self.isolated else None,
             stalled=False,
             stalled_at=None,
         )
@@ -2709,7 +2595,7 @@ class Supervisor:
 
 # ------------------------------------------------------------------ probe ---
 
-async def probe(command: str, cwd: str, model, effort, mode, timeout: float, profile_temp: bool = False) -> dict:
+async def probe(command: str, cwd: str, model, effort, mode, timeout: float) -> dict:
     result = {
         "status": "ok",
         "command": command,
@@ -2725,29 +2611,14 @@ async def probe(command: str, cwd: str, model, effort, mode, timeout: float, pro
     }
     argv = shlex.split(command) + ["acp"]
     stderr_tail = []
-    profile_root = None
     env = os.environ.copy()
-    if profile_temp:
-        profile_root = tempfile.mkdtemp(prefix="boss-acp-probe-")
-        try:
-            build_agent_profile(profile_root)
-        except OSError as exc:
-            shutil.rmtree(profile_root, ignore_errors=True)
-            result.update(status="fail", message=f"cannot create the probe profile: {exc}")
-            return result
-        env["XDG_CONFIG_HOME"] = os.path.join(profile_root, "config")
-        env["XDG_DATA_HOME"] = os.path.join(profile_root, "data")
     try:
         proc = await spawn_agent_process(*argv, cwd=cwd or None, env=env)
     except FileNotFoundError:
         result.update(status="fail", message=f"command '{argv[0]}' not found")
-        if profile_root:
-            shutil.rmtree(profile_root, ignore_errors=True)
         return result
     except OSError as exc:
         result.update(status="fail", message=f"cannot start '{argv[0]}': {exc}")
-        if profile_root:
-            shutil.rmtree(profile_root, ignore_errors=True)
         return result
     client = AcpClient(proc)
 
@@ -2764,7 +2635,6 @@ async def probe(command: str, cwd: str, model, effort, mode, timeout: float, pro
     reader = asyncio.create_task(client.reader_loop())
     err = asyncio.create_task(drain())
     session_id = None
-    closed = False
     try:
         init = await client.request(
             "initialize",
@@ -2845,16 +2715,11 @@ async def probe(command: str, cwd: str, model, effort, mode, timeout: float, pro
     except asyncio.TimeoutError:
         result.update(status="fail", message=f"the ACP handshake timed out after {timeout}s")
     finally:
+        # The probe uses the user's own agent store. Delete the empty session
+        # first: some agents exit on session/close and would never answer the
+        # delete. If deletion is unsupported, close the session and report the
+        # one that remains instead of hiding it.
         if session_id:
-            try:
-                await client.request("session/close", {"sessionId": session_id}, timeout=3)
-                closed = True
-            except Exception:
-                pass
-        # A non-isolated probe uses the user's own agent store. Close the
-        # session and delete it when the agent supports deletion; otherwise
-        # report the empty session instead of hiding it.
-        if session_id and not profile_temp:
             try:
                 await client.request("session/delete", {"sessionId": session_id}, timeout=3)
             except Exception as exc:
@@ -2862,6 +2727,10 @@ async def probe(command: str, cwd: str, model, effort, mode, timeout: float, pro
                 note = f"an empty probe session {session_id} remains in the user's agent store"
                 result["message"] = (result["message"] + "; " + note).strip("; ")
                 log(f"acp probe: {note} ({exc})")
+                try:
+                    await client.request("session/close", {"sessionId": session_id}, timeout=3)
+                except Exception:
+                    pass
         try:
             proc.terminate()
         except ProcessLookupError:
@@ -2875,8 +2744,6 @@ async def probe(command: str, cwd: str, model, effort, mode, timeout: float, pro
                 pass
         for task in (reader, err):
             task.cancel()
-        if profile_root:
-            shutil.rmtree(profile_root, ignore_errors=True)
     return result
 
 
@@ -2889,7 +2756,6 @@ def main() -> int:
     parser.add_argument("--effort", default="")
     parser.add_argument("--mode", default="")
     parser.add_argument("--timeout", type=float, default=20.0)
-    parser.add_argument("--profile-temp", action="store_true")
     args = parser.parse_args()
 
     if args.probe:
@@ -2901,7 +2767,6 @@ def main() -> int:
                 args.effort or None,
                 args.mode or None,
                 args.timeout,
-                profile_temp=args.profile_temp,
             )
         )
         print(json.dumps(result))

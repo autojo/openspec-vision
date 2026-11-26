@@ -182,7 +182,8 @@ transition SHALL wake the boss once, not once per concurrent permission request.
 
 `boss interrupt` SHALL cancel the active ACP turn and SHALL NOT send keystrokes
 to the agent. The runtime SHALL confirm the cancellation from the prompt
-response.
+response. By default it SHALL close the apply tab after the turn ends;
+`--keep-tab` SHALL preserve the tab for inspection.
 
 #### Scenario: Cancel during generation
 
@@ -200,6 +201,16 @@ response.
 
 - **WHEN** any ACP runner apply is interrupted
 - **THEN** no key sequence is sent to the agent terminal
+
+#### Scenario: Interrupt closes the tab
+
+- **WHEN** an ACP apply is interrupted without `--keep-tab`
+- **THEN** its recorded apply tab is closed after the cancellation
+
+#### Scenario: Keep the tab
+
+- **WHEN** an ACP apply is interrupted with `--keep-tab`
+- **THEN** the apply tab remains for inspection and the state says so
 
 ### Requirement: Session resume
 
@@ -331,61 +342,6 @@ name for waiting.
 
 - **WHEN** the runtime waits for a turn to finish
 - **THEN** it waits for the ACP response, not for `herdr agent wait`
-
-### Requirement: Isolated agent state
-
-The runtime SHALL run an ACP agent with a per-apply configuration and data root.
-Provider configuration and secrets MAY be linked from the user's profile, but the
-agent permission store SHALL be owned by the runtime and SHALL contain no
-`always_allow` entry for shell, write or edit. The profile SHALL be removed when
-the apply finishes and SHALL survive a supervisor restart so a resumed session
-keeps its state.
-
-#### Scenario: Apply uses its own profile
-
-- **WHEN** an ACP apply starts
-- **THEN** the agent's configuration, permission and session state come from the
-  per-apply root, not from the user's global agent profile
-
-#### Scenario: Global profile is not modified
-
-- **WHEN** the agent asks for or receives a permission during an apply
-- **THEN** the user's global permission store is unchanged
-
-#### Scenario: Finish removes the profile
-
-- **WHEN** an ACP apply is finished
-- **THEN** its configuration, permission and session data are removed with the
-  apply state
-
-#### Scenario: Resume keeps the profile
-
-- **WHEN** a supervisor restarts and resumes the same apply
-- **THEN** it reuses the per-apply profile and the agent can load its session
-
-### Requirement: Permission store validation
-
-The doctor SHALL inspect the effective agent permission store for every
-configured ACP runner. When a global allow for shell, write or edit would bypass
-the supervisor's policy, the doctor SHALL report the policy as weakened and name
-the offending entry instead of reporting it as enforced.
-
-#### Scenario: Weakened store is reported
-
-- **WHEN** the agent's global permission store always allows shell, write or edit
-- **THEN** the doctor reports `weakened`, names the entry, and does not claim the
-  ACP deny list is enforced
-
-#### Scenario: Clean store is reported
-
-- **WHEN** the agent has no global allow that bypasses the supervisor
-- **THEN** the doctor reports the ACP policy as enforced
-
-#### Scenario: Probe leaves no state
-
-- **WHEN** the doctor probes an ACP runner
-- **THEN** the probe uses a temporary profile and leaves no session or permission
-  entry in the user's agent state
 
 ### Requirement: Turn timeout and stall detection
 
@@ -529,3 +485,50 @@ SHALL name the plugin and SHALL NOT change any file.
 
 - **WHEN** no known memory plugin is enabled
 - **THEN** the doctor prints no warning
+
+### Requirement: OpenCode ACP runners
+
+An ACP runner whose command is `opencode` SHALL run with the user's global
+OpenCode configuration and SHALL set `isolate = false`. It SHALL NOT create a
+Goose profile or write a Goose permission store. Named OpenCode runners SHALL be
+independent, each pinning its own model and effort; the configured default SHALL
+be one of them.
+
+#### Scenario: OpenCode uses the global profile
+
+- **WHEN** an OpenCode ACP apply starts
+- **THEN** it uses `~/.config/opencode` and `~/.local/share/opencode`, and no
+  per-apply Goose profile is created
+
+#### Scenario: Several models coexist
+
+- **WHEN** the configuration defines several `opencode-*` runners with different
+  models and efforts
+- **THEN** each runner starts its own model/effort and the default is one of them
+
+#### Scenario: Goose is absent
+
+- **WHEN** an apply is dispatched without an explicit runner
+- **THEN** the configured default is an OpenCode ACP runner, not a Goose runner
+
+### Requirement: OpenCode permission validation
+
+The doctor SHALL report the effective OpenCode permission configuration for an
+OpenCode ACP runner and SHALL NOT read the Goose permission store. A broad
+permission setting SHALL be reported as the actual boundary, not as ACP policy
+enforcement.
+
+#### Scenario: Broad OpenCode permission is visible
+
+- **WHEN** `opencode.jsonc` allows shell, write or edit broadly
+- **THEN** the doctor reports that boundary for the OpenCode runner
+
+#### Scenario: Doctor does not read Goose
+
+- **WHEN** the doctor validates an OpenCode runner
+- **THEN** it does not read or modify `~/.config/goose/permission.yaml`
+
+#### Scenario: ACP policy remains the request gate
+
+- **WHEN** OpenCode sends an ACP permission request
+- **THEN** the runner's `policy` and `deny` decide it as before
