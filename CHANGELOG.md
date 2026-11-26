@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.1
+
+### Fixed
+
+- A fresh worktree dispatch no longer closes the root tab of the workspace it
+  just created. Closing the last tab removed the workspace, so the following
+  `herdr tab create` failed with `workspace_not_found`; a retried dispatch then
+  allocated a new workspace number on every attempt. Stale tabs are cleaned
+  only when an apply state already exists, and the workspace is re-resolved
+  after a cleanup that may have removed it.
+- A trial record stays valid when `<command> --version` prefixes the version
+  (`opencode v2.4.1`) while the ACP handshake reported the bare `2.4.1`. The
+  comparison now uses the version token instead of the presentation.
+
 ## 1.4.0
 
 ### Added

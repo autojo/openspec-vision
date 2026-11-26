@@ -2058,6 +2058,15 @@ model_agent_version() {
   printf '%s' "$out" | sed -n '1p' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
+# model_version_key <text> -- the first dotted version token in <text>, or the
+# text itself when it carries none. Used to compare the ACP handshake version
+# with the raw output of '<command> --version'.
+model_version_key() {
+  local text="$1" token
+  token="$(printf '%s' "$text" | grep -Eo '[0-9]+(\.[0-9]+)+' | head -n 1 || true)"
+  if [ -n "$token" ]; then printf '%s' "$token"; else printf '%s' "$text"; fi
+}
+
 # model_trial_record_for <model> -- path of the trial record of a model.
 model_trial_record_for() {
   printf '%s/%s.json\n' "$BOSS_MODELS_DIR" "$(sha1_hex "trial:$1")"
@@ -2097,7 +2106,11 @@ model_trial_status() {
   local recorded_version current_version
   recorded_version="$(printf '%s' "$record" | jq -r '.agent_version // empty')"
   current_version="$(model_agent_version "$command")"
-  if [ -n "$recorded_version" ] && [ -n "$current_version" ] && [ "$recorded_version" != "$current_version" ]; then
+  # The ACP handshake reports a bare version ("2.4.1") while '<command>
+  # --version' often prefixes it ("opencode v2.4.1"). Compare the version
+  # token, not the presentation.
+  if [ -n "$recorded_version" ] && [ -n "$current_version" ] \
+     && [ "$(model_version_key "$recorded_version")" != "$(model_version_key "$current_version")" ]; then
     reason "agent_version"
   fi
   if [ "$(printf '%s' "$reasons_json" | jq 'length')" -eq 0 ]; then

@@ -1092,21 +1092,33 @@ dispatch_change() {
   # earlier dispatch. Close stale tabs for the change/worktree before creating
   # the new one, so at most one apply tab remains. The base workspace is only
   # touched through its recorded tab.
-  local stale_tab="" stale_closed="" base_ws=""
+  #
+  # Only an existing state can carry a stale tab. A fresh dispatch has none,
+  # and its just-created workspace holds a root tab: closing that tab removes
+  # the workspace, so the following tab create would fail with
+  # workspace_not_found.
+  local stale_tab="" stale_closed="" base_ws="" had_state=0
   if [ -f "$state_file" ]; then
+    had_state=1
     stale_tab="$(jq -r '.tab_id // empty' "$state_file" 2>/dev/null || true)"
     base_ws="$(jq -r '.boss_workspace // empty' "$state_file" 2>/dev/null || true)"
   fi
-  [ -n "$base_ws" ] || base_ws="$(herdr_workspace_for_path "$project")"
-  [ -n "$base_ws" ] || base_ws="$dispatcher_workspace"
-  if [ "$want_worktree" = "1" ] && [ -n "$worktree" ]; then
-    stale_closed="$(herdr_close_apply_tabs "$worktree" "$change" "$worktree_workspace" "$base_ws" "$stale_tab")"
-  elif [ -n "$stale_tab" ] && [ "$stale_tab" != "null" ]; then
-    herdr tab close "$stale_tab" >/dev/null 2>&1 || true
-    stale_closed="$stale_tab"
-  fi
-  if [ -n "$stale_closed" ]; then
-    log "dispatch: closed stale apply tab(s) $(printf '%s' "$stale_closed" | paste -sd ', ' -) for $change"
+  if [ "$had_state" -eq 1 ]; then
+    [ -n "$base_ws" ] || base_ws="$(herdr_workspace_for_path "$project")"
+    [ -n "$base_ws" ] || base_ws="$dispatcher_workspace"
+    if [ "$want_worktree" = "1" ] && [ -n "$worktree" ]; then
+      stale_closed="$(herdr_close_apply_tabs "$worktree" "$change" "$worktree_workspace" "$base_ws" "$stale_tab")"
+    elif [ -n "$stale_tab" ] && [ "$stale_tab" != "null" ]; then
+      herdr tab close "$stale_tab" >/dev/null 2>&1 || true
+      stale_closed="$stale_tab"
+    fi
+    if [ -n "$stale_closed" ]; then
+      log "dispatch: closed stale apply tab(s) $(printf '%s' "$stale_closed" | paste -sd ', ' -) for $change"
+      # Closing a workspace's last tab removes the workspace. Re-resolve it so
+      # the create below always has a live target.
+      workspace_id="$(find_workspace_for_repo "$apply_root")"
+      [ -n "$workspace_id" ] || workspace_id="$(ensure_workspace "$apply_root" "$change")"
+    fi
   fi
 
   local -a env_args=()

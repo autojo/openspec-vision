@@ -3,9 +3,9 @@
 # intentional change to runtime/bin; CI verifies it.
 43928b2420775f6306df9bd547a530342550bc92428a572321d01346df2cbb98  runtime/bin/boss
 a46d48c7cf45781c46ee313624b5972cc8848fea75555b2a2e2d6a0f76ebae4c  runtime/bin/boss-acp
-ebcc2f4ecb9c2ffd788461a3090dbb6d7c9015d0d50ebde303bfd7be5b85b9f3  runtime/bin/boss-apply.sh
+c9f9f14f1dd0b0bcfa278968afb4e80b0d8754e2020576342c7be95e397a9336  runtime/bin/boss-apply.sh
 b30c1f2c15386cb8140ebc18f7708d84496881541b500e22281c9d4a969fed1f  runtime/bin/boss-doctor.sh
-d4c8d412394301ee73e2370b5ebdc69a8c3d5ebab0656501fd356a21aaffe3cb  runtime/bin/boss-lib.sh
+45ce0b270c18a40d26fd4c7fe82604e8cc43f1484259e3c3f2acaca2ca3ddb02  runtime/bin/boss-lib.sh
 540a27b8cbeeff585c839f215c535b28d5ae64a34fe0782e994f401ad10e5ea0  runtime/bin/boss-mission.sh
 9890ea5dfdd78cbc04ced4e8a709e782258f6f4a0315d450bae5cdbc02432d65  runtime/bin/boss-model.sh
 b69f2ffcaa9cb4d5de0b1509db20df940ec08762ab47a49bd47abe94b9d1d09c  runtime/bin/boss-review.sh

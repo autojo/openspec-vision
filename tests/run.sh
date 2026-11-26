@@ -3171,6 +3171,28 @@ check_eq "dispatch retry: one worktree" "1" \
 check_eq "dispatch retry: state records current tab" "true" \
   "$(jq -r '.tab_id != null' "$RSF")"
 
+# 63c. A fresh worktree dispatch must not close the root tab of the workspace
+# it just created: closing the last tab removes the workspace, and the
+# following tab create fails with workspace_not_found.
+P_WTF="$TMP/project-worktree-fresh"
+make_git_project "$P_WTF"
+make_change "$P_WTF" wt-fresh '- [ ] 1.1 Code.'
+plan_commit "$P_WTF" wt-fresh >/dev/null
+WTST_F="$TMP/worktree-fresh-state"
+mkdir -p "$WTST_F"
+F_TABS="$TMP/worktree-fresh-tabs.json"
+F_PANES="$TMP/worktree-fresh-panes.json"
+F_CLOSE="$TMP/worktree-fresh-close.log"
+jq -n '[{tab_id:"t-fresh-root",label:"wt-fresh",workspace_id:"ws-wt-wt-fresh"}]' >"$F_TABS"
+jq -n --arg cwd "$PWD" '[{pane_id:"p-fresh-root",tab_id:"t-fresh-root",workspace_id:"ws-wt-wt-fresh",cwd:"/nonexistent"},
+  {pane_id:"p-boss",tab_id:"t-boss",workspace_id:"ws-1",cwd:$cwd}]' >"$F_PANES"
+out="$(HERDR_TABS_JSON="$F_TABS" HERDR_PANES_JSON="$F_PANES" \
+  HERDR_TAB_CLOSE_LOG="$F_CLOSE" run_boss_state "$WTST_F" \
+  dispatch wt-fresh --project "$P_WTF" --worktree)"
+check_eq "fresh dispatch: started" "started" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "fresh dispatch: no tab closed" "0" \
+  "$([ -f "$F_CLOSE" ] && wc -l <"$F_CLOSE" | tr -d ' ' || printf 0)"
+
 # 64. A merge conflict aborts, keeps the worktree and names the path.
 P_WTC="$TMP/project-worktree-conflict"
 make_git_project "$P_WTC"
@@ -5607,6 +5629,13 @@ out="$(BOSS_CONFIG="$STALECONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_state "
 check_eq "trial: changed effort is stale" "stale" "$(printf '%s' "$out" | jq -r '.runners[] | select(.runner=="opencode-acp") | .trial.status')"
 err="$(make_change "$MP" model-untried '- [ ] 1.1 Do.'; BOSS_CONFIG="$STALECONF" HERDR_AGENTS_JSON="$ACP_AGENTS" run_boss_fail_state "$TSTATE" dispatch model-untried --project model-test --runner opencode-acp)"
 check_contains "gate: untried refused" "model_untried" "$err"
+
+# 76b. The ACP handshake reports a bare version while '<command> --version'
+# often prefixes it; the trial record must stay valid.
+jq '.agent_version = "2.4.1"' "$TREC" >"$TREC.tmp" && mv "$TREC.tmp" "$TREC"
+out="$(BOSS_MODEL_AGENT_VERSION='opencode v2.4.1' trial_boss "$TSTATE" model list --project model-test --json)"
+check_eq "trial: prefixed agent version stays valid" "valid" \
+  "$(printf '%s' "$out" | jq -r '.runners[] | select(.runner=="opencode-acp") | .trial.status')"
 
 # 77. Native session-record adapter: confirmed, mismatch, helper listing and an
 # unknown format.
