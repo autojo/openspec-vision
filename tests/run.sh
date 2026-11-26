@@ -4995,7 +4995,7 @@ S21="$(acp_state "$AS21" "$AP" acp-transport-lost)"
 EV21="$(acp_events_file "$AS21" "$AP" acp-transport-lost)"
 MODE21="$TMP/acp-mode-21"; printf 'close_stdout\n' >"$MODE21"
 FAKE_ACP_MODE_FILE="$MODE21" BOSS_ACP_STALL_S=0 BOSS_ACP_TURN_TIMEOUT_S=0 \
-  acp_boss "$AS21" dispatch acp-transport-lost --project acp-test --runner goose >/dev/null
+  acp_boss "$AS21" dispatch acp-transport-lost --project acp-test --runner opencode-acp >/dev/null
 acp_wait_stop "$S21" 200 || bad "acp transport lost: no stop reason"
 check_eq "acp transport lost: stop reason" "transport_lost" "$(jq -r '.acp.last_stop_reason' "$S21")"
 check_eq "acp transport lost: phase idle" "idle" "$(jq -r '.acp.phase' "$S21")"
@@ -5056,7 +5056,7 @@ S22="$(acp_state "$AS22" "$AP" acp-transport-new)"
 EV22="$(acp_events_file "$AS22" "$AP" acp-transport-new)"
 MODE22="$TMP/acp-mode-22"; printf 'no_load_close_stdout\n' >"$MODE22"
 FAKE_ACP_MODE_FILE="$MODE22" BOSS_ACP_STALL_S=0 BOSS_ACP_TURN_TIMEOUT_S=0 \
-  acp_boss "$AS22" dispatch acp-transport-new --project acp-test --runner goose >/dev/null
+  acp_boss "$AS22" dispatch acp-transport-new --project acp-test --runner opencode-acp >/dev/null
 acp_wait_stop "$S22" 200 || bad "acp transport new: no stop reason"
 check_eq "acp transport new: stop reason" "transport_lost" "$(jq -r '.acp.last_stop_reason' "$S22")"
 printf 'no_load\n' >"$MODE22"
@@ -5088,7 +5088,7 @@ make_change "$AP" acp-shutdown-live '- [ ] 1.1 Do the work.'
 AS23="$TMP/acp-state-23"; mkdir -p "$AS23"
 S23="$(acp_state "$AS23" "$AP" acp-shutdown-live)"
 FAKE_ACP_MODE=slow BOSS_ACP_STALL_S=0 BOSS_ACP_TURN_TIMEOUT_S=0 \
-  acp_boss "$AS23" dispatch acp-shutdown-live --project acp-test --runner goose >/dev/null
+  acp_boss "$AS23" dispatch acp-shutdown-live --project acp-test --runner opencode-acp >/dev/null
 i=0
 while [ "$i" -lt 100 ]; do
   [ "$(jq -r '.acp.phase // empty' "$S23" 2>/dev/null || true)" = "working" ] && \
@@ -5120,7 +5120,7 @@ make_change "$AP" acp-child-exit '- [ ] 1.1 Do the work.'
 AS24="$TMP/acp-state-24"; mkdir -p "$AS24"
 S24="$(acp_state "$AS24" "$AP" acp-child-exit)"
 FAKE_ACP_MODE=exit_on_prompt BOSS_ACP_STALL_S=0 BOSS_ACP_TURN_TIMEOUT_S=3 \
-  acp_boss "$AS24" dispatch acp-child-exit --project acp-test --runner goose >/dev/null
+  acp_boss "$AS24" dispatch acp-child-exit --project acp-test --runner opencode-acp >/dev/null
 i=0
 while [ "$i" -lt 100 ]; do
   pid="$(jq -r '.acp.supervisor_pid // empty' "$S24" 2>/dev/null || true)"

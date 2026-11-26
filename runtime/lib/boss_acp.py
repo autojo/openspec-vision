@@ -2432,6 +2432,12 @@ class Supervisor:
 
     # ----------------------------------------------------------------- run ---
     async def run(self) -> None:
+        # The supervisor log is an operator artifact: name the apply and the
+        # command it starts, so the 0600 log exists even for a clean turn.
+        log(
+            f"acp: supervisor starting for {self.change} in {self.project} "
+            f"({self.acp.get('command') or 'no command'})"
+        )
         self.acp_set(
             supervisor_pid=os.getpid(),
             phase="starting",

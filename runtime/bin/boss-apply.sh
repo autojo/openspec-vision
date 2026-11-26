@@ -709,29 +709,40 @@ start_acp_supervisor() {
   printf '%s\n' "$pid"
 }
 
+# acp_fail_from_state <state-file> -- die with the error the supervisor recorded
+# in the state, mapping a rejected session configuration to its own code. A
+# state without an error returns 0, so the caller can keep waiting.
+acp_fail_from_state() {
+  local state_file="$1" error error_code
+  error="$(jq -r '.acp.error // empty' "$state_file" 2>/dev/null || true)"
+  [ -n "$error" ] || return 0
+  error_code="$(jq -r '.acp.error_code // empty' "$state_file" 2>/dev/null || true)"
+  case "$error_code" in
+    model_not_offered|effort_not_offered|model_mismatch|mode_not_offered)
+      die_json "$error_code" "ACP session configuration failed for the apply: $error" ;;
+  esac
+  die_json "acp_start_failed" "ACP supervisor failed for the apply: $error"
+}
+
 # acp_wait_ready <state-file> [<timeout-ms>] -- wait until the supervisor has
 # completed the ACP handshake and applied the session configuration, or has
 # written an error. Dispatch uses this so a bad command/model/mode fails the
 # dispatch instead of leaving a half-created apply behind.
 acp_wait_ready() {
-  local state_file="$1" timeout="${2:-$BOSS_ACP_START_TIMEOUT_MS}" deadline error ready pid change error_code
+  local state_file="$1" timeout="${2:-$BOSS_ACP_START_TIMEOUT_MS}" deadline ready pid change
   change="$(jq -r '.change // "acp"' "$state_file" 2>/dev/null || printf acp)"
   deadline=$(( $(now_ms) + timeout ))
   while :; do
-    error="$(jq -r '.acp.error // empty' "$state_file" 2>/dev/null || true)"
-    if [ -n "$error" ]; then
-      error_code="$(jq -r '.acp.error_code // empty' "$state_file" 2>/dev/null || true)"
-      case "$error_code" in
-        model_not_offered|effort_not_offered|model_mismatch|mode_not_offered)
-          die_json "$error_code" "ACP session configuration failed for the apply: $error" ;;
-      esac
-      die_json "acp_start_failed" "ACP supervisor failed for the apply: $error"
-    fi
+    acp_fail_from_state "$state_file"
     ready="$(jq -r '.acp.ready // false' "$state_file" 2>/dev/null || printf false)"
     [ "$ready" = "true" ] && return 0
     pid="$(jq -r '.acp.supervisor_pid // empty' "$state_file" 2>/dev/null || true)"
     [ -n "$pid" ] || pid="${BOSS_FAILED_ACP_PID:-}"
     if [ -n "$pid" ] && ! acp_pid_alive "$pid"; then
+      # The supervisor writes its error before it exits, but a dispatcher state
+      # write can land between the reads above. Look again before reporting a
+      # fast-failing supervisor as a silent exit.
+      acp_fail_from_state "$state_file"
       die_json "acp_start_failed" "the ACP supervisor exited before the session was ready; see $BOSS_LOGS_DIR/$change-acp.log"
     fi
     [ "$(now_ms)" -lt "$deadline" ] \
