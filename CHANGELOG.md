@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.4.2
+
+### Added
+
+- `boss finish --discard` secures the apply branch as
+  `park/<change>-<timestamp>`, then removes the worktree, the `boss/<change>`
+  branch and the state. A later dispatch of the change starts clean instead of
+  continuing on the unmerged branch. It cannot be combined with
+  `--keep-worktree` or `--no-merge`.
+
+### Fixed
+
+- `boss doctor --fix` removes an apply state whose worktree directory and
+  recorded branch are both gone, and reports it under
+  `removed stale apply states`. Previously only `worktree_state` warned and the
+  change stayed undispatchable until the state file was removed by hand.
+- `boss doctor` never runs `openspec init`. It reports the command instead,
+  because init writes project files (`AGENTS.md`, tool config) and must not be
+  a side effect of a check.
+
 ## 1.4.1
 
 ### Fixed

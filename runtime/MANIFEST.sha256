@@ -1,15 +1,15 @@
 # SHA-256 of the vendored runtime, sorted by file name.
 # Regenerate with scripts/runtime-manifest.sh --write after an
 # intentional change to runtime/bin; CI verifies it.
-43928b2420775f6306df9bd547a530342550bc92428a572321d01346df2cbb98  runtime/bin/boss
+034fd751913b79e252ad3386a7b4d7da32d8918ed8e9b20259ed22e310864b5b  runtime/bin/boss
 a46d48c7cf45781c46ee313624b5972cc8848fea75555b2a2e2d6a0f76ebae4c  runtime/bin/boss-acp
 c9f9f14f1dd0b0bcfa278968afb4e80b0d8754e2020576342c7be95e397a9336  runtime/bin/boss-apply.sh
-b30c1f2c15386cb8140ebc18f7708d84496881541b500e22281c9d4a969fed1f  runtime/bin/boss-doctor.sh
+dd8c01c475f6bc369dc9c3d8da1f2f06919bfb8ff77218823f1044e23c11bd92  runtime/bin/boss-doctor.sh
 45ce0b270c18a40d26fd4c7fe82604e8cc43f1484259e3c3f2acaca2ca3ddb02  runtime/bin/boss-lib.sh
 540a27b8cbeeff585c839f215c535b28d5ae64a34fe0782e994f401ad10e5ea0  runtime/bin/boss-mission.sh
 9890ea5dfdd78cbc04ced4e8a709e782258f6f4a0315d450bae5cdbc02432d65  runtime/bin/boss-model.sh
 b69f2ffcaa9cb4d5de0b1509db20df940ec08762ab47a49bd47abe94b9d1d09c  runtime/bin/boss-review.sh
-b995a9d30c23585422a50c4e5620870966b23e7f93690895967b04cd10b01e77  runtime/bin/boss-run.sh
+462b5035a5594a9521148ce1f359de53482b42010d775e8489820af7a89957a9  runtime/bin/boss-run.sh
 9191704a7a9e26a76cee2238359e0fa429c96a308e49b481fa56883820dbb185  runtime/bin/boss-status.sh
 435af26232df5d00278177cf0fd860c52e108f0f4d4c7cc5015c63b7113c377d  runtime/bin/boss-waiter
 fa6606d0a4ccabddac9620fe360efec2e8469fa9d3a94614a2114fa8c8c8fcc2  runtime/lib/boss_acp.py

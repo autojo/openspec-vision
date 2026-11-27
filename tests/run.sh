@@ -3124,6 +3124,33 @@ check_contains "keep-worktree: final close recorded" "$TAB_REC_K" "$(cat "$CLOSE
 check_contains "keep-worktree: final close stale" "t-stale" "$(cat "$CLOSE_K3")"
 check_not_contains "keep-worktree: final base untouched" "t-base" "$(cat "$CLOSE_K3")"
 
+# 63a. --discard secures the branch under park/ and then removes worktree,
+# branch and state, so a later dispatch starts clean.
+P_WTDI="$TMP/project-worktree-discard"
+make_git_project "$P_WTDI"
+make_change "$P_WTDI" wt-discard '- [ ] 1.1 Code.'
+plan_commit "$P_WTDI" wt-discard >/dev/null
+WTST_DI="$TMP/worktree-discard-state"
+mkdir -p "$WTST_DI"
+out="$(run_boss_state "$WTST_DI" dispatch wt-discard --project "$P_WTDI" --worktree)"
+WTDI="$(printf '%s' "$out" | jq -r '.worktree')"
+DISF="$WTST_DI/applies/$(run_lib sha1_hex "$P_WTDI")-wt-discard.json"
+printf 'discarded\n' >"$WTDI/discarded.txt"
+git -C "$WTDI" add -A; git -C "$WTDI" commit -qm "work to preserve"
+HEAD_DI="$(git -C "$WTDI" rev-parse HEAD)"
+out="$(run_boss_state "$WTST_DI" finish wt-discard --project "$P_WTDI" --discard)"
+check_eq "discard: status" "discarded" "$(printf '%s' "$out" | jq -r '.status')"
+check_eq "discard: worktree removed" "0" "$([ -e "$WTDI" ] && printf 1 || printf 0)"
+check_eq "discard: boss branch removed" "0" \
+  "$(git -C "$P_WTDI" branch --list 'boss/wt-discard' | wc -l | tr -d ' ')"
+check_eq "discard: state removed" "0" "$([ -f "$DISF" ] && printf 1 || printf 0)"
+BACKUP_DI="$(printf '%s' "$out" | jq -r '.backup_branch')"
+check_contains "discard: backup branch named" "park/wt-discard-" "$BACKUP_DI"
+check_eq "discard: backup keeps the commit" "$HEAD_DI" \
+  "$(git -C "$P_WTDI" rev-parse --verify --quiet "$BACKUP_DI" 2>/dev/null)"
+check_eq "discard: backup file readable" "discarded" \
+  "$(git -C "$P_WTDI" show "$BACKUP_DI:discarded.txt" 2>/dev/null)"
+
 # 63b. A new dispatch in an existing worktree closes stale tabs and leaves at
 # most one apply tab for the change.
 P_WTR="$TMP/project-worktree-retry"
@@ -3707,6 +3734,23 @@ jq -n --arg p "$P_WTDOC" --arg w "$WT_DOC2" \
   >"$WTST_D/applies/$(run_lib sha1_hex "$P_WTDOC")-wt-unmerged.json"
 run_boss_state "$WTST_D" doctor --project "$P_WTDOC" --json --fix >/dev/null 2>&1
 check_eq "doctor fix: unmerged worktree kept" "1" "$([ -d "$WT_DOC2" ] && printf 1 || printf 0)"
+
+# A state whose worktree and branch are both gone is stale and safely removed.
+jq -n --arg p "$P_WTDOC" --arg w "$TMP/doctor-stale-gone" \
+  '{change:"wt-stale",project:$p,runner:"opencode",agent:"apply-wt-stale",
+    pane_id:null,tab_id:null,workspace_id:null,worktree:$w,branch:"boss/wt-stale",
+    worktree_workspace:null,base_head:null,merge_state:"none",merged:false,
+    merge_test:"not_run",kept:false,waiter_pid:null}' \
+  >"$WTST_D/applies/$(run_lib sha1_hex "$P_WTDOC")-wt-stale.json"
+STALE_F="$WTST_D/applies/$(run_lib sha1_hex "$P_WTDOC")-wt-stale.json"
+DOC_STALE="$(run_boss_state "$WTST_D" doctor --project "$P_WTDOC" --json --fix 2>/dev/null)"
+check_eq "doctor fix: stale state removed" "0" "$([ -f "$STALE_F" ] && printf 1 || printf 0)"
+check_contains "doctor fix: names removed state" "removed stale apply states" \
+  "$(printf '%s' "$DOC_STALE" | jq -r '.checks[] | select(.id=="worktree_state") | .hint')"
+check_contains "doctor fix: never runs init" "boss doctor never runs it" \
+  "$(printf '%s' "$DOC_STALE" | jq -r '.checks[] | select(.id=="project_init") | .hint')"
+check_eq "doctor fix: writes no init files" "0" \
+  "$(if [ -e "$P_WTDOC/.claude" ] || [ -e "$P_WTDOC/.opencode" ]; then printf 1; else printf 0; fi)"
 
 # 69. The documentation and both skills describe the worktree lifecycle.
 readme="$(cat "$ROOT/README.md")"

@@ -466,7 +466,7 @@ finish_close_apply_tabs() {
 # tasks_file_for <project> <change> -- active or archived tasks.md, or empty
 finish_worktree() {
   local change="$1" project="$2" state_file="$3" worktree="$4" branch="$5"
-  local commit_policy="$6" keep="$7" no_merge="$8" lesson_text="$9" lesson_scope="${10}"
+  local commit_policy="$6" keep="$7" no_merge="$8" lesson_text="$9" lesson_scope="${10}" discard="${11:-0}"
   local tab_id waiter_pid base_head merge_state merged merge_test worktree_workspace
   tab_id="$(jq -r '.tab_id // empty' "$state_file")"
   waiter_pid="$(jq -r '.waiter_pid // empty' "$state_file")"
@@ -500,6 +500,41 @@ finish_worktree() {
   }
   if git -C "$project" merge-base --is-ancestor "$branch" HEAD >/dev/null 2>&1; then
     already_merged=true
+  fi
+
+  # --discard is the deliberate drop: secure the branch under park/<change>-<ts>,
+  # then remove worktree, branch and state so a later dispatch starts clean.
+  if [ "$discard" = "1" ]; then
+    local discard_head discard_backup="" discard_tab discard_now
+    discard_tab="$(jq -r '.tab_id // empty' "$state_file" 2>/dev/null || true)"
+    discard_head="$(git -C "$project" rev-parse --verify --quiet "$branch" 2>/dev/null || true)"
+    if [ -n "$discard_head" ]; then
+      discard_now="$(date +%Y%m%dT%H%M%S)"
+      discard_backup="park/$(normalize_name "$change")-$discard_now"
+      git -C "$project" branch "$discard_backup" "$discard_head" >/dev/null 2>&1 || discard_backup=""
+    fi
+    finish_close_apply_tabs "$project" "$state_file" "$worktree" "$change" "$worktree_workspace" "$discard_tab"
+    kill_waiter "$waiter_pid" >/dev/null 2>&1 || true
+    herdr_worktree_remove "$project" "$worktree" "$worktree_workspace"
+    git -C "$project" worktree remove --force "$worktree" >/dev/null 2>&1 || true
+    git -C "$project" worktree prune >/dev/null 2>&1 || true
+    [ -n "$branch" ] && git -C "$project" branch -D "$branch" >/dev/null 2>&1 || true
+    rm -rf "$worktree" 2>/dev/null || true
+    rmdir "$(dirname "$worktree")" 2>/dev/null || true
+    rm -f "$state_file"
+    inbox_remove "$project" "$change"
+    append_event "$(events_file_for "$project" "$change")" finish \
+      "$(jq -nc --arg c "$change" --arg p "$project" --arg b "$discard_backup" \
+        '{change: $c, project: $p, discarded: true, backup_branch: (if $b == "" then null else $b end)}')" \
+      || log "warning: could not record discard event"
+    log "finish: change=$change project=$project discarded worktree=$worktree branch=$branch backup=${discard_backup:-none}"
+    printf '%s\n' "$(jq -n --arg change "$change" --arg project "$project" \
+      --arg worktree "$worktree" --arg branch "$branch" --arg backup "$discard_backup" \
+      '{change: $change, project: $project, status: "discarded", removed: true,
+        no_merge: true, discarded: true, merge_state: "discarded", merged: false,
+        worktree: $worktree, branch: $branch,
+        backup_branch: (if $backup == "" then null else $backup end)}')"
+    return 0
   fi
 
   # --no-merge is the manual path: close the agent, keep worktree and state.
@@ -687,7 +722,7 @@ finish_worktree() {
 
 cmd_finish() {
   local change="" project_name="" force=0 lesson_text="" lesson_scope="project" as_target="" arg
-  local keep_worktree=0 no_merge=0
+  local keep_worktree=0 no_merge=0 discard=0
   while [ $# -gt 0 ]; do
     arg="$1"; shift
     case "$arg" in
@@ -695,6 +730,7 @@ cmd_finish() {
       --force) force=1 ;;
       --keep-worktree) keep_worktree=1 ;;
       --no-merge) no_merge=1 ;;
+      --discard) discard=1 ;;
       --lesson) lesson_text="$(one_line "${1:-}")"; shift ;;
       --lesson-scope) lesson_scope="${1:-}"; shift ;;
       --as) as_target="${1:-}"; shift ;;
@@ -703,7 +739,10 @@ cmd_finish() {
       *) if [ -z "$change" ]; then change="$arg"; else usage_error "unexpected argument: $arg"; fi ;;
     esac
   done
-  [ -n "$change" ] || usage_error "usage: boss finish <change> [--project <name|path>] [--force] [--keep-worktree] [--no-merge] [--lesson <text>] [--lesson-scope project|global] [--as <pane|agent>]"
+  [ -n "$change" ] || usage_error "usage: boss finish <change> [--project <name|path>] [--force] [--keep-worktree] [--no-merge] [--discard] [--lesson <text>] [--lesson-scope project|global] [--as <pane|agent>]"
+  if [ "$discard" -eq 1 ] && { [ "$keep_worktree" -eq 1 ] || [ "$no_merge" -eq 1 ]; }; then
+    usage_error "--discard cannot be combined with --keep-worktree or --no-merge"
+  fi
   boss_use_caller "$as_target"
   ensure_boss_claim finish
   ensure_config
@@ -751,7 +790,7 @@ cmd_finish() {
   if [ -n "$finish_worktree_path" ]; then
     finish_worktree "$change" "$project" "$state_file" "$finish_worktree_path" \
       "${finish_branch:-$(worktree_branch_for "$change")}" "$commit_policy" \
-      "$keep_worktree" "$no_merge" "$lesson_text" "$lesson_scope"
+      "$keep_worktree" "$no_merge" "$lesson_text" "$lesson_scope" "$discard"
     return 0
   fi
 

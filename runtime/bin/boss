@@ -53,7 +53,7 @@ Usage:
   boss doctor [--project <name|path>] [--json] [--fix]
   boss retrigger <change> [--project <name|path>] [--note <text>] [--as <pane|agent>]
   boss retarget <change> [--project <name|path>] [--to <pane|agent>]
-  boss finish <change> [--project <name|path>] [--force] [--keep-worktree] [--no-merge] [--lesson <text>] [--lesson-scope project|global] [--as <pane|agent>]
+  boss finish <change> [--project <name|path>] [--force] [--keep-worktree] [--no-merge] [--discard] [--lesson <text>] [--lesson-scope project|global] [--as <pane|agent>]
   boss park <change> [--project <name|path>] [--note <text>] [--as <pane|agent>]
   boss resume <change> [--project <name|path>] [--note <text>] [--as <pane|agent>]
   boss interrupt <change> [--project <name|path>] [--keep-tab] [--as <pane|agent>]

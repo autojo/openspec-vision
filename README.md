@@ -542,10 +542,12 @@ budget keeps the state with `merge_state=test_timeout`, reports
 `--keep-worktree`
 merges and tests but keeps the worktree, branch and state (`kept=true`,
 `merge_state=done`) for inspection; `--no-merge` closes the apply tabs and keeps
-them for a manual merge without recording a finish. A later `boss finish` cleans
-up either kept path. Closing the worktree tabs covers stale tabs from earlier
-dispatches, not only the recorded one, and never touches unrelated tabs in the
-base workspace.
+them for a manual merge without recording a finish. `--discard` secures the
+branch as `park/<change>-<timestamp>` and then removes the worktree, the
+`boss/<change>` branch and the state, so the next dispatch starts clean. A later
+`boss finish` cleans up either kept path. Closing the worktree tabs covers stale
+tabs from earlier dispatches, not only the recorded one, and never touches
+unrelated tabs in the base workspace.
 
 `boss park` keeps the worktree and branch for the human handoff. `boss resume`
 reuses the same worktree and branch and starts a fresh agent there; `boss
@@ -555,9 +557,12 @@ silently using the base checkout. `boss doctor` reports a missing worktree
 path, a `conflict`/`test_failed`/`test_timeout` state, an uncommitted change dir, orphaned
 worktrees under the state root, a dirty base and an uncommitted plan.
 `boss doctor --fix` removes only merged worktrees that belong to a kept or
-finished state; unmerged worktrees are only reported. Before removing a merged
-worktree it closes every apply tab in that worktree workspace, reports each
-closed tab, and leaves unrelated tabs in the base workspace untouched.
+finished state; unmerged worktrees are only reported. When both the worktree
+directory and its recorded branch are gone, it removes the stale apply state so
+the change can be dispatched again. Before removing a worktree it closes every
+apply tab in that worktree workspace, reports each closed tab, and leaves
+unrelated tabs in the base workspace untouched. Doctor never runs
+`openspec init`; it only reports the command.
 
 ## Test gate
 

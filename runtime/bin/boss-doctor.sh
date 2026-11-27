@@ -61,7 +61,7 @@ doctor_check_worktrees() {
   fi
   doctor_add worktree_support "$wt_support" "$wt_support_hint"
 
-  local wt_project_hash wt_warn="" wt_orphans="" wt_removed="" wt_tabs="" wt_count=0
+  local wt_project_hash wt_warn="" wt_orphans="" wt_removed="" wt_states="" wt_tabs="" wt_count=0
   local wt_f wt_ch wt_path wt_ms wt_merged wt_kept wt_branch wt_tab wt_ws
   wt_project_hash="$(sha1_hex "$project")"
   if [ -d "$BOSS_APPLIES_DIR" ]; then
@@ -78,6 +78,31 @@ doctor_check_worktrees() {
       wt_branch="$(jq -r '.branch // empty' "$wt_f" 2>/dev/null || true)"
       wt_ws="$(jq -r '.worktree_workspace // empty' "$wt_f" 2>/dev/null || true)"
       if [ ! -d "$wt_path" ]; then
+        local wt_branch_missing=0 wt_close wt_socket wt_waiter
+        if [ -z "$wt_branch" ] \
+           || ! git -C "$project" rev-parse --verify --quiet "$wt_branch" >/dev/null 2>&1; then
+          wt_branch_missing=1
+        fi
+        if [ "$fix" -eq 1 ] && [ -n "$wt_branch" ] && [ "$wt_branch_missing" -eq 1 ]; then
+          # Neither the worktree nor its branch exists: nothing can be merged or
+          # restored. Remove the stale state so the change can be dispatched
+          # again, and close a tab that may still point at it.
+          wt_tab="$(jq -r '.tab_id // empty' "$wt_f" 2>/dev/null || true)"
+          wt_socket="$(jq -r '.acp.control_socket // empty' "$wt_f" 2>/dev/null || true)"
+          wt_waiter="$(jq -r '.waiter_pid // empty' "$wt_f" 2>/dev/null || true)"
+          wt_close="$(herdr_close_apply_tabs "$wt_path" "$wt_ch" "$wt_ws" "" "$wt_tab")"
+          [ -n "$wt_close" ] && wt_tabs="$wt_tabs $wt_ch:$(printf '%s' "$wt_close" | paste -sd ',' -)"
+          [ -n "$wt_socket" ] && rm -f "$wt_socket" 2>/dev/null || true
+          if [ -n "$wt_waiter" ] && kill -0 "$wt_waiter" 2>/dev/null; then
+            kill "$wt_waiter" 2>/dev/null || true
+          fi
+          rm -f "$wt_f"
+          inbox_remove "$project" "$wt_ch"
+          rmdir "$(dirname "$wt_path")" 2>/dev/null || true
+          wt_states="$wt_states $wt_ch"
+          log "doctor --fix: removed stale apply state for $wt_ch (worktree and branch $wt_branch are gone)"
+          continue
+        fi
         wt_warn="$wt_warn $wt_ch:path missing ($wt_path)"
         continue
       fi
@@ -134,11 +159,13 @@ doctor_check_worktrees() {
   if [ -z "$wt_warn" ]; then
     local wt_hint=""
     [ -n "$wt_removed" ] && wt_hint="removed merged worktrees:$wt_removed"
+    [ -n "$wt_states" ] && wt_hint="${wt_hint:+$wt_hint; }removed stale apply states:$wt_states"
     [ -n "$wt_tabs" ] && wt_hint="${wt_hint:+$wt_hint; }closed apply tabs:$wt_tabs"
     doctor_add worktree_state ok "$wt_hint"
   else
     local wt_hint="worktree states need attention:$wt_warn; run 'boss review' and 'boss finish', or 'boss doctor --fix' for merged kept worktrees"
     [ -n "$wt_removed" ] && wt_hint="$wt_hint; removed merged worktrees:$wt_removed"
+    [ -n "$wt_states" ] && wt_hint="$wt_hint; removed stale apply states:$wt_states"
     [ -n "$wt_tabs" ] && wt_hint="$wt_hint; closed apply tabs:$wt_tabs"
     doctor_add worktree_state warn "$wt_hint"
   fi
@@ -417,12 +444,10 @@ cmd_doctor() {
   ls "$project"/.opencode/commands/opsx-*.md >/dev/null 2>&1 || init_missing="$init_missing opencode"
   if [ -z "$init_missing" ]; then
     doctor_add project_init ok ""
-  elif [ "$fix" -eq 1 ] && command -v openspec >/dev/null 2>&1 \
-       && (cd "$project" && openspec init --tools claude,opencode >/dev/null 2>&1); then
-    log "doctor --fix: ran 'openspec init --tools claude,opencode' in $project"
-    doctor_add project_init ok ""
   else
-    doctor_add project_init warn "run 'openspec init --tools claude,opencode' in $project"
+    # 'openspec init' writes project files (AGENTS.md, tool config); a doctor
+    # run must not do that unasked.
+    doctor_add project_init warn "run 'openspec init --tools claude,opencode' in $project (boss doctor never runs it)"
   fi
 
   local status_out bad_kinds="" bad_runner=""

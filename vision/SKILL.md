@@ -746,8 +746,10 @@ and reports `merge_test_timeout` with the budget and log path; raise
 change paths there first; under `agent` verify the commits. `--keep-worktree`
 merges and tests but keeps the worktree, branch and state (`kept=true`,
 `merge_state=done`); `--no-merge` closes the apply tabs and keeps them without a
-finish event. A later `finish` cleans up either path. Both paths close every
-tab of the worktree workspace and leave unrelated base tabs untouched.
+finish event; `--discard` secures the branch as `park/<change>-<timestamp>` and
+then removes worktree, branch and state so the next dispatch starts clean. A
+later `finish` cleans up either kept path. Every path closes every tab of the
+worktree workspace and leaves unrelated base tabs untouched.
 
 `boss park` keeps the worktree and branch. `boss resume` reuses them and starts
 a fresh agent in the same worktree; `boss retrigger` continues in place, or
@@ -830,8 +832,8 @@ apply in the same workspace with `executer_busy`.
    **mission** in the target project – `boss mission start <slug> --project <p>`,
    then fill in the goal and the change order (see Missions).
    Before the run, preflight the environment with `boss doctor --project <p>`
-   (read-only; `--fix` creates missing directories, runs `openspec init` and
-   registers the project – nothing else). On OpenCode V2, doctor checks the
+   (read-only; `--fix` creates missing directories and registers the project –
+   nothing else. It never runs `openspec init`; it only reports the command). On OpenCode V2, doctor checks the
    effective config from `opencode debug config`; on V1 it keeps the tab
    environment check. V2 dispatches use `--auto` and the shared background
    server, so never "fix" permissions by setting `OPENCODE_CONFIG_CONTENT` in
